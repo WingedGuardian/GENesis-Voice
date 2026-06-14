@@ -1,0 +1,18 @@
+[Unit]
+Description=GENesis-Voice s2s bridge (conversational, OpenAI Realtime)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Point WorkingDirectory at the deployed s2s_bridge package.
+WorkingDirectory=%h/genesis-voice/bridges/s2s_bridge
+EnvironmentFile=%h/genesis-voice/bridges/s2s_bridge/edge/.env
+# Use your venv's python (the bridge needs pipecat-ai[openai,websocket]==1.3.0).
+ExecStart=%h/s2s-venv/bin/python -m app.main
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

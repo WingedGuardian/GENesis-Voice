@@ -1,0 +1,25 @@
+# Secrets and local config — never commit
+.env
+*.env
+!.env.example
+secrets.yaml
+secrets.env
+
+# Local data + models
+*.db
+*.db-wal
+*.db-shm
+models/
+*.onnx
+*.wav
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+*.swp
