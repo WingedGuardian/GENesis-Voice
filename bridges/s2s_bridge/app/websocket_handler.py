@@ -203,7 +203,7 @@ class WebSocketHandler:
         logger.info("✅ Pipeline created for WebSocket connection")
 
         # Audio recording is handled by AudioFrameRecorder processors in the pipeline
-        if self.audio_recording_service:
+        if self.audio_recording_service and self.audio_recording_service.enable_recording:
             logger.info("🎙️ Audio recording enabled - will record input and output audio")
 
         # Create pipeline runner and task
