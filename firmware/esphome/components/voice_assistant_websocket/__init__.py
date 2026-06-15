@@ -16,6 +16,7 @@ VoiceAssistantWebSocket = voice_assistant_websocket_ns.class_(
 )
 
 CONF_SERVER_URL = "server_url"
+CONF_AMBIENT_URL = "ambient_url"
 CONF_VOICE_ASSISTANT_WEBSOCKET = "voice_assistant_websocket"
 CONF_ON_CONNECTED = "on_connected"
 CONF_ON_DISCONNECTED = "on_disconnected"
@@ -28,6 +29,7 @@ CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(VoiceAssistantWebSocket),
         cv.Required(CONF_SERVER_URL): cv.string,
+        cv.Optional(CONF_AMBIENT_URL): cv.string,
         cv.Optional(CONF_MICROPHONE): cv.use_id(microphone.Microphone),
         cv.Optional(CONF_SPEAKER): cv.use_id(speaker.Speaker),
         cv.Optional(CONF_ON_CONNECTED): automation.validate_automation(single=True),
@@ -57,7 +59,11 @@ async def to_code(config):
         )
     
     cg.add(var.set_server_url(config[CONF_SERVER_URL]))
-    
+
+    # Optional ambient bridge URL (second one-way sink for wake-word-free capture).
+    if CONF_AMBIENT_URL in config:
+        cg.add(var.set_ambient_url(config[CONF_AMBIENT_URL]))
+
     if CONF_MICROPHONE in config:
         mic = await cg.get_variable(config[CONF_MICROPHONE])
         cg.add(var.set_microphone(mic))

@@ -51,7 +51,16 @@ class VoiceAssistantWebSocket : public Component {
   // relies on server-side semantic VAD + noise reduction to reject echo).
   void set_full_duplex(bool enabled) { this->full_duplex_ = enabled; }
   bool is_full_duplex() const { return this->full_duplex_; }
-  
+
+  // Ambient mode: when enabled AND no conversation is active, stream mic audio
+  // (16 kHz mono) to a SECOND WebSocket — the ambient bridge — for passive,
+  // wake-word-free capture. Orthogonal to full-duplex (which lifts the mic gate
+  // DURING a conversation for barge-in). Default OFF; the HA switch is
+  // ALWAYS_OFF on boot, so ambient never survives a reboot (privacy default).
+  void set_ambient_url(const std::string &url) { this->ambient_url_ = url; }
+  void set_ambient(bool enabled);
+  bool is_ambient() const { return this->ambient_; }
+
   void set_state_callback(std::function<void(VoiceAssistantWebSocketState)> &&callback) {
     this->state_callback_ = std::move(callback);
   }
@@ -72,15 +81,37 @@ class VoiceAssistantWebSocket : public Component {
   void on_microphone_data_(const std::vector<uint8_t> &data);
   static void websocket_event_handler_(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
   void handle_websocket_event_(esp_websocket_event_id_t event_id, esp_websocket_event_data_t *event_data);
-  
+
+  // --- ambient mode (second, one-way WS sink; purely additive — these never
+  //     touch the s2s state machine, triggers, LEDs, or speaker) ---
+  void connect_ambient_();      // lazy-init on first enable; start() (incl. after stop)
+  void disconnect_ambient_();   // stop() only — KEEP the handle (no destroy → no UAF)
+  void stream_ambient_(const std::vector<uint8_t> &data);  // stereo32→mono16, send 16k
+  static void ambient_event_handler_(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
+  void handle_ambient_event_(esp_websocket_event_id_t event_id, esp_websocket_event_data_t *event_data);
+  bool ambient_is_connected_() const {
+    return this->ambient_ws_client_ != nullptr && esp_websocket_client_is_connected(this->ambient_ws_client_);
+  }
+  // A conversation is active or transitioning (wake-word session starting, live,
+  // or tearing down). Ambient streaming pauses for ALL of these — conversation
+  // always wins; ambient resumes only once fully idle/disconnected.
+  bool conversation_active_() const {
+    return this->state_ == VOICE_ASSISTANT_WEBSOCKET_STARTING ||
+           this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING ||
+           this->state_ == VOICE_ASSISTANT_WEBSOCKET_STOPPING;
+  }
+
   std::string server_url_;
+  std::string ambient_url_;  // ws:// of the ambient bridge (empty → ambient disabled)
   microphone::Microphone *microphone_{nullptr};
   speaker::Speaker *speaker_{nullptr};
   
 #ifdef USE_ESP_IDF
   esp_websocket_client_handle_t websocket_client_{nullptr};
+  esp_websocket_client_handle_t ambient_ws_client_{nullptr};  // second one-way sink
 #else
   void *websocket_client_{nullptr};
+  void *ambient_ws_client_{nullptr};
 #endif
   VoiceAssistantWebSocketState state_{VOICE_ASSISTANT_WEBSOCKET_IDLE};
   
@@ -95,6 +126,9 @@ class VoiceAssistantWebSocket : public Component {
   Trigger<> bot_stopped_speaking_trigger_{};
   bool was_bot_speaking_{false};  // For edge detection in loop()
   bool full_duplex_{false};  // Open-mic barge-in (set via Full Duplex Mode switch)
+  bool ambient_{false};      // Ambient capture mode (set via Ambient Mode switch)
+  bool pending_ambient_connect_{false};     // serviced in loop() (network op off the lambda)
+  bool pending_ambient_disconnect_{false};  // serviced in loop()
   bool pending_interrupt_cleanup_{false};  // Set from websocket task; loop() drains audio_queue_
   
   // Audio buffers
@@ -116,6 +150,9 @@ class VoiceAssistantWebSocket : public Component {
   static const uint32_t OUTPUT_SAMPLE_RATE = 24000;    // 24kHz for OpenAI output
   static const uint32_t BYTES_PER_SAMPLE = 2;          // 16-bit = 2 bytes
   static const uint32_t INPUT_BUFFER_SIZE = (INPUT_SAMPLE_RATE * BYTES_PER_SAMPLE * AUDIO_SEND_INTERVAL_MS) / 1000;
+  // Ambient sends are bounded (drop-on-full) so a slow/unreachable bridge can
+  // NEVER stall the mic task that feeds micro_wake_word. 20ms ≪ the 100ms frame.
+  static const uint32_t AMBIENT_SEND_TIMEOUT_MS = 20;
   
   // Auto-stop tracking
   uint32_t last_speaker_audio_time_{0};  // Last time we received audio from speaker

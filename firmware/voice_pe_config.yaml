@@ -245,6 +245,22 @@ switch:
       - lambda: 'id(voice_assistant_ws).set_full_duplex(true);'
     turn_off_action:
       - lambda: 'id(voice_assistant_ws).set_full_duplex(false);'
+  # Ambient Mode — passive, wake-word-free capture. When ON and NO conversation
+  # is active, mic audio (16 kHz mono) streams to the AMBIENT bridge (a separate
+  # one-way sink) for local transcription. Conversation always wins: ambient
+  # pauses during a wake-word session and resumes after. ALWAYS_OFF so it never
+  # survives a reboot (privacy default); needs ambient_url set on the component.
+  - platform: template
+    id: ambient_mode
+    name: "Ambient Mode"
+    icon: "mdi:ear-hearing"
+    entity_category: config
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      - lambda: 'id(voice_assistant_ws).set_ambient(true);'
+    turn_off_action:
+      - lambda: 'id(voice_assistant_ws).set_ambient(false);'
   - platform: gpio
     pin: GPIO47
     id: internal_speaker_amp
@@ -1482,7 +1498,11 @@ voice_assistant_websocket:
   id: voice_assistant_ws
   # Server URL - uses secret from secrets.yaml
   server_url: !secret server_url
-  
+  # Ambient bridge URL (second, one-way PCM sink). Used only when the Ambient
+  # Mode switch is ON and no conversation is active. From secrets so the private
+  # LAN address never enters this public repo. Set a placeholder if unused.
+  ambient_url: !secret ambient_bridge_url
+
   # Audio input (microphone) - reference to I2S audio input
   microphone: i2s_mics
   
