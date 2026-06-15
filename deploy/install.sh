@@ -42,8 +42,22 @@ install_ambient() {
   "$venv/bin/pip" install --upgrade pip
   "$venv/bin/pip" install sherpa-onnx onnxruntime soxr soundfile websockets numpy
   cp "$REPO_ROOT/deploy/systemd/ambient-bridge.service" "$SYSTEMD_USER_DIR/"
+  echo "   downloading models into ~/models ..."
+  mkdir -p "$HOME/models"
+  local rel="https://github.com/k2-fsa/sherpa-onnx/releases/download"
+  # VAD (Silero) + diarization models (pyannote segmentation + 3dspeaker embedding).
+  [ -f "$HOME/models/silero_vad.onnx" ] || wget -qP "$HOME/models" "$rel/asr-models/silero_vad.onnx"
+  if [ ! -d "$HOME/models/sherpa-onnx-pyannote-segmentation-3-0" ]; then
+    wget -qO "$HOME/models/seg.tar.bz2" "$rel/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2" \
+      && tar -xjf "$HOME/models/seg.tar.bz2" -C "$HOME/models" && rm -f "$HOME/models/seg.tar.bz2"
+  fi
+  [ -f "$HOME/models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx" ] || \
+    wget -qP "$HOME/models" "$rel/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
   echo "   venv: $venv"
-  echo "   next: download the STT models into ~/models (see bridges/ambient_bridge/README.md)"
+  echo "   NOTE: the Zipformer STT model is NOT auto-downloaded — place an offline"
+  echo "         transducer (encoder/decoder/joiner/tokens.txt) in ~/models/sherpa-zip"
+  echo "         from the sherpa-onnx model zoo. Diarization can be disabled with"
+  echo "         AMBIENT_DIAR_ENABLED=0 if you only want capture+STT."
 }
 
 require_python
