@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Python lint + syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.15.8
+      - name: Ruff
+        run: ruff check --config ruff.toml .
+      - name: Syntax (compileall)
+        run: python -m compileall -q bridges firmware
+
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck (errors)
+        run: shellcheck -S error deploy/install.sh bridges/s2s_bridge/edge/run-edge.sh .github/scripts/check-private-data.sh
+      - name: Bash syntax
+        run: |
+          for f in deploy/install.sh bridges/s2s_bridge/edge/run-edge.sh; do
+            bash -n "$f"
+          done
+
+  privacy:
+    name: No private data
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash .github/scripts/check-private-data.sh
