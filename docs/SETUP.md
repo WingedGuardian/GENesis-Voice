@@ -65,6 +65,6 @@ start talking.
 
 - Keep bridge ports on a trusted local network. The device-to-edge socket is unauthenticated
   by design (see [`../CONTRACTS.md`](../CONTRACTS.md)).
-- `bridges/s2s_bridge` can also run as a Home Assistant add-on (its `config.yaml`,
-  `repository.json`, and `root/run.sh` are the add-on packaging). The edge path above is
-  the recommended uniform deploy.
+- `bridges/s2s_bridge` can also run as a container — see its `Dockerfile`
+  (`docker build` then `docker run --env-file edge/.env -p 8080:8080`). The systemd
+  path above is the simplest for a VM.
