@@ -55,8 +55,9 @@ class VoiceAssistantWebSocket : public Component {
   // Ambient mode: when enabled AND no conversation is active, stream mic audio
   // (16 kHz mono) to a SECOND WebSocket — the ambient bridge — for passive,
   // wake-word-free capture. Orthogonal to full-duplex (which lifts the mic gate
-  // DURING a conversation for barge-in). Default OFF; the HA switch is
-  // ALWAYS_OFF on boot, so ambient never survives a reboot (privacy default).
+  // DURING a conversation for barge-in). Default OFF on a first-ever boot
+  // (privacy default), but the HA switch is RESTORE_DEFAULT_OFF so it PERSISTS
+  // the user's last choice across reboots/flashes.
   void set_ambient_url(const std::string &url) { this->ambient_url_ = url; }
   void set_ambient(bool enabled);
   bool is_ambient() const { return this->ambient_; }
