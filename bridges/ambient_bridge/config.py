@@ -45,6 +45,21 @@ class AmbientConfig:
     health_path: str = field(default_factory=lambda: _env("AMBIENT_HEALTH", os.path.expanduser("~/ambient_health.json")))
     health_interval_s: int = field(default_factory=lambda: int(_env("AMBIENT_HEALTH_INTERVAL_S", "60")))
 
+    # --- diarization (Stage-1b, additive) ---
+    # Speaker diarization runs DEFERRED on closed windows; if models are missing or
+    # init fails, the service runs capture-only with speaker_label NULL.
+    diar_enabled: bool = field(default_factory=lambda: _env("AMBIENT_DIAR_ENABLED", "1") not in ("0", "false", "False", "no", ""))
+    # pyannote segmentation model; embedding model (empty → autodetect *eres2net*16k* in models_dir).
+    # The zh-cn eres2net is VALIDATED on English (speaker embeddings are language-agnostic).
+    seg_model: str = field(default_factory=lambda: _env("AMBIENT_SEG_MODEL", os.path.expanduser("~/models/sherpa-onnx-pyannote-segmentation-3-0/model.onnx")))
+    emb_model: str = field(default_factory=lambda: _env("AMBIENT_EMB_MODEL", ""))
+    diar_threshold: float = field(default_factory=lambda: float(_env("AMBIENT_DIAR_THRESHOLD", "0.7")))
+    # Window of CONTINUOUS audio to diarize together (seconds of accumulated stream).
+    diar_window_s: float = field(default_factory=lambda: float(_env("AMBIENT_DIAR_WINDOW_S", "60")))
+    diar_queue_max: int = field(default_factory=lambda: int(_env("AMBIENT_DIAR_QUEUE_MAX", "4")))
+    # Diar shares the CPU with STT; keep below (cores - stt threads) on small boxes.
+    diar_num_threads: int = field(default_factory=lambda: int(_env("AMBIENT_DIAR_NUM_THREADS", "2")))
+
 
 def load_config() -> AmbientConfig:
     return AmbientConfig()

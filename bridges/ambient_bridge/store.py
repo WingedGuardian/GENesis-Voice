@@ -17,9 +17,11 @@ CREATE TABLE IF NOT EXISTS ambient_transcripts (
     ts            TEXT NOT NULL,                 -- ISO8601 UTC, utterance end
     text          TEXT NOT NULL,
     duration_s    REAL,
-    -- window-prefixed diarization label, e.g. 'w3:2' (NULL until diarized).
-    -- The window prefix makes explicit that cluster ids are NOT comparable
-    -- across windows (no cross-time speaker identity in Stage-1).
+    -- window-prefixed diarization label, e.g. 'w3:2/4' = window 3, cluster 2 of 4
+    -- speakers found (NULL until diarized). The window prefix makes explicit that
+    -- cluster ids are NOT comparable across windows OR across `source` connections
+    -- (no cross-time / cross-room speaker identity in Stage-1). The /total suffix
+    -- distinguishes a confirmed single speaker (/1) from one cluster among many.
     speaker_label TEXT,
     provenance    TEXT NOT NULL DEFAULT 'ambient_overheard',
     source        TEXT,                          -- connection/device id
