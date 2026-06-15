@@ -239,6 +239,12 @@ class AmbientServer:
             # window) before tearing down the store + background tasks.
             if self._handler_tasks:
                 await asyncio.wait(self._handler_tasks, timeout=10.0)
+            # Drain queued diar windows so their labels land (the worker is still
+            # running here). Bounded by ~queue_max windows of diar time; the timeout
+            # keeps shutdown well under systemd's default stop window.
+            if self._diar_queue is not None:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._diar_queue.join(), timeout=30.0)
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)

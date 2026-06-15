@@ -175,6 +175,8 @@ class AmbientPipeline:
         self._base = 0             # absolute resampled-sample index of _raw_chunks[0][0]
         self._win_utts: list[tuple[int, int, int]] = []  # (row_id, abs_start, abs_end)
         self._win_first = 0        # abs start sample of the window's first utterance
+        self._fed_total = 0        # cumulative resampled samples (to sanity-check vad.front.start)
+        self._diar_checked = False  # one-time guard that seg.start is an absolute index
 
     async def feed(self, pcm_bytes: bytes) -> int:
         """Accept one raw-PCM binary frame. Returns #utterances stored from it.
@@ -242,6 +244,7 @@ class AmbientPipeline:
             if self._diar_on:
                 self._raw_chunks.append(pcm)
                 self._raw_len += len(pcm)
+                self._fed_total += len(pcm)
 
         while len(self._buf) >= self._window:
             self._vad.accept_waveform(self._buf[: self._window])
@@ -270,6 +273,22 @@ class AmbientPipeline:
             logger.info("[%s] (%.1fs) %s", self._source, dur, text)
             if self._diar_on:
                 abs_end = abs_start + len(samples)
+                # One-time guard: seg.start must be an absolute sample index in the
+                # resampled stream (the whole windowing rests on it). If not, the slice
+                # math would silently use wrong audio — disable diar instead.
+                if not self._diar_checked:
+                    self._diar_checked = True
+                    if abs_start > self._fed_total:
+                        logger.error(
+                            "vad.front.start=%d > samples fed=%d — seg.start is not an "
+                            "absolute index; disabling diarization (capture continues)",
+                            abs_start, self._fed_total,
+                        )
+                        self._diar_on = False
+                        self._raw_chunks = []
+                        self._raw_len = 0
+                        self._win_utts = []
+                        continue
                 if not self._win_utts:
                     self._win_first = abs_start
                 self._win_utts.append((row_id, abs_start, abs_end))
@@ -279,7 +298,9 @@ class AmbientPipeline:
                 if closed is None and len(self._win_utts) >= 2 and (abs_end - self._win_first) >= self._diar_window_samples:
                     closed = self._close_window()
 
-        if flush and self._diar_on and closed is None and len(self._win_utts) >= 2:
+        if flush and self._diar_on and closed is None and len(self._win_utts) >= 1:
+            # On disconnect, label even a lone trailing utterance (→ w?:0/1) rather than
+            # leaving it NULL; the mid-stream close above keeps the >=2 requirement.
             closed = self._close_window()
         if self._diar_on:
             self._cap_raw()
