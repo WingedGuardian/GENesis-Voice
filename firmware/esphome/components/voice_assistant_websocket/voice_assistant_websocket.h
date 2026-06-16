@@ -157,7 +157,7 @@ class VoiceAssistantWebSocket : public Component {
   
   // Auto-stop tracking
   uint32_t last_speaker_audio_time_{0};  // Last time we received audio from speaker
-  static const uint32_t AUTO_STOP_INACTIVITY_MS = 20000;  // Stop after 20 seconds of speaker inactivity
+  static const uint32_t AUTO_STOP_INACTIVITY_MS = 60000;  // Backstop only (60s since last bot audio); the bridge's SessionIdleManager owns normal idle-end. (Was 20s, which cut off long user turns since it ignores user speech.)
   
   // Audio conversion buffers
   std::vector<int16_t> mono_buffer_;  // For stereo to mono conversion (input)
