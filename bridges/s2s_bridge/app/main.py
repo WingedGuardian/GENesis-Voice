@@ -93,12 +93,19 @@ class Application:
             os.environ.get("NOISE_GATE_BOT_SPEAKING_THRESHOLD", "1500")
         )
         noise_gate_hangover_ms = float(os.environ.get("NOISE_GATE_HANGOVER_MS", "250"))
+        # Diagnostic logging cadence for the noise gate (sampled). 0 = off
+        # (post-calibration quiet switch).
+        noise_gate_log_interval_s = float(
+            os.environ.get("NOISE_GATE_LOG_INTERVAL_S", "2.0")
+        )
         idle_timeout_seconds = float(os.environ.get("IDLE_TIMEOUT_SECONDS", "45"))
         logger.info(
-            "Noise gate: open=%d, bot_speaking=%d, hangover=%.0fms; idle_timeout=%.0fs",
+            "Noise gate: open=%d, bot_speaking=%d, hangover=%.0fms, "
+            "log_interval=%.1fs; idle_timeout=%.0fs",
             noise_gate_open_threshold,
             noise_gate_bot_speaking_threshold,
             noise_gate_hangover_ms,
+            noise_gate_log_interval_s,
             idle_timeout_seconds,
         )
 
@@ -149,6 +156,7 @@ class Application:
             noise_gate_open_threshold=noise_gate_open_threshold,
             noise_gate_bot_speaking_threshold=noise_gate_bot_speaking_threshold,
             noise_gate_hangover_ms=noise_gate_hangover_ms,
+            noise_gate_log_interval_s=noise_gate_log_interval_s,
             idle_timeout_seconds=idle_timeout_seconds,
         )
         self.websocket_transport = self.websocket_handler.create_transport()
@@ -396,6 +404,11 @@ class Application:
             idle_manager = getattr(self.websocket_handler, "session_idle_manager", None)
             if idle_manager:
                 idle_manager.arm()
+            # Start a clean noise-gate diagnostic window for this session (the
+            # gate is reused across reconnects).
+            noise_gate = getattr(self.websocket_handler, "noise_gate", None)
+            if noise_gate:
+                noise_gate.reset_instrumentation()
 
         async def on_client_disconnected(client_id: str):
             """Handle client disconnection."""
