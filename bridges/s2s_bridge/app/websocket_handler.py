@@ -68,6 +68,7 @@ class WebSocketHandler:
         noise_gate_open_threshold: int = 500,
         noise_gate_bot_speaking_threshold: int = 1500,
         noise_gate_hangover_ms: float = 250,
+        noise_gate_log_interval_s: float = 2.0,
         idle_timeout_seconds: float = 45,
     ):
         """
@@ -84,6 +85,8 @@ class WebSocketHandler:
                 while the bot is speaking (raises the bar for barge-in).
             noise_gate_hangover_ms: Hangover window keeping the gate open after
                 a loud frame so mid-word dips are not clipped.
+            noise_gate_log_interval_s: Cadence (s) of the gate's sampled
+                diagnostic logging; <= 0 disables it (post-calibration).
             idle_timeout_seconds: Seconds of genuine idle (no speech, response,
                 or pending tool) after which the client WS is closed.
         """
@@ -94,6 +97,7 @@ class WebSocketHandler:
         self._noise_gate_open_threshold = noise_gate_open_threshold
         self._noise_gate_bot_speaking_threshold = noise_gate_bot_speaking_threshold
         self._noise_gate_hangover_ms = noise_gate_hangover_ms
+        self._noise_gate_log_interval_s = noise_gate_log_interval_s
         self._idle_timeout_seconds = idle_timeout_seconds
 
         self.transport: WebsocketServerTransport | None = None
@@ -103,6 +107,9 @@ class WebSocketHandler:
         # Surfaced for main.py's connect/disconnect handlers to arm/disarm.
         # Recreated each time the pipeline is built.
         self.session_idle_manager: SessionIdleManager | None = None
+        # Surfaced so the connect handler can reset its diagnostic window per
+        # session (the gate is reused across reconnects).
+        self.noise_gate: NoiseGate | None = None
         # Tracks the most recently connected client websocket. Used to detect
         # stale-socket disconnects when the ESP32 opens a replacement
         # connection (pipecat allows one client; new connections evict old).
@@ -192,7 +199,9 @@ class WebSocketHandler:
             open_threshold=self._noise_gate_open_threshold,
             bot_speaking_threshold=self._noise_gate_bot_speaking_threshold,
             hangover_ms=self._noise_gate_hangover_ms,
+            log_interval_s=self._noise_gate_log_interval_s,
         )
+        self.noise_gate = noise_gate
 
         # End the session only on genuine idle (no user/bot speech, no pending
         # response, no pending tool). Inserted on the output side, just before

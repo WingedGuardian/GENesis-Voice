@@ -7,6 +7,7 @@ with equal-length silence so the VAD never sees it, while passing real speech
 through byte-identical (barge-in preserved).
 """
 import asyncio
+import logging
 
 import numpy as np
 from pipecat.frames.frames import (
@@ -200,3 +201,145 @@ def test_full_scale_negative_sample_not_gated(monkeypatch):
     original = frame.audio
     _run(gate.process_frame(frame, FrameDirection.DOWNSTREAM))
     assert pushed[0][0].audio == original  # passed through, NOT silenced
+
+
+# --- diagnostic instrumentation (for on-device calibration) ---
+# The gate must surface what it is actually seeing — peaks vs threshold, and
+# when audio slips through while the bot is speaking — without spamming the log
+# on every ~100ms frame. These tests pin the sampled-logging contract.
+
+
+def test_emits_periodic_stats_after_interval(monkeypatch, caplog):
+    """After ``log_interval_s`` of frames, one summary line is emitted with the
+    pass/gate counts so we can read the noise floor from journald."""
+    gate, _pushed, clock = _make_gate(monkeypatch, log_interval_s=2.0)
+    with caplog.at_level(logging.INFO, logger="app.noise_gate"):
+        _run(gate.process_frame(_audio_frame(peak=100), FrameDirection.DOWNSTREAM))
+        clock["t"] = 1002.5  # +2.5s > 2.0s interval — flush on the next frame
+        _run(gate.process_frame(_audio_frame(peak=100), FrameDirection.DOWNSTREAM))
+
+    summaries = [r.message for r in caplog.records if "noise-gate stats" in r.message]
+    assert len(summaries) == 1
+    assert "gated=2" in summaries[0]
+
+
+def test_no_stats_before_interval(monkeypatch, caplog):
+    """Frames within one interval do NOT emit a summary (no per-frame spam)."""
+    gate, _pushed, clock = _make_gate(monkeypatch, log_interval_s=2.0)
+    with caplog.at_level(logging.INFO, logger="app.noise_gate"):
+        _run(gate.process_frame(_audio_frame(peak=100), FrameDirection.DOWNSTREAM))
+        clock["t"] = 1001.0  # +1.0s < 2.0s interval
+        _run(gate.process_frame(_audio_frame(peak=100), FrameDirection.DOWNSTREAM))
+
+    assert not any("noise-gate stats" in r.message for r in caplog.records)
+
+
+def test_stats_report_peaks(monkeypatch, caplog):
+    """The summary reports the max passed/gated peaks — the numbers we calibrate
+    thresholds against."""
+    gate, _pushed, clock = _make_gate(
+        monkeypatch, open_threshold=500, bot_speaking_threshold=1500, log_interval_s=2.0
+    )
+    with caplog.at_level(logging.INFO, logger="app.noise_gate"):
+        _run(gate.process_frame(_audio_frame(peak=300), FrameDirection.DOWNSTREAM))  # gated
+        _run(gate.process_frame(_audio_frame(peak=800), FrameDirection.DOWNSTREAM))  # passed
+        clock["t"] = 1002.1
+        _run(gate.process_frame(_audio_frame(peak=100), FrameDirection.DOWNSTREAM))  # gated → flush
+
+    summaries = [r.message for r in caplog.records if "noise-gate stats" in r.message]
+    assert len(summaries) == 1
+    assert "passed=1/3" in summaries[0]
+    assert "max_peak_passed=800" in summaries[0]
+    assert "max_peak_gated=300" in summaries[0]
+
+
+def test_passed_during_bot_speech_logged(monkeypatch, caplog):
+    """When audio slips through the gate WHILE the bot is speaking — the prime
+    false-interrupt suspect — an immediate line is logged with peak + threshold
+    so it can be correlated with the interrupt timestamps."""
+    gate, _pushed, _clock = _make_gate(
+        monkeypatch, open_threshold=500, bot_speaking_threshold=1500, log_interval_s=2.0
+    )
+    with caplog.at_level(logging.INFO, logger="app.noise_gate"):
+        _run(gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM))
+        _run(gate.process_frame(_audio_frame(peak=5000), FrameDirection.DOWNSTREAM))
+
+    hits = [r.message for r in caplog.records if "PASSED during bot speech" in r.message]
+    assert len(hits) == 1
+    assert "peak=5000" in hits[0]
+
+
+def test_passed_during_bot_speech_throttled(monkeypatch, caplog):
+    """Repeated pass-through during a single bot turn logs at most once per
+    interval — a real barge-in must not flood the log."""
+    gate, _pushed, clock = _make_gate(
+        monkeypatch, open_threshold=500, bot_speaking_threshold=1500, log_interval_s=2.0
+    )
+    with caplog.at_level(logging.INFO, logger="app.noise_gate"):
+        _run(gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM))
+        _run(gate.process_frame(_audio_frame(peak=5000), FrameDirection.DOWNSTREAM))
+        clock["t"] = 1000.5  # +0.5s < 2.0s interval
+        _run(gate.process_frame(_audio_frame(peak=5000), FrameDirection.DOWNSTREAM))
+
+    hits = [r.message for r in caplog.records if "PASSED during bot speech" in r.message]
+    assert len(hits) == 1
+
+
+def test_logging_disabled_when_interval_non_positive(monkeypatch, caplog):
+    """``log_interval_s <= 0`` turns instrumentation off entirely — the post-
+    calibration quiet switch (set via env, no redeploy)."""
+    gate, _pushed, clock = _make_gate(monkeypatch, log_interval_s=0)
+    with caplog.at_level(logging.INFO, logger="app.noise_gate"):
+        _run(gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM))
+        for _ in range(5):
+            _run(gate.process_frame(_audio_frame(peak=5000), FrameDirection.DOWNSTREAM))
+        clock["t"] = 1100.0  # well past any interval
+        _run(gate.process_frame(_audio_frame(peak=5000), FrameDirection.DOWNSTREAM))
+
+    assert not any("noise-gate" in r.message for r in caplog.records)
+
+
+def test_hangover_pass_during_bot_speech_not_flagged(monkeypatch, caplog):
+    """A quiet frame let through ONLY because it rides the hangover window did
+    not cross the threshold — it must NOT be logged as a barge-in suspect, or
+    its near-zero peak corrupts the calibration signal. Only threshold-crossing
+    frames (the ones that actually opened the gate) get flagged."""
+    gate, _pushed, clock = _make_gate(
+        monkeypatch,
+        open_threshold=500,
+        bot_speaking_threshold=1500,
+        hangover_ms=5000,  # long hangover so the quiet frame still passes
+        log_interval_s=0.1,  # short throttle so it's NOT what suppresses the log
+    )
+    with caplog.at_level(logging.INFO, logger="app.noise_gate"):
+        _run(gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM))
+        _run(gate.process_frame(_audio_frame(peak=5000), FrameDirection.DOWNSTREAM))  # opens gate
+        clock["t"] = 1000.2  # +0.2s > 0.1s throttle, but < 5.0s hangover
+        _run(gate.process_frame(_audio_frame(peak=50), FrameDirection.DOWNSTREAM))  # hangover pass
+
+    # Exactly one flag — the threshold-crossing frame. The quiet hangover frame
+    # is NOT flagged: with log_interval_s=0.1 the throttle would have allowed a
+    # second log 0.2s later, so the single hit proves the peak>=threshold guard.
+    hits = [r.message for r in caplog.records if "PASSED during bot speech" in r.message]
+    assert len(hits) == 1
+    assert "peak=5000 thr=1500" in hits[0]
+
+
+def test_reset_instrumentation_starts_a_clean_window(monkeypatch, caplog):
+    """``reset_instrumentation()`` (called on client reconnect) clears the
+    throttle + counters so a fresh session's first barge-in always logs, even if
+    the previous session logged one moments earlier."""
+    gate, _pushed, clock = _make_gate(
+        monkeypatch, open_threshold=500, bot_speaking_threshold=1500, log_interval_s=2.0
+    )
+    _run(gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM))
+    _run(gate.process_frame(_audio_frame(peak=5000), FrameDirection.DOWNSTREAM))  # logs, sets throttle
+
+    gate.reset_instrumentation()
+
+    with caplog.at_level(logging.INFO, logger="app.noise_gate"):
+        clock["t"] = 1000.1  # only +0.1s — would be throttled WITHOUT the reset
+        _run(gate.process_frame(_audio_frame(peak=5000), FrameDirection.DOWNSTREAM))
+
+    hits = [r.message for r in caplog.records if "PASSED during bot speech" in r.message]
+    assert len(hits) == 1
