@@ -85,6 +85,23 @@ class Application:
         # Get recording setting (optional, defaults to false)
         enable_recording = os.environ.get("ENABLE_RECORDING", "false").lower() == "true"
 
+        # Noise gate + idle-timeout config (calibrated live; sane defaults).
+        # NoiseGate: gate sub-threshold mic noise before OpenAI's VAD sees it.
+        # SessionIdleManager: end the session only on genuine idle.
+        noise_gate_open_threshold = int(os.environ.get("NOISE_GATE_OPEN_THRESHOLD", "500"))
+        noise_gate_bot_speaking_threshold = int(
+            os.environ.get("NOISE_GATE_BOT_SPEAKING_THRESHOLD", "1500")
+        )
+        noise_gate_hangover_ms = float(os.environ.get("NOISE_GATE_HANGOVER_MS", "250"))
+        idle_timeout_seconds = float(os.environ.get("IDLE_TIMEOUT_SECONDS", "45"))
+        logger.info(
+            "Noise gate: open=%d, bot_speaking=%d, hangover=%.0fms; idle_timeout=%.0fs",
+            noise_gate_open_threshold,
+            noise_gate_bot_speaking_threshold,
+            noise_gate_hangover_ms,
+            idle_timeout_seconds,
+        )
+
         # Get session reuse timeout and initialize session manager
         session_reuse_timeout = float(os.environ.get("SESSION_REUSE_TIMEOUT_SECONDS", "300"))
         self.session_manager = SessionManager(reuse_timeout=session_reuse_timeout)
@@ -128,7 +145,11 @@ class Application:
             host=websocket_host,
             port=websocket_port,
             session_manager=self.session_manager,
-            audio_recording_service=self.audio_recording_service
+            audio_recording_service=self.audio_recording_service,
+            noise_gate_open_threshold=noise_gate_open_threshold,
+            noise_gate_bot_speaking_threshold=noise_gate_bot_speaking_threshold,
+            noise_gate_hangover_ms=noise_gate_hangover_ms,
+            idle_timeout_seconds=idle_timeout_seconds,
         )
         self.websocket_transport = self.websocket_handler.create_transport()
 
@@ -371,10 +392,17 @@ class Application:
             if self.audio_recording_service:
                 self.audio_recording_service.start_new_session(client_id)
             _start_rotation_timer()
+            # Start tracking idle for this session (closes the WS on genuine idle).
+            idle_manager = getattr(self.websocket_handler, "session_idle_manager", None)
+            if idle_manager:
+                idle_manager.arm()
 
         async def on_client_disconnected(client_id: str):
             """Handle client disconnection."""
             _cancel_rotation_timer()
+            idle_manager = getattr(self.websocket_handler, "session_idle_manager", None)
+            if idle_manager:
+                idle_manager.disarm()
             if self.session_manager:
                 self.session_manager.handle_client_disconnect(client_id, self.openai_service)
 
