@@ -17,11 +17,18 @@ logger = logging.getLogger(__name__)
 
 
 class ContextCacheEntry:
-    """Entry in the context cache for a specific client."""
+    """Entry in the context cache for a specific client.
 
-    def __init__(self, context: LLMContext, timestamp: float):
+    ``message_count`` is the number of messages in the cached context. It lets
+    the manager tell a genuinely new turn (count grows) from reconnect churn
+    (count unchanged), so churn does not refresh ``timestamp`` and keep a stale
+    context alive indefinitely past ``reuse_timeout``.
+    """
+
+    def __init__(self, context: LLMContext, timestamp: float, message_count: int):
         self.context = context
         self.timestamp = timestamp
+        self.message_count = message_count
 
 
 class SessionManager:
@@ -96,11 +103,24 @@ class SessionManager:
         if context:
             messages = context.get_messages() if hasattr(context, 'get_messages') else []
             message_count = len(messages) if messages else 0
-            self.context_caches[client_id] = ContextCacheEntry(
-                context=context,
-                timestamp=time.time()
-            )
-            logger.info(f"💾 Cached context from previous session for client {client_id} ({message_count} messages)")
+            existing = self.context_caches.get(client_id)
+            if existing is not None and message_count <= existing.message_count:
+                # No new conversational content since the last cache — this is a
+                # reconnect with no new turns (the device churns sub-second
+                # reconnects). Leave the existing entry intact so its `timestamp`
+                # keeps ageing toward `reuse_timeout` from the last REAL turn,
+                # instead of refreshing to "now" and reviving stale context.
+                logger.debug(
+                    f"↩️ Re-cache for client {client_id} with no new messages "
+                    f"({message_count}) — keeping original cache timestamp"
+                )
+            else:
+                self.context_caches[client_id] = ContextCacheEntry(
+                    context=context,
+                    timestamp=time.time(),
+                    message_count=message_count,
+                )
+                logger.info(f"💾 Cached context from previous session for client {client_id} ({message_count} messages)")
         else:
             if not service:
                 logger.warning(f"⚠️ No service provided to cache context for client {client_id}")
@@ -261,7 +281,10 @@ class SessionManager:
                 self.cache_context_from_service(client_id, service_to_cache)
                 if client_id in self.current_services:
                     del self.current_services[client_id]
-                logger.info(f"💾 Cached context for disconnected client {client_id}")
+                # cache_context_from_service logs the actual store (or the
+                # churn skip) — this is just the disconnect-path trace, kept at
+                # debug so it doesn't falsely imply a write on reconnect churn.
+                logger.debug(f"🔌 Disconnect handled for client {client_id}")
             except Exception as e:
                 logger.warning(f"⚠️ Error caching context for disconnected client {client_id}: {e}")
         else:
