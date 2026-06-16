@@ -20,7 +20,9 @@ from pipecat.transports.websocket.server import WebsocketServerParams, Websocket
 
 from app.audio_recording_service import AudioRecordingService
 from app.interrupt_relay import InterruptRelay
+from app.noise_gate import NoiseGate
 from app.raw_audio_serializer import RawAudioSerializer
+from app.session_idle_manager import SessionIdleManager
 from app.session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
@@ -63,6 +65,10 @@ class WebSocketHandler:
         port: int = 8080,
         session_manager: SessionManager | None = None,
         audio_recording_service: AudioRecordingService | None = None,
+        noise_gate_open_threshold: int = 500,
+        noise_gate_bot_speaking_threshold: int = 1500,
+        noise_gate_hangover_ms: float = 250,
+        idle_timeout_seconds: float = 45,
     ):
         """
         Initialize WebSocket handler.
@@ -72,16 +78,31 @@ class WebSocketHandler:
             port: Port to listen on
             session_manager: Session manager instance
             audio_recording_service: Audio recording service instance
+            noise_gate_open_threshold: Peak amplitude (int16) above which mic
+                audio passes while the bot is idle.
+            noise_gate_bot_speaking_threshold: Higher peak threshold applied
+                while the bot is speaking (raises the bar for barge-in).
+            noise_gate_hangover_ms: Hangover window keeping the gate open after
+                a loud frame so mid-word dips are not clipped.
+            idle_timeout_seconds: Seconds of genuine idle (no speech, response,
+                or pending tool) after which the client WS is closed.
         """
         self.host = host
         self.port = port
         self.session_manager = session_manager
         self.audio_recording_service = audio_recording_service
+        self._noise_gate_open_threshold = noise_gate_open_threshold
+        self._noise_gate_bot_speaking_threshold = noise_gate_bot_speaking_threshold
+        self._noise_gate_hangover_ms = noise_gate_hangover_ms
+        self._idle_timeout_seconds = idle_timeout_seconds
 
         self.transport: WebsocketServerTransport | None = None
         self.pipeline: Pipeline | None = None
         self.runner: PipelineRunner | None = None
         self.current_task: PipelineTask | None = None
+        # Surfaced for main.py's connect/disconnect handlers to arm/disarm.
+        # Recreated each time the pipeline is built.
+        self.session_idle_manager: SessionIdleManager | None = None
         # Tracks the most recently connected client websocket. Used to detect
         # stale-socket disconnects when the ESP32 opens a replacement
         # connection (pipecat allows one client; new connections evict old).
@@ -164,11 +185,31 @@ class WebSocketHandler:
         # transport input so interrupts act before anything else.
         interrupt_relay = InterruptRelay(openai_service=openai_service)
 
+        # Gate sub-threshold mic noise BEFORE OpenAI's VAD sees it (kills
+        # false interrupts) while passing real speech through (barge-in
+        # preserved). Sits on the input side, after the activity tracker.
+        noise_gate = NoiseGate(
+            open_threshold=self._noise_gate_open_threshold,
+            bot_speaking_threshold=self._noise_gate_bot_speaking_threshold,
+            hangover_ms=self._noise_gate_hangover_ms,
+        )
+
+        # End the session only on genuine idle (no user/bot speech, no pending
+        # response, no pending tool). Inserted on the output side, just before
+        # transport.output(). Surfaced on the handler so main.py can
+        # arm/disarm it on client connect/disconnect.
+        session_idle_manager = SessionIdleManager(
+            transport=transport,
+            idle_timeout=self._idle_timeout_seconds,
+        )
+        self.session_idle_manager = session_idle_manager
+
         # Build pipeline components
         pipeline_components = [
             transport.input(),
             interrupt_relay,
             input_activity_tracker,
+            noise_gate,
         ]
 
         # Add input audio recorder to capture ONLY InputAudioRawFrame
@@ -187,6 +228,10 @@ class WebSocketHandler:
             pipeline_components.append(openai_service)
 
         pipeline_components.append(output_activity_tracker)
+        # Idle manager observes downstream activity (user/tool frames via the
+        # broadcast copy, LLM response frames, bot frames via the upstream
+        # copy) and must sit before transport.output().
+        pipeline_components.append(session_idle_manager)
 
         # Add output audio recorder to capture ONLY OutputAudioRawFrame
         output_recorder = self.audio_recording_service.get_output_recorder() if self.audio_recording_service else None
