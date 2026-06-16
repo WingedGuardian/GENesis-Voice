@@ -343,3 +343,26 @@ def test_reset_instrumentation_starts_a_clean_window(monkeypatch, caplog):
 
     hits = [r.message for r in caplog.records if "PASSED during bot speech" in r.message]
     assert len(hits) == 1
+
+
+def test_flush_on_bot_speaking_transition(monkeypatch, caplog):
+    """A bot start/stop flushes + resets the stats window so each summary covers
+    exactly ONE regime. Without this, a window straddling the transition reports
+    a mix (e.g. frames gated under the bot-speaking threshold showing up in a
+    bot_speaking=False summary), corrupting the per-regime calibration numbers."""
+    gate, _pushed, clock = _make_gate(
+        monkeypatch, open_threshold=500, bot_speaking_threshold=10000, log_interval_s=10.0
+    )
+    with caplog.at_level(logging.INFO, logger="app.noise_gate"):
+        _run(gate.process_frame(_audio_frame(peak=30000), FrameDirection.DOWNSTREAM))  # idle pass
+        clock["t"] = 1000.3  # past the 250ms hangover
+        _run(gate.process_frame(_audio_frame(peak=100), FrameDirection.DOWNSTREAM))  # idle gate
+        clock["t"] = 1000.5
+        # Bot starts — must flush the IDLE window NOW, despite the 10s interval.
+        _run(gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM))
+
+    summaries = [r.message for r in caplog.records if "noise-gate stats" in r.message]
+    assert len(summaries) == 1
+    assert "bot_speaking=False" in summaries[0]  # the flushed window is the idle one
+    assert "passed=1/2" in summaries[0]
+    assert "max_peak_passed=30000" in summaries[0]

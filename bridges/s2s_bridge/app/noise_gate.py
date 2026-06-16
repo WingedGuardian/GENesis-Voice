@@ -68,8 +68,12 @@ class NoiseGate(FrameProcessor):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, BotStartedSpeakingFrame):
+            # Close the idle window before the regime changes so it never
+            # straddles the transition, then switch.
+            self._flush_stats(time.monotonic())
             self._bot_speaking = True
         elif isinstance(frame, BotStoppedSpeakingFrame):
+            self._flush_stats(time.monotonic())
             self._bot_speaking = False
         elif isinstance(frame, InputAudioRawFrame):
             self._gate(frame)
@@ -138,23 +142,39 @@ class NoiseGate(FrameProcessor):
             self._frames_gated += 1
             self._max_peak_gated = max(self._max_peak_gated, peak)
 
-        elapsed = now - self._stats_window_start
-        if elapsed >= self._log_interval_s:
-            total = self._frames_passed + self._frames_gated
-            if total:
-                logger.info(
-                    "noise-gate stats[%.0fs]: bot_speaking=%s thr=%d "
-                    "passed=%d/%d gated=%d max_peak_passed=%d max_peak_gated=%d",
-                    elapsed,
-                    self._bot_speaking,
-                    threshold,
-                    self._frames_passed,
-                    total,
-                    self._frames_gated,
-                    self._max_peak_passed,
-                    self._max_peak_gated,
-                )
-            self._reset_stats(now)
+        if now - self._stats_window_start >= self._log_interval_s:
+            self._flush_stats(now)
+
+    def _flush_stats(self, now: float) -> None:
+        """Emit the current window's summary (if it has frames) and reset it.
+
+        Called both on the periodic interval AND on every bot-speaking
+        transition, so a window never straddles idle ↔ bot-speaking. That keeps
+        the per-regime peaks honest: the logged ``bot_speaking`` and ``thr``
+        apply to every frame counted in the window.
+        """
+        if self._log_interval_s <= 0:
+            return
+        total = self._frames_passed + self._frames_gated
+        if total and self._stats_window_start is not None:
+            threshold = (
+                self._bot_speaking_threshold
+                if self._bot_speaking
+                else self._open_threshold
+            )
+            logger.info(
+                "noise-gate stats[%.1fs]: bot_speaking=%s thr=%d "
+                "passed=%d/%d gated=%d max_peak_passed=%d max_peak_gated=%d",
+                now - self._stats_window_start,
+                self._bot_speaking,
+                threshold,
+                self._frames_passed,
+                total,
+                self._frames_gated,
+                self._max_peak_passed,
+                self._max_peak_gated,
+            )
+        self._reset_stats(now)
 
     def _reset_stats(self, now: float) -> None:
         """Start a fresh stats window at ``now``."""
