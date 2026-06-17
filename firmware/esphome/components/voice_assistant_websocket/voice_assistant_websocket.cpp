@@ -25,6 +25,18 @@ void VoiceAssistantWebSocket::setup() {
   this->output_stereo_buffer_.reserve(4096 * 2);  // Reserve for output processing (24kHz mono -> 48kHz stereo)
   this->state_ = VOICE_ASSISTANT_WEBSOCKET_IDLE;
   
+  // Mutex serializing all sends on websocket_client_ (mic/audio task vs the loop
+  // task's interrupt()). Without it, concurrent sends corrupt the outgoing
+  // WebSocket frame masking and the server drops the connection (1002).
+  this->ws_send_lock_ = xSemaphoreCreateMutex();
+  if (this->ws_send_lock_ == nullptr) {
+    // Without the send mutex, concurrent sends corrupt the WS frame and kill the
+    // link (the bug we're fixing) — refuse to operate rather than run unserialized.
+    ESP_LOGE(TAG, "Failed to create WebSocket send mutex — marking component failed");
+    this->mark_failed();
+    return;
+  }
+
   // Register microphone data callback
   if (this->microphone_ != nullptr) {
     this->microphone_->add_data_callback([this](const std::vector<uint8_t> &data) {
@@ -34,6 +46,15 @@ void VoiceAssistantWebSocket::setup() {
 }
 
 void VoiceAssistantWebSocket::loop() {
+  // Diagnostic: periodic free-heap while connected, to spot heap exhaustion
+  // before a ~45s connection death (calibration instrumentation).
+  uint32_t loop_now = millis();
+  if (this->is_connected() && loop_now - this->last_heap_log_ >= 5000) {
+    this->last_heap_log_ = loop_now;
+    ESP_LOGI(TAG, "diag: free heap=%u, state=%d",
+             (unsigned) esp_get_free_heap_size(), (int) this->state_);
+  }
+
   // Ambient mode connect/disconnect — network ops belong in the main task, not
   // the switch lambda. Done FIRST (the pending_disconnect_ block below early-
   // returns, and this is independent of the s2s session lifecycle).
@@ -353,13 +374,26 @@ void VoiceAssistantWebSocket::send_audio_chunk_(const uint8_t *data, size_t len)
     return;
   }
   
-  // Send binary data
-  int sent = esp_websocket_client_send_bin(this->websocket_client_, 
-                                            (const char *) data, 
-                                            len, 
-                                            portMAX_DELAY);
+  // Serialize with interrupt()'s send (different task, same handle). Drop this
+  // frame rather than block the audio task if the lock is held — a missed 100ms
+  // chunk is harmless; a concurrent write that corrupts the frame is not.
+  if (this->ws_send_lock_ != nullptr &&
+      xSemaphoreTake(this->ws_send_lock_, pdMS_TO_TICKS(50)) != pdTRUE) {
+    ESP_LOGW(TAG, "send_audio_chunk_: send lock busy, dropping frame");
+    return;
+  }
+  // Bounded timeout (was portMAX_DELAY): fail fast if the TCP buffer is full
+  // instead of blocking the task and holding the lock.
+  int sent = esp_websocket_client_send_bin(this->websocket_client_,
+                                            (const char *) data,
+                                            len,
+                                            pdMS_TO_TICKS(100));
+  if (this->ws_send_lock_ != nullptr) {
+    xSemaphoreGive(this->ws_send_lock_);
+  }
   if (sent < 0) {
-    ESP_LOGW(TAG, "Failed to send audio chunk");
+    ESP_LOGW(TAG, "Failed to send audio chunk (free heap=%u)",
+             (unsigned) esp_get_free_heap_size());
   }
 }
 
@@ -582,9 +616,22 @@ void VoiceAssistantWebSocket::interrupt() {
   
   ESP_LOGI(TAG, "Sending interrupt message to server");
   
-  // Send interrupt message as JSON text frame
+  // Send interrupt message as JSON text frame. Serialize with the audio send
+  // task (see send_audio_chunk_) — NEVER send concurrently, that is the
+  // corruption we're fixing. If the lock is held (a send is in flight), DROP the
+  // interrupt: a dropped barge-in is recoverable (the server's own VAD also
+  // detects the user, and they can retry); a concurrent write kills the link.
   const char *interrupt_msg = "{\"type\":\"interrupt\"}";
-  int sent = esp_websocket_client_send_text(this->websocket_client_, interrupt_msg, strlen(interrupt_msg), portMAX_DELAY);
+  if (this->ws_send_lock_ != nullptr &&
+      xSemaphoreTake(this->ws_send_lock_, pdMS_TO_TICKS(200)) != pdTRUE) {
+    ESP_LOGW(TAG, "interrupt: send lock busy after 200ms, dropping interrupt");
+    return;
+  }
+  int sent = esp_websocket_client_send_text(this->websocket_client_, interrupt_msg,
+                                             strlen(interrupt_msg), pdMS_TO_TICKS(100));
+  if (this->ws_send_lock_ != nullptr) {
+    xSemaphoreGive(this->ws_send_lock_);
+  }
   
   if (sent < 0) {
     ESP_LOGW(TAG, "Failed to send interrupt message");
@@ -639,7 +686,8 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       break;
       
     case WEBSOCKET_EVENT_DISCONNECTED:
-      ESP_LOGW(TAG, "WebSocket disconnected");
+      ESP_LOGW(TAG, "WebSocket disconnected (free heap=%u)",
+               (unsigned) esp_get_free_heap_size());
       this->state_ = VOICE_ASSISTANT_WEBSOCKET_DISCONNECTED;
       
       if (this->state_callback_) {
@@ -704,12 +752,13 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
         int sock_errno = event_data->error_handle.esp_transport_sock_errno;
         esp_err_t tls_err = event_data->error_handle.esp_tls_last_esp_err;
         
-        ESP_LOGE(TAG, "WebSocket error - Type: %d, ESP-TLS Error: %s (0x%x), Socket errno: %d, Handshake Status: %d",
+        ESP_LOGE(TAG, "WebSocket error - Type: %d, ESP-TLS Error: %s (0x%x), Socket errno: %d, Handshake Status: %d, free heap=%u",
                  event_data->error_handle.error_type,
                  esp_err_to_name(tls_err),
                  tls_err,
                  sock_errno,
-                 event_data->error_handle.esp_ws_handshake_status_code);
+                 event_data->error_handle.esp_ws_handshake_status_code,
+                 (unsigned) esp_get_free_heap_size());
         
         // Log specific error types
         if (event_data->error_handle.error_type != WEBSOCKET_ERROR_TYPE_NONE) {
