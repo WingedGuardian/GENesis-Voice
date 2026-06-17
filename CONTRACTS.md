@@ -6,20 +6,23 @@ an implementation detail.
 ## 1. Device to edge — audio WebSocket
 
 The Voice PE firmware opens a WebSocket to a bridge and streams raw audio. Both bridges
-speak the same wire contract.
+speak the same wire contract. The firmware maintains up to two such sockets:
 
-- **Audio frames** — binary WebSocket frames (opcode 0x02), each carrying raw
-  **16-bit little-endian, mono PCM at 24 kHz**, roughly 4800 bytes per 100 ms.
+- **Conversational (s2s)** — opened on wake word to `server_url`. Binary frames (opcode
+  0x02) of raw **16-bit little-endian, mono PCM at 24 kHz**, ~4800 bytes per 100 ms (the
+  firmware upsamples the 16 kHz mic for the conversational model).
+- **Ambient** — opened when the **Ambient Mode** switch is ON, to `ambient_url`. Same frame
+  format and opcode, but **16 kHz mono** (~3200 bytes per 100 ms) — the native mic rate,
+  sent without upsampling. Streamed only while no conversation is active (conversation
+  wins). The ambient bridge must run with **`AMBIENT_INPUT_SR=16000`** so its resample is a
+  no-op. (The bridge still accepts 24 kHz from a non-ambient sender and downsamples; the
+  rate is the sender's choice, declared via `AMBIENT_INPUT_SR`.)
 - **Control frames** — text WebSocket frames carrying JSON: `{"type": "interrupt"}` to
-  cut off playback, `{"type": "disconnect"}` to end the session.
+  cut off playback, `{"type": "disconnect"}` to end the session. (Ambient is one-way; the
+  ambient bridge sends no control frames back.)
 - **No auth / no handshake.** The socket is expected to live on a trusted local network.
   Do not expose a bridge port to the public internet.
 - Keepalive is standard WebSocket ping/pong.
-
-Note: 24 kHz is what the firmware sends (it upsamples the 16 kHz mic for the conversational
-model). The ambient bridge downsamples 24 -> 16 kHz for its speech models. A future
-ambient-only firmware mode may send 16 kHz directly; the bridge handles either via its
-`AMBIENT_INPUT_SR` setting.
 
 ## 2. Edge (conversational) to Genesis — `/v1/voice/*`
 

@@ -230,21 +230,38 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-  # Full Duplex Mode — experimental open-mic barge-in. When ON, mic audio
-  # streams to the server even while the bot speaks (semantic VAD + noise
-  # reduction must reject the speaker echo). ALWAYS_OFF: the experiment
-  # never survives a reboot.
+  # Full Duplex Mode — open-mic barge-in: when ON, mic audio streams even while
+  # the bot speaks, so you can talk over it (semantic VAD + near-field noise
+  # reduction reject the speaker echo — verified Jun 13). RESTORE_DEFAULT_ON:
+  # defaults ON and PERSISTS across reboots/flashes (a setting must never reset).
   - platform: template
     id: full_duplex_mode
     name: "Full Duplex Mode"
     icon: "mdi:account-voice"
     entity_category: config
     optimistic: true
-    restore_mode: ALWAYS_OFF
+    restore_mode: RESTORE_DEFAULT_ON
     turn_on_action:
       - lambda: 'id(voice_assistant_ws).set_full_duplex(true);'
     turn_off_action:
       - lambda: 'id(voice_assistant_ws).set_full_duplex(false);'
+  # Ambient Mode — passive, wake-word-free capture. When ON and NO conversation
+  # is active, mic audio (16 kHz mono) streams to the AMBIENT bridge (a separate
+  # one-way sink) for local transcription. Conversation always wins: ambient
+  # pauses during a wake-word session and resumes after. RESTORE_DEFAULT_OFF:
+  # PERSISTS your last choice across reboots/flashes (defaults OFF on a first-ever
+  # boot only — privacy default). Needs ambient_url set on the component.
+  - platform: template
+    id: ambient_mode
+    name: "Ambient Mode"
+    icon: "mdi:ear-hearing"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: 'id(voice_assistant_ws).set_ambient(true);'
+    turn_off_action:
+      - lambda: 'id(voice_assistant_ws).set_ambient(false);'
   - platform: gpio
     pin: GPIO47
     id: internal_speaker_amp
@@ -1429,26 +1446,18 @@ micro_wake_word:
           # wake word as an interrupt (if bot is speaking) or ignore it.
           # NEVER stop+restart — that kills the active WS connection and
           # causes the "Only one client allowed" race on the addon side.
+          # Wake word ONLY starts a session — it NEVER interrupts. Interruption
+          # is the open-mic / Full Duplex path (semantic VAD detects you talking
+          # over the bot). If already in a session, the wake word is ignored.
           - if:
               condition:
-                or:
-                  - voice_assistant_websocket.is_running:
-                      id: voice_assistant_ws
-                  - voice_assistant_websocket.is_connected:
-                      id: voice_assistant_ws
-              then:
-                # Already in a session — only interrupt if bot is speaking
-                - if:
-                    condition:
-                      voice_assistant_websocket.is_bot_speaking:
+                not:
+                  or:
+                    - voice_assistant_websocket.is_running:
                         id: voice_assistant_ws
-                    then:
-                      - voice_assistant_websocket.interrupt:
-                          id: voice_assistant_ws
-                # If bot is not speaking, ignore the wake word — user is
-                # already in a conversation and the mic is active
-              else:
-                # Voice assistant not running — start a new session
+                    - voice_assistant_websocket.is_connected:
+                        id: voice_assistant_ws
+              then:
                 - if:
                     condition:
                       switch.is_on: wake_sound
@@ -1482,7 +1491,11 @@ voice_assistant_websocket:
   id: voice_assistant_ws
   # Server URL - uses secret from secrets.yaml
   server_url: !secret server_url
-  
+  # Ambient bridge URL (second, one-way PCM sink). Used only when the Ambient
+  # Mode switch is ON and no conversation is active. From secrets so the private
+  # LAN address never enters this public repo. Set a placeholder if unused.
+  ambient_url: !secret ambient_bridge_url
+
   # Audio input (microphone) - reference to I2S audio input
   microphone: i2s_mics
   

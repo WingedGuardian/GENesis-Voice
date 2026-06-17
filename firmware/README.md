@@ -5,6 +5,25 @@ Derived from the Home Assistant Voice PE ESPHome firmware, with a custom
 `voice_assistant_websocket` component that streams audio to a bridge (see
 [`../CONTRACTS.md`](../CONTRACTS.md)) and the `"hey genesis"` wake word.
 
+## Two capture paths
+
+1. **Conversational (wake word).** Say "hey genesis" → the component opens a WebSocket to
+   the **s2s bridge** (`server_url`) and streams 24 kHz mono PCM for a live OpenAI Realtime
+   conversation. This is the original behaviour, unchanged.
+2. **Ambient (wake-word-free).** Toggle the **Ambient Mode** switch ON (HA,
+   `entity_category: config`). When ON *and no conversation is active*, the mic audio is
+   forked to a SECOND WebSocket — the **ambient bridge** (`ambient_url`, default port 8765) —
+   as raw **16 kHz mono** PCM, where it's transcribed locally. A conversation always wins:
+   ambient pauses while a wake-word session is starting/running/stopping and resumes when it
+   ends. The send is bounded/drop-on-full so a slow ambient bridge can never stall wake-word
+   detection.
+
+   Set `ambient_bridge_url` in `secrets.yaml` (the ambient bridge runs with
+   `AMBIENT_INPUT_SR=16000`). The switch is `RESTORE_DEFAULT_OFF` — **OFF on a first-ever
+   boot (privacy default) but it PERSISTS your last choice across reboots and OTA flashes**
+   (settings never silently reset). Muting the device (hardware switch or software mute)
+   stops capture on both paths.
+
 ## Contents
 
 - `esphome/components/voice_assistant_websocket/` — the custom streaming component.

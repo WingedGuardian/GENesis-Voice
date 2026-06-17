@@ -34,6 +34,18 @@ void VoiceAssistantWebSocket::setup() {
 }
 
 void VoiceAssistantWebSocket::loop() {
+  // Ambient mode connect/disconnect — network ops belong in the main task, not
+  // the switch lambda. Done FIRST (the pending_disconnect_ block below early-
+  // returns, and this is independent of the s2s session lifecycle).
+  if (this->pending_ambient_connect_) {
+    this->pending_ambient_connect_ = false;
+    this->connect_ambient_();
+  }
+  if (this->pending_ambient_disconnect_) {
+    this->pending_ambient_disconnect_ = false;
+    this->disconnect_ambient_();
+  }
+
   // Handle pending disconnect (must be done in main task, not websocket task)
   if (this->pending_disconnect_) {
     this->pending_disconnect_ = false;
@@ -149,6 +161,7 @@ void VoiceAssistantWebSocket::loop() {
 void VoiceAssistantWebSocket::dump_config() {
   ESP_LOGCONFIG(TAG, "Voice Assistant WebSocket:");
   ESP_LOGCONFIG(TAG, "  Server URL: %s", this->server_url_.c_str());
+  ESP_LOGCONFIG(TAG, "  Ambient URL: %s", this->ambient_url_.empty() ? "(unset — ambient disabled)" : this->ambient_url_.c_str());
   ESP_LOGCONFIG(TAG, "  Microphone Sample Rate: %u Hz", MICROPHONE_SAMPLE_RATE);
   ESP_LOGCONFIG(TAG, "  Input Sample Rate (after resampling): %u Hz", INPUT_SAMPLE_RATE);
   ESP_LOGCONFIG(TAG, "  Output Sample Rate: %u Hz", OUTPUT_SAMPLE_RATE);
@@ -475,8 +488,17 @@ void VoiceAssistantWebSocket::process_received_audio_(const uint8_t *data, size_
 }
 
 void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &data) {
-  // Only process if connected and running
+  // Only process for the active conversation if connected and running.
   if (!this->is_connected() || this->state_ != VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
+    // No live conversation stream. If ambient mode is ON, fork the mic audio to
+    // the ambient bridge (a separate one-way sink). Conversation always wins:
+    // conversation_active_() excludes STARTING/RUNNING/STOPPING so we never
+    // capture the head/tail of a wake-word session. Gating on ambient_ (an
+    // atomic bool flipped off BEFORE the client is ever stopped) keeps this
+    // safe against teardown.
+    if (this->ambient_ && !this->conversation_active_() && this->ambient_is_connected_()) {
+      this->stream_ambient_(data);
+    }
     return;
   }
   
@@ -744,6 +766,158 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       break;
       
     default:
+      break;
+  }
+}
+
+// =========================================================================
+// Ambient mode — a SECOND, one-way WebSocket sink to the ambient bridge.
+// Additive: none of this touches the s2s session, state_, triggers, or LEDs.
+// =========================================================================
+
+void VoiceAssistantWebSocket::set_ambient(bool enabled) {
+  if (enabled == this->ambient_) {
+    return;  // no change
+  }
+  if (enabled && this->ambient_url_.empty()) {
+    // Don't enter a "stuck on, silently dead" state: refuse to enable without a
+    // sink. Leaves ambient_ false; the HA switch will reflect the failed turn-on
+    // on its next state read.
+    ESP_LOGE(TAG, "Cannot enable ambient mode: ambient_url is not set");
+    return;
+  }
+  // Flip the gate flag FIRST (the mic task reads this; an aligned bool R/W is
+  // atomic on Xtensa). Defer the actual connect/disconnect to loop() — network
+  // ops must not run on the switch lambda, and ambient_ is already false before
+  // any stop() runs, so the mic task has stopped streaming by then.
+  this->ambient_ = enabled;
+  if (enabled) {
+    this->pending_ambient_connect_ = true;
+    this->pending_ambient_disconnect_ = false;
+  } else {
+    this->pending_ambient_disconnect_ = true;
+    this->pending_ambient_connect_ = false;
+  }
+  ESP_LOGI(TAG, "Ambient mode %s", enabled ? "ENABLED" : "DISABLED");
+}
+
+void VoiceAssistantWebSocket::connect_ambient_() {
+  if (this->ambient_url_.empty()) {
+    ESP_LOGW(TAG, "Ambient URL not set — ambient streaming disabled");
+    return;
+  }
+  // Lazy one-time init. The handle then lives for the rest of uptime; we only
+  // ever stop/start it after this (NEVER destroy) so the mic task can't race a
+  // free. ws:// on the LAN — no TLS.
+  if (this->ambient_ws_client_ == nullptr) {
+    ESP_LOGI(TAG, "Connecting to ambient bridge: %s", this->ambient_url_.c_str());
+    esp_websocket_client_config_t websocket_cfg = {};
+    websocket_cfg.uri = this->ambient_url_.c_str();
+    websocket_cfg.user_context = this;
+    websocket_cfg.buffer_size = 4096;
+    websocket_cfg.task_prio = 4;   // below the s2s WS task (5); ambient is background
+    websocket_cfg.task_stack = 6144;
+    websocket_cfg.transport = WEBSOCKET_TRANSPORT_OVER_TCP;
+    websocket_cfg.network_timeout_ms = 30000;
+    websocket_cfg.reconnect_timeout_ms = 10000;  // esp client auto-reconnects while it lives
+    websocket_cfg.ping_interval_sec = 20;
+    websocket_cfg.pingpong_timeout_sec = 10;
+    this->ambient_ws_client_ = esp_websocket_client_init(&websocket_cfg);
+    if (this->ambient_ws_client_ == nullptr) {
+      ESP_LOGE(TAG, "Failed to initialize ambient WS client");
+      return;
+    }
+    esp_websocket_register_events(this->ambient_ws_client_,
+                                  (esp_websocket_event_id_t) WEBSOCKET_EVENT_ANY,
+                                  ambient_event_handler_, this);
+  } else {
+    ESP_LOGI(TAG, "Resuming ambient bridge connection");
+  }
+  // Already up (e.g. a redundant enable) — nothing to start.
+  if (esp_websocket_client_is_connected(this->ambient_ws_client_)) {
+    return;
+  }
+  esp_err_t err = esp_websocket_client_start(this->ambient_ws_client_);
+  if (err == ESP_ERR_INVALID_STATE) {
+    // A recent stop()'s client task may still be unwinding, so start() can't run
+    // yet. Re-queue and retry next loop — converges in a tick or two (without
+    // this, a fast OFF→ON toggle would leave ambient silently never-reconnected).
+    ESP_LOGD(TAG, "Ambient WS not ready to start yet — retrying next loop");
+    this->pending_ambient_connect_ = true;
+    return;
+  }
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to start ambient WS client: %s", esp_err_to_name(err));
+  }
+}
+
+void VoiceAssistantWebSocket::disconnect_ambient_() {
+  if (this->ambient_ws_client_ == nullptr) {
+    return;
+  }
+  // STOP, never destroy: the mic task may still hold the handle. Stop closes the
+  // TCP connection + halts auto-reconnect but keeps the handle valid, so a racing
+  // send_bin returns an error rather than touching freed memory. ambient_ is
+  // already false here, so the mic gate has stopped calling stream_ambient_.
+  ESP_LOGI(TAG, "Pausing ambient bridge connection");
+  esp_websocket_client_stop(this->ambient_ws_client_);
+}
+
+void VoiceAssistantWebSocket::stream_ambient_(const std::vector<uint8_t> &data) {
+  // Mic native format: 16kHz, 32-bit, stereo. The ambient bridge wants 16kHz
+  // 16-bit MONO (its sherpa STT is 16kHz). Extract the left channel and send raw
+  // — NO 24k upsample (unlike the s2s path, which upsamples for OpenAI). The
+  // bridge runs with AMBIENT_INPUT_SR=16000 so 16k is its native rate.
+  size_t stereo_32bit_samples = data.size() / (4 * 2);  // 4 bytes/sample, 2 channels
+  if (stereo_32bit_samples == 0) {
+    return;
+  }
+  if (this->mono_buffer_.size() < stereo_32bit_samples) {
+    this->mono_buffer_.resize(stereo_32bit_samples);
+  }
+  const int32_t *stereo_32bit = reinterpret_cast<const int32_t *>(data.data());
+  int16_t *mono_16bit = this->mono_buffer_.data();
+  for (size_t i = 0; i < stereo_32bit_samples; i++) {
+    int32_t left_sample = stereo_32bit[i * 2];
+    mono_16bit[i] = static_cast<int16_t>((left_sample >> 16));
+  }
+  size_t mono_bytes = stereo_32bit_samples * BYTES_PER_SAMPLE;
+  // Bounded send (drop-on-full): a slow/unreachable bridge must NEVER stall the
+  // mic callback that feeds micro_wake_word. Ambient is lossy-tolerant.
+  int sent = esp_websocket_client_send_bin(this->ambient_ws_client_,
+                                           reinterpret_cast<const char *>(mono_16bit),
+                                           mono_bytes,
+                                           pdMS_TO_TICKS(AMBIENT_SEND_TIMEOUT_MS));
+  if (sent < 0) {
+    ESP_LOGV(TAG, "Ambient frame dropped (TX busy)");
+  }
+}
+
+void VoiceAssistantWebSocket::ambient_event_handler_(void *handler_args,
+                                                     esp_event_base_t base,
+                                                     int32_t event_id,
+                                                     void *event_data) {
+  VoiceAssistantWebSocket *instance = static_cast<VoiceAssistantWebSocket *>(handler_args);
+  instance->handle_ambient_event_((esp_websocket_event_id_t) event_id,
+                                  (esp_websocket_event_data_t *) event_data);
+}
+
+void VoiceAssistantWebSocket::handle_ambient_event_(esp_websocket_event_id_t event_id,
+                                                    esp_websocket_event_data_t *event_data) {
+  // Minimal: the ambient client is a one-way PCM sink. NEVER touch the s2s state
+  // machine (state_), reconnect flags, triggers, LEDs, or the speaker here.
+  switch (event_id) {
+    case WEBSOCKET_EVENT_CONNECTED:
+      ESP_LOGI(TAG, "Ambient bridge connected");
+      break;
+    case WEBSOCKET_EVENT_DISCONNECTED:
+      ESP_LOGW(TAG, "Ambient bridge disconnected (esp client will auto-reconnect)");
+      break;
+    case WEBSOCKET_EVENT_ERROR:
+      ESP_LOGW(TAG, "Ambient bridge connection error");
+      break;
+    default:
+      // Ignore DATA (bridge is one-way), BEFORE_CONNECT, etc.
       break;
   }
 }
