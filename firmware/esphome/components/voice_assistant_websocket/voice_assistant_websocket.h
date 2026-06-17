@@ -9,6 +9,7 @@
 #include "esp_http_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_system.h"
 #endif
 #include <string>
@@ -110,9 +111,14 @@ class VoiceAssistantWebSocket : public Component {
 #ifdef USE_ESP_IDF
   esp_websocket_client_handle_t websocket_client_{nullptr};
   esp_websocket_client_handle_t ambient_ws_client_{nullptr};  // second one-way sink
+  // Serializes all sends on websocket_client_: the mic/audio task and the main
+  // loop task (interrupt()) both write this one handle, and concurrent writes
+  // corrupt the outgoing WebSocket frame masking (server drops with 1002).
+  SemaphoreHandle_t ws_send_lock_{nullptr};
 #else
   void *websocket_client_{nullptr};
   void *ambient_ws_client_{nullptr};
+  void *ws_send_lock_{nullptr};
 #endif
   VoiceAssistantWebSocketState state_{VOICE_ASSISTANT_WEBSOCKET_IDLE};
   
@@ -145,6 +151,7 @@ class VoiceAssistantWebSocket : public Component {
   // Timing
   uint32_t last_audio_send_{0};
   uint32_t last_audio_receive_{0};
+  uint32_t last_heap_log_{0};  // diag: throttle periodic free-heap logging
   static const uint32_t AUDIO_SEND_INTERVAL_MS = 100;  // Send 100ms chunks
   static const uint32_t MICROPHONE_SAMPLE_RATE = 16000;  // 16kHz from microphone (required by micro_wake_word)
   static const uint32_t INPUT_SAMPLE_RATE = 24000;       // 24kHz for OpenAI input (non-beta API requirement)
