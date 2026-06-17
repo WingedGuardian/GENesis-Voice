@@ -13,12 +13,18 @@ Endpoints called:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
+import uuid
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+_MAX_PERSIST_ATTEMPTS = 3
 
 
 class GenesisToolService:
@@ -28,11 +34,16 @@ class GenesisToolService:
     triggers a function call (ask_genesis, web_search, approve_pending).
     """
 
-    def __init__(self, genesis_url: str, token: str = "") -> None:
+    def __init__(
+        self, genesis_url: str, token: str = "", fallback_dir: str = "failed_transcripts",
+    ) -> None:
         self._url = genesis_url.rstrip("/")
         self._headers: dict[str, str] = {"Content-Type": "application/json"}
         if token:
             self._headers["Authorization"] = f"Bearer {token}"
+        # Where to save a transcript if persistence to Genesis fails after all
+        # retries, so a conversation is never lost (see store_conversation).
+        self._fallback_dir = Path(fallback_dir)
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict:
         """Dispatch a tool call to Genesis and return the result."""
@@ -88,24 +99,79 @@ class GenesisToolService:
             return None
 
         transcript = f"Voice conversation [{satellite_id}]:\n" + "\n".join(turns)
+        # Log the transcript turn-by-turn BEFORE the (fragile) network call, so
+        # the conversation survives in journald even if every persist attempt
+        # fails — and one oversized line can't be truncated by journald.
         logger.info(
-            "Persisting voice conversation (%d turns, %d chars)",
+            "Persisting voice conversation (%d turns, %d chars):",
             len(turns), len(transcript),
         )
+        for turn in turns:
+            logger.info("  %s", turn)
 
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                f"{self._url}/api/t/memory_store",
-                headers=self._headers,
-                json={
-                    "content": transcript,
-                    "source": "voice_s2s",
-                    "memory_type": "episodic",
-                    "tags": ["voice", "s2s", "conversation"],
-                    "confidence": 0.5,
-                    "wing": "channels",
-                    "room": "voice",
-                },
+        payload = {
+            "content": transcript,
+            "source": "voice_s2s",
+            "memory_type": "episodic",
+            "tags": ["voice", "s2s", "conversation"],
+            "confidence": 0.5,
+            "wing": "channels",
+            "room": "voice",
+        }
+
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_PERSIST_ATTEMPTS):
+            try:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    resp = await client.post(
+                        f"{self._url}/api/t/memory_store",
+                        headers=self._headers,
+                        json=payload,
+                    )
+                    resp.raise_for_status()
+                    return resp.json()
+            except asyncio.CancelledError:
+                # Abrupt teardown (loop shutting down / task cancelled) raises a
+                # BaseException that skips ordinary excepts. Save synchronously,
+                # then let the cancellation propagate.
+                self._write_fallback(transcript, None)
+                raise
+            except Exception as exc:
+                # Broad on purpose: httpx errors AND non-httpx teardown errors
+                # (OSError, "Event loop is closed") must not lose the transcript.
+                last_exc = exc
+                logger.warning(
+                    "Persist attempt %d/%d failed: %s: %s",
+                    attempt + 1, _MAX_PERSIST_ATTEMPTS, type(exc).__name__, exc,
+                )
+                if attempt < _MAX_PERSIST_ATTEMPTS - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+
+        # Every attempt failed — save locally so the transcript is never lost.
+        self._write_fallback(transcript, last_exc)
+        return None
+
+    def _write_fallback(self, transcript: str, exc: Exception | None) -> None:
+        """Save a transcript to a local file when Genesis is unreachable."""
+        try:
+            self._fallback_dir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            path = self._fallback_dir / f"voice_{stamp}.txt"
+            n = 0
+            while path.exists() and n < 100:  # avoid clobber within the same second
+                n += 1
+                path = self._fallback_dir / f"voice_{stamp}_{n}.txt"
+            if path.exists():  # pathological dir; guarantee uniqueness, don't spin
+                path = self._fallback_dir / f"voice_{stamp}_{uuid.uuid4().hex[:8]}.txt"
+            path.write_text(transcript, encoding="utf-8")
+            logger.warning(
+                "Persist failed after %d attempts (%s) — saved transcript to %s",
+                _MAX_PERSIST_ATTEMPTS,
+                type(exc).__name__ if exc else "unknown",
+                path,
             )
-            resp.raise_for_status()
-            return resp.json()
+        except Exception as fexc:  # never let fallback failure crash disconnect
+            logger.error(
+                "Could not write fallback transcript: %s: %s",
+                type(fexc).__name__, fexc,
+            )
