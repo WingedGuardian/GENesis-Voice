@@ -12,6 +12,7 @@ These tests exercise the STATE LOGIC and the close decision directly via
 fast and deterministic. A mutable monotonic clock is monkeypatched.
 """
 import asyncio
+import json
 
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
@@ -30,13 +31,24 @@ from app.session_idle_manager import SessionIdleManager
 
 
 class _FakeWebSocket:
-    """Async-closable stand-in for the transport input websocket."""
+    """Async stand-in for the transport input websocket.
+
+    Records send/close calls in order so tests can assert the idle close first
+    tells the device ``{"type":"disconnect"}`` and only THEN closes the socket.
+    """
 
     def __init__(self):
         self.close_count = 0
+        self.calls: list[str] = []   # ordered record of "send"/"close"
+        self.sent: list[str] = []    # payloads passed to send()
+
+    async def send(self, message):
+        self.sent.append(message)
+        self.calls.append("send")
 
     async def close(self):
         self.close_count += 1
+        self.calls.append("close")
 
 
 class _FakeInput:
@@ -59,6 +71,11 @@ def _make_manager(monkeypatch, idle_timeout=45.0):
     and a mutable monotonic clock. Returns (mgr, ws, pushed, clock)."""
     clock = {"t": 1000.0}
     monkeypatch.setattr("app.session_idle_manager.time.monotonic", lambda: clock["t"])
+    # The disconnect-grace in ws_control awaits a real asyncio.sleep, which would
+    # hang under the frozen monotonic clock above (asyncio's loop clock IS
+    # time.monotonic). Make it instant — we verify the send-before-close ORDER,
+    # not the wall-clock grace.
+    monkeypatch.setattr("app.ws_control.asyncio.sleep", _noop_sleep)
 
     ws = _FakeWebSocket()
     transport = _FakeTransport(ws)
@@ -71,6 +88,10 @@ def _make_manager(monkeypatch, idle_timeout=45.0):
 
     mgr.push_frame = fake_push
     return mgr, ws, pushed, clock
+
+
+async def _noop_sleep(*_a, **_k):
+    return None
 
 
 def _run(coro):
@@ -158,6 +179,28 @@ def test_idle_past_timeout_closes_once(monkeypatch):
     # No activity; advance past the timeout.
     clock["t"] = 1000.0 + 46.0
     _run(mgr._check_idle_once())
+    assert ws.close_count == 1
+
+
+def test_idle_close_signals_device_before_closing(monkeypatch):
+    """On idle, the manager must first send a ``{"type":"disconnect"}`` control
+    frame and only THEN close the socket.
+
+    The Voice PE firmware reconnects on a bare socket close but goes cleanly to
+    idle (no reconnect) when it first receives that frame. Closing FIRST orphans
+    the device — it reconnects into a torn-down session and spins forever. The
+    send-before-close ORDER is the contract this test pins.
+    """
+    mgr, ws, _pushed, clock = _make_manager(monkeypatch, idle_timeout=45.0)
+    _run(_arm_quiet(mgr))
+
+    clock["t"] = 1000.0 + 46.0
+    _run(mgr._check_idle_once())
+
+    assert ws.sent, "expected a disconnect control frame to be sent before close"
+    payload = json.loads(ws.sent[0])
+    assert payload.get("type") == "disconnect"
+    assert ws.calls == ["send", "close"]  # signal device first, THEN close
     assert ws.close_count == 1
 
 

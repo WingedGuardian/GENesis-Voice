@@ -1,9 +1,9 @@
 """Tool for disconnecting the client when user says goodbye or stop."""
-import asyncio
-import json
 import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Optional
+
+from app.ws_control import send_disconnect_then_close
 
 if TYPE_CHECKING:
     from pipecat.services.llm_service import FunctionCallParams
@@ -101,17 +101,14 @@ def create_disconnect_callback(
                 logger.warning("⚠️ Transport is not a WebsocketServerTransport")
                 return
 
-            # WebSocket transport - try to disconnect the client
-            # Check for various ways to access the websocket connection
+            # WebSocket transport — locate the underlying websocket to close.
+            # Deliberately NO transport.disconnect_client() path: WebsocketServer-
+            # Transport has no such method (this is already guarded to that type
+            # above), and routing through it would bare-close the socket, bypassing
+            # send_disconnect_then_close and re-introducing the device spin bug.
             websocket_to_close = None
 
-            # Try method 1: direct disconnect method
-            if hasattr(transport, 'disconnect_client'):
-                await transport.disconnect_client()
-                logger.info("✅ Closed WebSocket connection via disconnect_client")
-                return
-
-            # Try method 2: access websocket from transport
+            # Try the websocket attribute on the transport directly.
             if hasattr(transport, '_websocket') and transport._websocket:
                 websocket_to_close = transport._websocket
             elif hasattr(transport, 'websocket') and transport.websocket:
@@ -119,7 +116,7 @@ def create_disconnect_callback(
             elif hasattr(transport, '_connection') and transport._connection:
                 websocket_to_close = transport._connection
 
-            # Try method 3: get websocket from input/output processors
+            # Otherwise, get the websocket from the input processor.
             if not websocket_to_close and hasattr(transport, 'input'):
                 input_proc = transport.input()
                 if hasattr(input_proc, '_websocket') and input_proc._websocket:
@@ -128,24 +125,11 @@ def create_disconnect_callback(
                     websocket_to_close = input_proc.websocket
 
             if websocket_to_close:
-                # Send disconnect message before closing (optional)
-                try:
-                    if hasattr(websocket_to_close, 'send'):
-                        await websocket_to_close.send(json.dumps({
-                            "type": "disconnect",
-                            "message": "User requested disconnect",
-                            "reason": reason
-                        }))
-                        await asyncio.sleep(0.1)  # Give client time to process
-                except Exception as e:
-                    logger.debug(f"Could not send disconnect message: {e}")
-
-                # Close the websocket
-                if hasattr(websocket_to_close, 'close'):
-                    await websocket_to_close.close()
-                    logger.info("✅ Closed WebSocket connection")
-                else:
-                    logger.warning("⚠️ WebSocket object found but no close method")
+                # Tell the device to go idle, THEN close — the same contract the
+                # idle manager uses (see app.ws_control). A bare close makes the
+                # firmware reconnect into a torn-down session and spin forever.
+                await send_disconnect_then_close(websocket_to_close, reason=reason)
+                logger.info("✅ Closed WebSocket connection")
             else:
                 logger.warning("⚠️ Could not find WebSocket connection to close")
                 # Try to trigger disconnect event

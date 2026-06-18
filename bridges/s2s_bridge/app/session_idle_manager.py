@@ -35,6 +35,8 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
+from app.ws_control import send_disconnect_then_close
+
 logger = logging.getLogger(__name__)
 
 
@@ -145,7 +147,12 @@ class SessionIdleManager(FrameProcessor):
             await self._close_idle()
 
     async def _close_idle(self) -> None:
-        """Close the client websocket once."""
+        """Signal the device the session is over, then close the client WS once.
+
+        The bare ``ws.close()`` this used to do made the firmware reconnect into
+        a torn-down session (spinning forever); ``send_disconnect_then_close``
+        first tells the device to go idle so it stops cleanly instead.
+        """
         if self._closing:
             return
         self._closing = True
@@ -153,7 +160,7 @@ class SessionIdleManager(FrameProcessor):
         if ws is not None:
             logger.info(
                 "💤 Session idle for %.0fs (no speech, response, or pending tool) "
-                "— closing client WS",
+                "— signalling device + closing client WS",
                 self._idle_timeout,
             )
-            await ws.close()
+            await send_disconnect_then_close(ws, reason="idle")
