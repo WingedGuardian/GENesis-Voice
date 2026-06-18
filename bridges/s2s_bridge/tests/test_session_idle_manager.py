@@ -22,6 +22,7 @@ from pipecat.frames.frames import (
     FunctionCallResultFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    TranscriptionFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
@@ -269,3 +270,41 @@ def test_not_armed_does_not_close(monkeypatch):
     clock["t"] = 2000.0
     _run(mgr._check_idle_once())
     assert ws.close_count == 0
+
+
+# ── disconnect guard: user_turn_since_last_bot_response ──────────────────────
+
+def test_disconnect_guard_true_when_user_speaks_after_bot(monkeypatch):
+    """User transcript AFTER the bot's last response → a real end-of-call."""
+    mgr, _ws, _pushed, clock = _make_manager(monkeypatch)
+    _feed(mgr, BotStartedSpeakingFrame(), direction=FrameDirection.UPSTREAM)
+    clock["t"] = 1005.0
+    _feed(mgr, TranscriptionFrame("goodbye", "", "2026-01-01T00:00:00Z"))
+    assert mgr.user_turn_since_last_bot_response() is True
+
+
+def test_disconnect_guard_false_for_echo_after_bot(monkeypatch):
+    """The echo case: user turn, bot responds, then NO new user turn (just an
+    echo interrupt). The model must NOT be allowed to hang up."""
+    mgr, _ws, _pushed, clock = _make_manager(monkeypatch)
+    _feed(mgr, TranscriptionFrame("how are you tonight", "", "t"))  # user @1000
+    clock["t"] = 1002.0
+    _feed(mgr, BotStartedSpeakingFrame(), direction=FrameDirection.UPSTREAM)  # bot @1002
+    clock["t"] = 1004.0  # echo interrupt, no transcript
+    assert mgr.user_turn_since_last_bot_response() is False
+
+
+def test_disconnect_guard_ignores_empty_transcript(monkeypatch):
+    """An empty/whitespace transcript (echo garbage) is not a real user turn."""
+    mgr, _ws, _pushed, clock = _make_manager(monkeypatch)
+    _feed(mgr, BotStartedSpeakingFrame(), direction=FrameDirection.UPSTREAM)
+    clock["t"] = 1005.0
+    _feed(mgr, TranscriptionFrame("   ", "", "t"))
+    assert mgr.user_turn_since_last_bot_response() is False
+
+
+def test_disconnect_guard_false_on_fresh_session(monkeypatch):
+    """Before anyone speaks (both timers reset by arm), disconnect is refused."""
+    mgr, _ws, _pushed, _clock = _make_manager(monkeypatch)
+    _run(_arm_quiet(mgr))
+    assert mgr.user_turn_since_last_bot_response() is False

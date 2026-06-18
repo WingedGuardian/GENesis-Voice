@@ -30,6 +30,7 @@ from pipecat.frames.frames import (
     FunctionCallResultFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    TranscriptionFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
@@ -55,6 +56,11 @@ class SessionIdleManager(FrameProcessor):
         self._response_pending = False
         self._pending_tools: set = set()
         self._last_activity = time.monotonic()
+        # Turn-tracking for the disconnect guard: a real user turn (non-empty
+        # transcript) must follow the bot's last response for disconnect_client
+        # to be honoured. Reset per session in arm().
+        self._last_user_transcript_t = 0.0
+        self._last_bot_response_t = 0.0
         self._watchdog: asyncio.Task | None = None
         self._closing = False
         self._armed = False
@@ -68,8 +74,16 @@ class SessionIdleManager(FrameProcessor):
         elif isinstance(frame, UserStoppedSpeakingFrame):
             self._user_speaking = False
             self._touch()
+        elif isinstance(frame, TranscriptionFrame):
+            # A completed user transcript = a real user turn. VAD alone is
+            # unreliable here (the bot's own echo trips it), so the disconnect
+            # guard keys off when the user last actually said something.
+            if frame.text and frame.text.strip():
+                self._last_user_transcript_t = time.monotonic()
+            self._touch()
         elif isinstance(frame, BotStartedSpeakingFrame):
             self._bot_speaking = True
+            self._last_bot_response_t = time.monotonic()
             self._touch()
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self._bot_speaking = False
@@ -102,6 +116,16 @@ class SessionIdleManager(FrameProcessor):
             or bool(self._pending_tools)
         )
 
+    def user_turn_since_last_bot_response(self) -> bool:
+        """True if a real user turn (non-empty transcript) arrived after the
+        bot's most recent spoken response began.
+
+        The disconnect guard uses this: the model should only end the call in
+        response to the user actually saying something — not after a spurious
+        echo false-interrupt that left it in an empty-turn state.
+        """
+        return self._last_user_transcript_t > self._last_bot_response_t
+
     def arm(self) -> None:
         """Reset to a fresh idle baseline and start the watchdog.
 
@@ -112,6 +136,8 @@ class SessionIdleManager(FrameProcessor):
         self._bot_speaking = False
         self._response_pending = False
         self._pending_tools = set()
+        self._last_user_transcript_t = 0.0
+        self._last_bot_response_t = 0.0
         self._closing = False
         self._armed = True
         self._touch()

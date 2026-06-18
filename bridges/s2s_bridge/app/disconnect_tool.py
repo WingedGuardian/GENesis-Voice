@@ -17,7 +17,15 @@ def get_disconnect_tool_definition() -> dict[str, Any]:
     return {
         "type": "function",
         "name": "disconnect_client",
-        "description": "Disconnect the voice assistant session when the user says goodbye, farewell, stop, or only thank you without additional questions and wants to end the conversation. Use this when the user explicitly wants to end the conversation or says phrases like 'Auf Wiedersehen', 'Tschüss', 'Stop', 'Beenden', 'Ende', etc.",
+        "description": (
+            "End the voice session ONLY when the user has clearly and explicitly "
+            "asked to end the conversation in their most recent turn — e.g. "
+            "'goodbye', 'bye', 'stop', \"we're done\", \"that's all\", 'Tschuss', "
+            "'Auf Wiedersehen'. Do NOT call this on ambiguity, after your own reply "
+            "was interrupted, right after you asked the user a question, or merely "
+            "because the user said 'thanks' or went quiet. When in doubt, stay "
+            "connected and let the user keep talking — only the user ends the call."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -142,13 +150,18 @@ def create_disconnect_callback(
 
 
 def create_disconnect_tool_handler(
-    transport: Optional["WebsocketServerTransport"]
+    transport: Optional["WebsocketServerTransport"],
+    should_honor: Callable[[], bool] | None = None,
 ) -> Callable[["FunctionCallParams"], Awaitable[None]]:
     """
     Create a disconnect tool handler for Pipecat's OpenAI Realtime Service.
 
     Args:
         transport: The WebSocket transport instance
+        should_honor: Optional predicate; when it returns False the disconnect is
+            refused (the model called it with no real user turn — likely a
+            spurious echo false-interrupt). The session stays open and the idle
+            timeout ends it cleanly instead of yanking the device offline.
 
     Returns:
         Async function handler that can be registered with OpenAIRealtimeLLMService
@@ -156,6 +169,19 @@ def create_disconnect_tool_handler(
     async def disconnect_tool_handler(params: "FunctionCallParams") -> None:
         """Handle disconnect tool calls."""
         logger.info(f"🔌 Disconnect tool called: {params.function_name} with arguments: {params.arguments}")
+
+        # Guard: only end the call if a real user turn prompted it. A spurious
+        # echo interrupt can make the model hang up with no user input — refuse
+        # that and let the idle timeout end the session cleanly.
+        if should_honor is not None and not should_honor():
+            logger.info(
+                "🛡️ Ignoring disconnect_client — no real user turn since the bot's "
+                "last response (likely a spurious interrupt)"
+            )
+            await params.result_callback(
+                "Still here — the user has not asked to end the conversation. Staying connected."
+            )
+            return
 
         # Get reason from arguments
         reason = params.arguments.get("reason", "user_requested")

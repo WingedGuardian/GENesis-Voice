@@ -53,6 +53,12 @@ class Application:
         self.session_manager: SessionManager | None = None
         self.current_task: PipelineTask | None = None
         self._pipeline_lock: asyncio.Lock | None = None
+        # Monotonic connection counter, bumped on each client connect. A
+        # disconnect handler snapshots it on entry and re-checks before tearing
+        # down the (shared) OpenAI session, so a slow/stale disconnect can't
+        # clobber a newer connection's freshly-reset session (the reconnect race
+        # that left the device connected to a brain-less bridge → dark).
+        self._conn_seq = 0
         self._rotation_task: asyncio.Task | None = None
         # Session rotation interval in seconds. OpenAI Realtime sessions
         # expire at 60 minutes — rotate at 55 to leave margin for the
@@ -191,6 +197,35 @@ class Application:
         """Update session activity timestamp (called by SessionActivityTracker)."""
         pass
 
+    async def _persist_transcript(self, messages: list) -> None:
+        """Persist a voice transcript out-of-band so it never blocks teardown.
+
+        Spawned as a background task from on_client_disconnected — a slow Genesis
+        here must not delay the OpenAI teardown (see the reconnect-race guard).
+        """
+        try:
+            result = await self.genesis_tool_service.store_conversation(messages)
+            if result:
+                logger.info("💾 Voice conversation persisted to Genesis memory")
+        except Exception as e:  # never let a persist failure escape the task
+            logger.warning(
+                "⚠️ Failed to persist voice conversation: %s: %s", type(e).__name__, e
+            )
+
+    def _disconnect_is_legitimate(self) -> bool:
+        """True if the model's disconnect_client is a real end-of-call.
+
+        Honour it only when a real user turn followed the bot's last response —
+        i.e. the user actually said something to end the call. A spurious echo
+        false-interrupt can drop the model into an empty-turn state where it
+        hangs up with no user input; that case returns False so we keep the
+        session alive (the 45s idle still ends it cleanly).
+        """
+        idle = getattr(self.websocket_handler, "session_idle_manager", None)
+        if idle is None:
+            return True  # no tracker available — don't block
+        return idle.user_turn_since_last_bot_response()
+
     async def _ensure_openai_service(self, client_id: str | None = None):
         """Ensure the OpenAI service is ready for a client.
 
@@ -287,7 +322,10 @@ class Application:
             logger.info(f"✅ OpenAI Service created: {type(self.openai_service).__name__}")
 
             # Register disconnect tool handler
-            disconnect_tool_handler = create_disconnect_tool_handler(self.websocket_transport)
+            disconnect_tool_handler = create_disconnect_tool_handler(
+                self.websocket_transport,
+                should_honor=self._disconnect_is_legitimate,
+            )
             self.openai_service.register_function("disconnect_client", disconnect_tool_handler)
             logger.info("Registered disconnect tool handler")
 
@@ -396,6 +434,8 @@ class Application:
         # ── WebSocket event handlers ──────────────────────────────────
         async def on_client_connected(client_id: str):
             """Handle new client connection."""
+            # A newer connection invalidates any in-flight stale teardown.
+            self._conn_seq += 1
             await self._ensure_openai_service(client_id=client_id)
             if self.audio_recording_service:
                 self.audio_recording_service.start_new_session(client_id)
@@ -412,6 +452,10 @@ class Application:
 
         async def on_client_disconnected(client_id: str):
             """Handle client disconnection."""
+            # Snapshot the connection counter. If a newer client connects while
+            # this teardown is in flight, we must NOT tear down the OpenAI
+            # session it has since taken over (the reconnect race).
+            seq_at_entry = self._conn_seq
             _cancel_rotation_timer()
             idle_manager = getattr(self.websocket_handler, "session_idle_manager", None)
             if idle_manager:
@@ -420,29 +464,36 @@ class Application:
                 self.session_manager.handle_client_disconnect(client_id, self.openai_service)
 
             # Persist conversation transcript to Genesis memory (Phase 3D).
-            # Must run AFTER handle_client_disconnect caches the context.
+            # Fire-and-forget: a slow Genesis must NOT delay the teardown below —
+            # a ~6s persist once let this handler's _disconnect() run AFTER a new
+            # connection had reset the session, clobbering it. Context is already
+            # cached by handle_client_disconnect; store_conversation writes a
+            # local fallback on failure, so backgrounding loses nothing.
             if self.genesis_tool_service and self.session_manager:
                 cached = self.session_manager.get_cached_context(client_id)
                 if cached:
                     messages = cached.get_messages()
                     if messages:
-                        try:
-                            result = await self.genesis_tool_service.store_conversation(messages)
-                            if result:
-                                logger.info("💾 Voice conversation persisted to Genesis memory")
-                        except Exception as e:
-                            logger.warning("⚠️ Failed to persist voice conversation: %s: %s", type(e).__name__, e)
+                        asyncio.create_task(self._persist_transcript(messages))
 
             if self.audio_recording_service:
                 self.audio_recording_service.stop_recording()
             # Disconnect from OpenAI to stop the 60-min session clock.
-            # Acquire lock to prevent race with concurrent on_client_connected.
             if self.openai_service is not None:
                 if self._pipeline_lock is None:
                     self._pipeline_lock = asyncio.Lock()
                 async with self._pipeline_lock:
-                    await self.openai_service._disconnect()
-                    logger.info("💤 OpenAI session closed — client disconnected")
+                    if self._conn_seq != seq_at_entry:
+                        # A newer connection took over and reset the shared OpenAI
+                        # session while we were tearing down. Disconnecting now
+                        # would kill the LIVE session → brain-less, dark device.
+                        logger.info(
+                            "↩️ Skipping stale OpenAI teardown — newer connection "
+                            "took over (seq %d→%d)", seq_at_entry, self._conn_seq,
+                        )
+                    else:
+                        await self.openai_service._disconnect()
+                        logger.info("💤 OpenAI session closed — client disconnected")
 
         self.websocket_handler.setup_event_handlers(
             transport=self.websocket_transport,
