@@ -1,9 +1,9 @@
 """Tool for disconnecting the client when user says goodbye or stop."""
-import asyncio
-import json
 import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Optional
+
+from app.ws_control import send_disconnect_then_close
 
 if TYPE_CHECKING:
     from pipecat.services.llm_service import FunctionCallParams
@@ -17,7 +17,15 @@ def get_disconnect_tool_definition() -> dict[str, Any]:
     return {
         "type": "function",
         "name": "disconnect_client",
-        "description": "Disconnect the voice assistant session when the user says goodbye, farewell, stop, or only thank you without additional questions and wants to end the conversation. Use this when the user explicitly wants to end the conversation or says phrases like 'Auf Wiedersehen', 'Tschüss', 'Stop', 'Beenden', 'Ende', etc.",
+        "description": (
+            "End the voice session ONLY when the user has clearly and explicitly "
+            "asked to end the conversation in their most recent turn — e.g. "
+            "'goodbye', 'bye', 'stop', \"we're done\", \"that's all\", 'Tschuss', "
+            "'Auf Wiedersehen'. Do NOT call this on ambiguity, after your own reply "
+            "was interrupted, right after you asked the user a question, or merely "
+            "because the user said 'thanks' or went quiet. When in doubt, stay "
+            "connected and let the user keep talking — only the user ends the call."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -101,17 +109,14 @@ def create_disconnect_callback(
                 logger.warning("⚠️ Transport is not a WebsocketServerTransport")
                 return
 
-            # WebSocket transport - try to disconnect the client
-            # Check for various ways to access the websocket connection
+            # WebSocket transport — locate the underlying websocket to close.
+            # Deliberately NO transport.disconnect_client() path: WebsocketServer-
+            # Transport has no such method (this is already guarded to that type
+            # above), and routing through it would bare-close the socket, bypassing
+            # send_disconnect_then_close and re-introducing the device spin bug.
             websocket_to_close = None
 
-            # Try method 1: direct disconnect method
-            if hasattr(transport, 'disconnect_client'):
-                await transport.disconnect_client()
-                logger.info("✅ Closed WebSocket connection via disconnect_client")
-                return
-
-            # Try method 2: access websocket from transport
+            # Try the websocket attribute on the transport directly.
             if hasattr(transport, '_websocket') and transport._websocket:
                 websocket_to_close = transport._websocket
             elif hasattr(transport, 'websocket') and transport.websocket:
@@ -119,7 +124,7 @@ def create_disconnect_callback(
             elif hasattr(transport, '_connection') and transport._connection:
                 websocket_to_close = transport._connection
 
-            # Try method 3: get websocket from input/output processors
+            # Otherwise, get the websocket from the input processor.
             if not websocket_to_close and hasattr(transport, 'input'):
                 input_proc = transport.input()
                 if hasattr(input_proc, '_websocket') and input_proc._websocket:
@@ -128,24 +133,11 @@ def create_disconnect_callback(
                     websocket_to_close = input_proc.websocket
 
             if websocket_to_close:
-                # Send disconnect message before closing (optional)
-                try:
-                    if hasattr(websocket_to_close, 'send'):
-                        await websocket_to_close.send(json.dumps({
-                            "type": "disconnect",
-                            "message": "User requested disconnect",
-                            "reason": reason
-                        }))
-                        await asyncio.sleep(0.1)  # Give client time to process
-                except Exception as e:
-                    logger.debug(f"Could not send disconnect message: {e}")
-
-                # Close the websocket
-                if hasattr(websocket_to_close, 'close'):
-                    await websocket_to_close.close()
-                    logger.info("✅ Closed WebSocket connection")
-                else:
-                    logger.warning("⚠️ WebSocket object found but no close method")
+                # Tell the device to go idle, THEN close — the same contract the
+                # idle manager uses (see app.ws_control). A bare close makes the
+                # firmware reconnect into a torn-down session and spin forever.
+                await send_disconnect_then_close(websocket_to_close, reason=reason)
+                logger.info("✅ Closed WebSocket connection")
             else:
                 logger.warning("⚠️ Could not find WebSocket connection to close")
                 # Try to trigger disconnect event
@@ -158,13 +150,18 @@ def create_disconnect_callback(
 
 
 def create_disconnect_tool_handler(
-    transport: Optional["WebsocketServerTransport"]
+    transport: Optional["WebsocketServerTransport"],
+    should_honor: Callable[[], bool] | None = None,
 ) -> Callable[["FunctionCallParams"], Awaitable[None]]:
     """
     Create a disconnect tool handler for Pipecat's OpenAI Realtime Service.
 
     Args:
         transport: The WebSocket transport instance
+        should_honor: Optional predicate; when it returns False the disconnect is
+            refused (the model called it with no real user turn — likely a
+            spurious echo false-interrupt). The session stays open and the idle
+            timeout ends it cleanly instead of yanking the device offline.
 
     Returns:
         Async function handler that can be registered with OpenAIRealtimeLLMService
@@ -172,6 +169,19 @@ def create_disconnect_tool_handler(
     async def disconnect_tool_handler(params: "FunctionCallParams") -> None:
         """Handle disconnect tool calls."""
         logger.info(f"🔌 Disconnect tool called: {params.function_name} with arguments: {params.arguments}")
+
+        # Guard: only end the call if a real user turn prompted it. A spurious
+        # echo interrupt can make the model hang up with no user input — refuse
+        # that and let the idle timeout end the session cleanly.
+        if should_honor is not None and not should_honor():
+            logger.info(
+                "🛡️ Ignoring disconnect_client — no real user turn since the bot's "
+                "last response (likely a spurious interrupt)"
+            )
+            await params.result_callback(
+                "Still here — the user has not asked to end the conversation. Staying connected."
+            )
+            return
 
         # Get reason from arguments
         reason = params.arguments.get("reason", "user_requested")

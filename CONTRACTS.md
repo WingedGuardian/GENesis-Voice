@@ -18,8 +18,11 @@ speak the same wire contract. The firmware maintains up to two such sockets:
   no-op. (The bridge still accepts 24 kHz from a non-ambient sender and downsamples; the
   rate is the sender's choice, declared via `AMBIENT_INPUT_SR`.)
 - **Control frames** — text WebSocket frames carrying JSON: `{"type": "interrupt"}` to
-  cut off playback, `{"type": "disconnect"}` to end the session. (Ambient is one-way; the
-  ambient bridge sends no control frames back.)
+  cut off playback, `{"type": "disconnect"}` to end the session. The device treats a *bare*
+  socket close as a dropped connection and auto-reconnects — so to end a session the bridge
+  **must send `{"type": "disconnect"}` and then close** (see `s2s_bridge` `ws_control`).
+  Closing without it orphans the device: it reconnects into a torn-down session and spins
+  forever. (Ambient is one-way; the ambient bridge sends no control frames back.)
 - **No auth / no handshake.** The socket is expected to live on a trusted local network.
   Do not expose a bridge port to the public internet.
 - Keepalive is standard WebSocket ping/pong.
