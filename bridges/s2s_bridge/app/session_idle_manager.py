@@ -123,6 +123,12 @@ class SessionIdleManager(FrameProcessor):
         The disconnect guard uses this: the model should only end the call in
         response to the user actually saying something — not after a spurious
         echo false-interrupt that left it in an empty-turn state.
+
+        Best-effort, not airtight: it reliably catches the case where the echo
+        produced NO transcript (the observed failure). If the echo is itself
+        transcribed (the bot's own words bleeding back), this can't tell it from
+        a user turn. The robust protection against a dark device is the
+        reconnect-race guard in main.py, which survives ANY disconnect.
         """
         return self._last_user_transcript_t > self._last_bot_response_t
 

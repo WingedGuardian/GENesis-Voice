@@ -59,6 +59,10 @@ class Application:
         # clobber a newer connection's freshly-reset session (the reconnect race
         # that left the device connected to a brain-less bridge → dark).
         self._conn_seq = 0
+        # Strong refs to in-flight fire-and-forget persist tasks. Without this
+        # the loop keeps only a weak ref and the GC can collect a task
+        # mid-flight (documented CPython asyncio caveat).
+        self._persist_tasks: set[asyncio.Task] = set()
         self._rotation_task: asyncio.Task | None = None
         # Session rotation interval in seconds. OpenAI Realtime sessions
         # expire at 60 minutes — rotate at 55 to leave margin for the
@@ -387,8 +391,15 @@ class Application:
                 if self.openai_service and self.openai_service._websocket:
                     await asyncio.sleep(1)  # Let session.created + _update_settings() complete
                     async with self._pipeline_lock:
-                        # Only disconnect if no client has connected in the meantime
-                        if self.openai_service and self.openai_service._websocket:
+                        # Only disconnect if no client has connected in the meantime.
+                        # A client connect bumps _conn_seq and resets the session;
+                        # tearing it down here would kill that live session (dark
+                        # device). _conn_seq == 0 ⇒ still the startup deferral.
+                        if (
+                            self._conn_seq == 0
+                            and self.openai_service
+                            and self.openai_service._websocket
+                        ):
                             await self.openai_service._disconnect()
                             logger.info("💤 OpenAI session deferred — will connect on first client")
                     return
@@ -474,7 +485,9 @@ class Application:
                 if cached:
                     messages = cached.get_messages()
                     if messages:
-                        asyncio.create_task(self._persist_transcript(messages))
+                        task = asyncio.create_task(self._persist_transcript(messages))
+                        self._persist_tasks.add(task)
+                        task.add_done_callback(self._persist_tasks.discard)
 
             if self.audio_recording_service:
                 self.audio_recording_service.stop_recording()
