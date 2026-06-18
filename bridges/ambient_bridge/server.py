@@ -50,6 +50,7 @@ class AmbientServer:
         self._engine = AmbientEngine(cfg, self._store)
         self._active = 0
         self._utterances_total = 0
+        self._last_connection_ts: str | None = None  # last client connect (for the health monitor)
         # --- diarization (deferred, additive; capture works fine without it) ---
         self._diar: DiarizationEngine | None = None
         self._diar_queue: asyncio.Queue[DiarWindow] | None = None
@@ -111,7 +112,8 @@ class AmbientServer:
                     window.window_idx, total, labeled, len(window.spans))
 
     async def _diar_worker(self) -> None:
-        self._diar_worker_alive = True
+        # Liveness flag is set at task-creation in run() (so the startup health snapshot reads
+        # accurately); the finally-block below clears it on exit.
         try:
             while True:
                 window = await self._diar_queue.get()
@@ -134,6 +136,7 @@ class AmbientServer:
         task = asyncio.current_task()
         self._handler_tasks.add(task)
         self._active += 1
+        self._last_connection_ts = datetime.now(UTC).isoformat()
         logger.info("Client connected: %s (active=%d)", source, self._active)
         try:
             async for message in websocket:
@@ -175,6 +178,7 @@ class AmbientServer:
                 "ts": datetime.now(UTC).isoformat(),
                 "alive": True,
                 "active_connections": self._active,
+                "last_connection_ts": self._last_connection_ts,
                 "utterances_total": self._utterances_total,
                 "diar_enabled": self._diar is not None,
                 "diar_worker_alive": self._diar_worker_alive,
@@ -209,8 +213,7 @@ class AmbientServer:
     # --- lifecycle ------------------------------------------------------------
 
     async def run(self) -> None:
-        # Write health + purge stale rows immediately on startup.
-        self._write_health()
+        # Purge stale rows immediately on startup.
         try:
             await asyncio.to_thread(self._store.purge, self._cfg.ttl_hours, self._cfg.row_ceiling)
         except Exception:  # noqa: BLE001
@@ -222,7 +225,12 @@ class AmbientServer:
         if self._diar is not None:
             # Create the queue inside the running loop, before any connection can submit.
             self._diar_queue = asyncio.Queue(maxsize=self._cfg.diar_queue_max)
+            # Mark alive at task creation so the startup health snapshot isn't spuriously
+            # False (the worker's finally-block flips it back off on exit).
+            self._diar_worker_alive = True
             tasks.append(tracked_task(self._diar_worker(), name="ambient-diar"))
+        # First health write AFTER tasks are wired, so the snapshot reflects real state.
+        self._write_health()
         logger.info("Ambient bridge listening on ws://%s:%d/ (input_sr=%d → 16k, diar=%s)",
                     self._cfg.host, self._cfg.port, self._cfg.input_sample_rate, self._diar is not None)
         # Graceful stop on SIGINT (Ctrl-C) AND SIGTERM (systemd stop/restart).
@@ -232,7 +240,16 @@ class AmbientServer:
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, stop.set)
         try:
-            async with websockets.serve(self._handler, self._cfg.host, self._cfg.port, max_size=None):
+            # ping_interval=None: the Voice PE's minimal WS stack rejects server PING control
+            # frames (-> 1002 invalid-opcode close ~every 60s, with no client-side reconnect),
+            # which silently kills ambient capture. Audio is a continuous stream, so we rely on
+            # app-level liveness instead. CAVEAT: without WS pings a silently-dead (half-open)
+            # socket isn't detected until the OS TCP keep-alive fires (~2h default), so
+            # active_connections can read stale -> the health MONITOR must gate on `last_ts`
+            # (audio-gap) freshness, NOT on active_connections.
+            async with websockets.serve(
+                self._handler, self._cfg.host, self._cfg.port, max_size=None, ping_interval=None,
+            ):
                 await stop.wait()
         finally:
             # Let in-flight handlers finish their flush() (which may submit a final
