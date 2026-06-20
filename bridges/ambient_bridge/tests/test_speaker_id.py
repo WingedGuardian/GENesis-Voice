@@ -98,3 +98,19 @@ def test_classify_all_short_cluster_recovers():
 def test_classify_no_embedding_is_null():
     r = _reg({"user": _unit([1, 0, 0])})
     assert r.classify_window([None], [4.0], [0], threshold=0.35, min_embed_s=3.0) == [(None, None)]
+
+
+def test_classify_none_cluster_short_stays_null():
+    # A short utt with no diar cluster (clusters=None) must NOT be averaged with other
+    # gap utts — it stays NULL (no direct verdict possible, no cluster to inherit).
+    r = _reg({"user": _unit([1, 0, 0])})
+    v = r.classify_window([_unit([0.8, 0.2, 0])], [1.0], [None], threshold=0.35, min_embed_s=3.0)
+    assert v == [(None, None)]
+
+
+def test_classify_none_cluster_long_is_direct():
+    # A long utt still gets a DIRECT verdict even with no diar cluster (direct path
+    # does not depend on clustering).
+    r = _reg({"user": _unit([1, 0, 0])})
+    v = r.classify_window([_unit([0.9, 0.1, 0])], [4.0], [None], threshold=0.35, min_embed_s=3.0)
+    assert v == [(True, "direct")]

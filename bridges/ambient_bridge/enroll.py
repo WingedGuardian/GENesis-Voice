@@ -98,6 +98,7 @@ async def _capture_live(cfg, *, target_s: float, min_dur: float, port: int) -> l
                     log.info("  captured %.1fs utt (%.0f/%.0fs collected)", dur, total, target_s)
                     if total >= target_s:
                         done.set()
+                        return  # enough collected — close this connection, stop buffering
 
     async with websockets.serve(handler, "0.0.0.0", port, max_size=None, ping_interval=None):
         log.info("capture server on ws://0.0.0.0:%d/ — need ~%.0fs of >=%.1fs utterances",
@@ -133,9 +134,12 @@ def main() -> int:
                 loop.add_signal_handler(sig, loop.stop)
             except NotImplementedError:
                 pass
-        samples = loop.run_until_complete(
-            _capture_live(cfg, target_s=args.target_s, min_dur=args.min_dur, port=args.port),
-        )
+        try:
+            samples = loop.run_until_complete(
+                _capture_live(cfg, target_s=args.target_s, min_dur=args.min_dur, port=args.port),
+            )
+        finally:
+            loop.close()
 
     if not samples:
         log.error("no audio collected — nothing enrolled")

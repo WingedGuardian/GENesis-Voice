@@ -142,9 +142,12 @@ class SpeakerIDRegistry:
             if embeddings[i] is not None and durations[i] >= min_embed_s:
                 verdicts[i] = (bool(self.score(embeddings[i]) >= threshold), "direct")
         # Cluster centroid for the still-undecided utts (anchored by the whole cluster).
+        # Skip utts with no diar cluster (clusters[i] is None — no segment overlapped):
+        # averaging unrelated "gap" utts together would yield a spurious verdict, so they
+        # stay NULL unless they already got a direct verdict above.
         groups: dict[int, list[int]] = {}
         for i in range(n):
-            if embeddings[i] is not None:
+            if embeddings[i] is not None and clusters[i] is not None:
                 groups.setdefault(clusters[i], []).append(i)
         for idxs in groups.values():
             undecided = [i for i in idxs if verdicts[i][1] is None]
