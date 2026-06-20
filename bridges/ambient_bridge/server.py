@@ -21,7 +21,8 @@ from datetime import UTC, datetime
 import websockets
 
 from .config import AmbientConfig, load_config
-from .pipeline import AmbientEngine, DiarizationEngine, DiarWindow
+from .pipeline import AmbientEngine, DiarizationEngine, DiarWindow, _autodetect_embedding
+from .speaker_id import SpeakerIDRegistry
 from .store import AmbientStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -71,6 +72,25 @@ class AmbientServer:
                 logger.warning("Diarization init failed — running capture-only "
                                "(speaker_label stays NULL)", exc_info=True)
                 self._diar = None
+        # --- speaker identification (Stage-A, additive) — needs the diar worker (cluster
+        # aggregation runs there). No registry / no enrolled voiceprint → is_user stays NULL. ---
+        self._speaker_id: SpeakerIDRegistry | None = None
+        if cfg.speaker_id_enabled and self._diar is not None:
+            try:
+                model = cfg.speaker_id_model or _autodetect_embedding(cfg.models_dir)
+                reg = SpeakerIDRegistry(
+                    model, persist_path=cfg.speaker_registry_path,
+                    num_threads=cfg.diar_num_threads, user_name=cfg.user_speaker_name,
+                )
+                if reg.has_user():
+                    self._speaker_id = reg
+                    logger.info("Speaker-ID enabled (user=%r voiceprint loaded)", cfg.user_speaker_name)
+                else:
+                    logger.warning("Speaker-ID on but no %r voiceprint in %s — is_user stays NULL "
+                                   "until enrolled (python -m ambient_bridge.enroll)",
+                                   cfg.user_speaker_name, cfg.speaker_registry_path)
+            except Exception:
+                logger.warning("Speaker-ID init failed — is_user stays NULL", exc_info=True)
         # Track active handler tasks so shutdown awaits their flush before closing the store.
         self._handler_tasks: set[asyncio.Task] = set()
 
@@ -93,23 +113,60 @@ class AmbientServer:
                            dropped.window_idx, len(dropped.spans))
         self._diar_queue.put_nowait(window)
 
+    @staticmethod
+    def _overlap_cluster(start_s: float, end_s: float,
+                         segs: list[tuple[float, float, int]]) -> int | None:
+        """The diar cluster id with the most temporal overlap with [start_s, end_s]
+        (WhisperX-style intersection), or None if no segment overlaps."""
+        best, best_ov = None, 0.0
+        for ss, se, spk in segs:
+            ov = max(0.0, min(end_s, se) - max(start_s, ss))
+            if ov > best_ov:
+                best_ov, best = ov, spk
+        return best
+
     def _assign_labels(self, window: DiarWindow, segs: list[tuple[float, float, int]]) -> None:
-        """Map each utterance to its max-overlap speaker cluster (WhisperX-style temporal
-        intersection). Label = wN:c/total — N global window, c cluster, total #clusters in
-        the window (so '1-speaker confirmed' is distinguishable from a lumped cluster)."""
+        """Map each utterance to its max-overlap speaker cluster. Label = wN:c/total —
+        N global window, c cluster, total #clusters in the window (so '1-speaker
+        confirmed' is distinguishable from a lumped cluster)."""
         total = len({spk for _, _, spk in segs}) or 1
         labeled = 0
         for row_id, start_s, end_s in window.spans:
-            best, best_ov = None, 0.0
-            for ss, se, spk in segs:
-                ov = max(0.0, min(end_s, se) - max(start_s, ss))
-                if ov > best_ov:
-                    best_ov, best = ov, spk
+            best = self._overlap_cluster(start_s, end_s, segs)
             if best is not None:
                 self._store.set_speaker_label(row_id, f"w{window.window_idx}:{best}/{total}")
                 labeled += 1
         logger.info("diar w%d: %d speaker(s), labeled %d/%d utts",
                     window.window_idx, total, labeled, len(window.spans))
+
+    def _verify_speaker_identities(self, window: DiarWindow,
+                                   segs: list[tuple[float, float, int]]) -> None:
+        """Tag each utterance ``is_user`` via speaker-ID. Runs in the diar worker thread
+        (OFF the ingest path). Embeds each utterance from ``window.raw``; a DIRECT verdict
+        for utts >= min_embed_s, and the shorter utts inherit their diar cluster's centroid
+        verdict (recovery). No-op if speaker-id is disabled or unenrolled."""
+        reg = self._speaker_id
+        if reg is None or not window.spans:
+            return
+        sr = self._cfg.model_sample_rate
+        raw = window.raw
+        embeddings, durations, clusters, row_ids = [], [], [], []
+        for row_id, start_s, end_s in window.spans:
+            embeddings.append(reg.embed(raw[int(start_s * sr):int(end_s * sr)]))
+            durations.append(end_s - start_s)
+            clusters.append(self._overlap_cluster(start_s, end_s, segs))
+            row_ids.append(row_id)
+        verdicts = reg.classify_window(
+            embeddings, durations, clusters,
+            threshold=self._cfg.user_verify_threshold, min_embed_s=self._cfg.min_embed_s,
+        )
+        n_user = 0
+        for row_id, (is_user, method) in zip(row_ids, verdicts):
+            if is_user is None:
+                continue
+            self._store.set_is_user(row_id, is_user, method)
+            n_user += int(is_user)
+        logger.info("speaker-id w%d: %d/%d utts → user", window.window_idx, n_user, len(row_ids))
 
     async def _diar_worker(self) -> None:
         # Liveness flag is set at task-creation in run() (so the startup health snapshot reads
@@ -120,6 +177,8 @@ class AmbientServer:
                 try:
                     segs = await asyncio.to_thread(self._diar.process, window.raw)
                     await asyncio.to_thread(self._assign_labels, window, segs)
+                    if self._speaker_id is not None:
+                        await asyncio.to_thread(self._verify_speaker_identities, window, segs)
                 except Exception:
                     logger.error("diar failed for window w%d (%d utts) — labels stay NULL",
                                  window.window_idx, len(window.spans), exc_info=True)
@@ -184,6 +243,7 @@ class AmbientServer:
                 "diar_worker_alive": self._diar_worker_alive,
                 "diar_queue_depth": self._diar_queue.qsize() if self._diar_queue else 0,
                 "diar_windows_dropped": self._diar_dropped,
+                "speaker_id_enabled": self._speaker_id is not None,
                 **stats,
             }
             tmp = self._cfg.health_path + ".tmp"

@@ -37,6 +37,13 @@ class AmbientStore:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.executescript(_SCHEMA)
+        # Stage-A: is_user column (NULL until speaker-id verifies). Idempotent ALTER so an
+        # EXISTING db (created before this column) gains it — CREATE TABLE IF NOT EXISTS
+        # would not add it. is_user: 1=enrolled user, 0=other, NULL=no verdict yet.
+        try:
+            self._db.execute("ALTER TABLE ambient_transcripts ADD COLUMN is_user INTEGER")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         self._db.commit()
         self._lock = threading.Lock()
 
@@ -59,6 +66,28 @@ class AmbientStore:
             self._db.execute(
                 "UPDATE ambient_transcripts SET speaker_label=? WHERE id=?",
                 (label, row_id),
+            )
+            self._db.commit()
+
+    def set_is_user(self, row_id: int, is_user: bool, method: str) -> None:
+        """Record the speaker-id verdict (1=enrolled user / 0=other) plus how it was
+        derived (``method``: 'direct' per-utterance, or 'cluster' centroid) in meta JSON,
+        so a later graduation step can weight cluster verdicts lower. Merges into any
+        existing meta rather than clobbering it."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT meta FROM ambient_transcripts WHERE id=?", (row_id,)
+            ).fetchone()
+            meta: dict = {}
+            if row and row[0]:
+                try:
+                    meta = json.loads(row[0])
+                except (ValueError, TypeError):
+                    meta = {}
+            meta["is_user_method"] = method
+            self._db.execute(
+                "UPDATE ambient_transcripts SET is_user=?, meta=? WHERE id=?",
+                (1 if is_user else 0, json.dumps(meta), row_id),
             )
             self._db.commit()
 

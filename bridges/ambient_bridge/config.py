@@ -60,6 +60,20 @@ class AmbientConfig:
     # Diar shares the CPU with STT; keep below (cores - stt threads) on small boxes.
     diar_num_threads: int = field(default_factory=lambda: int(_env("AMBIENT_DIAR_NUM_THREADS", "2")))
 
+    # --- speaker identification (Stage-A: per-utterance is_user tagging) ---
+    # Tags each row is_user (1=user / 0=other / NULL=no verdict) via a speaker-embedding
+    # match to an enrolled voiceprint. Runs in the diar worker (reuses cluster labels to
+    # recover short utts). Disabled, or no registry file → is_user stays NULL (capture
+    # unaffected). threshold 0.35 + min_embed_s 3.0 are the Stage-0 16k gate results.
+    speaker_id_enabled: bool = field(default_factory=lambda: _env("AMBIENT_SPEAKER_ID_ENABLED", "1") not in ("0", "false", "False", "no", ""))
+    speaker_id_model: str = field(default_factory=lambda: _env("AMBIENT_SPEAKER_ID_MODEL", ""))  # empty → autodetect *eres2net*16k*
+    user_verify_threshold: float = field(default_factory=lambda: float(_env("AMBIENT_USER_VERIFY_THRESHOLD", "0.35")))
+    # min utterance seconds for a DIRECT per-utterance verdict; shorter utts get a verdict
+    # only via cluster-centroid aggregation (Stage-0: clean separation holds ≥3s).
+    min_embed_s: float = field(default_factory=lambda: float(_env("AMBIENT_MIN_EMBED_S", "3.0")))
+    speaker_registry_path: str = field(default_factory=lambda: _env("AMBIENT_SPEAKER_REGISTRY", os.path.expanduser("~/ambient_speaker_registry.json")))
+    user_speaker_name: str = field(default_factory=lambda: _env("AMBIENT_USER_SPEAKER_NAME", "user"))
+
 
 def load_config() -> AmbientConfig:
     return AmbientConfig()
