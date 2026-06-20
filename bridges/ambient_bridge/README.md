@@ -17,6 +17,24 @@ Labels are window-scoped, NOT comparable across windows or connections (no cross
 identity in Stage-1). Validated on English (the zh-cn eres2net embedding is
 language-agnostic). If the diar models are absent it degrades to capture-only (label NULL).
 
+**Speaker identification (Stage-A)** runs in the same deferred diar worker: each utterance
+is matched to an enrolled voiceprint and tagged `is_user` (1 = the enrolled user, 0 = someone
+else, NULL = no verdict). A DIRECT cosine match vs the voiceprint (threshold ~0.35) is used for
+utterances ≥ `AMBIENT_MIN_EMBED_S` (3 s, where embeddings are reliable); shorter utterances
+inherit their diar cluster's centroid verdict (averaging the cluster's embeddings recovers
+short-utterance recall). The method (`direct`|`cluster`) is recorded in the row's `meta`.
+Enrollment is a reusable named-speaker registry (`speaker_id.py` + `enroll.py`), persisted as
+JSON. Disabled or no voiceprint enrolled → `is_user` stays NULL (capture unaffected). Calibration
+(threshold 0.35, min 3 s) is from the 16 kHz speaker-ID gate; both are env-tunable.
+
+Enroll a speaker (on the edge box, from `~/genesis-voice/bridges`):
+```bash
+# from existing 16k wavs (no re-recording):
+~/ambient-venv/bin/python -m ambient_bridge.enroll --name user --from-dir ~/enroll_clips
+# or live capture through the device (stop the bridge first so :8765 is free, then speak):
+~/ambient-venv/bin/python -m ambient_bridge.enroll --name alice
+```
+
 Wire contract mirrors the firmware exactly: binary frames = 16-bit mono PCM; JSON text
 frames (`{"type":"interrupt"|"disconnect"}`) for control. No auth/handshake. See
 [`../../CONTRACTS.md`](../../CONTRACTS.md).
@@ -64,8 +82,12 @@ clusters) · `AMBIENT_DIAR_WINDOW_S` (60) · `AMBIENT_DIAR_QUEUE_MAX` (4) ·
 `AMBIENT_DIAR_NUM_THREADS` (2) · `AMBIENT_SEG_MODEL` / `AMBIENT_EMB_MODEL` (auto-detected
 in the models dir if unset).
 
+Speaker-ID: `AMBIENT_SPEAKER_ID_ENABLED` (1) · `AMBIENT_USER_VERIFY_THRESHOLD` (0.35) ·
+`AMBIENT_MIN_EMBED_S` (3.0) · `AMBIENT_SPEAKER_REGISTRY` (~/ambient_speaker_registry.json) ·
+`AMBIENT_USER_SPEAKER_NAME` (user) · `AMBIENT_SPEAKER_ID_MODEL` (auto-detect *eres2net*16k* if unset).
+
 ## Not yet (tracked in the design)
-The filter / attention / sense-making tiers, the graduation boundary to Genesis memory, a
-Genesis-side health probe of `ambient_health.json`, cross-window / cross-time speaker
-identity (a speaker-embedding registry), and the ESP32 ambient-mode firmware (the real
-audio source; Stage 1 uses the test feeder).
+The filter / attention / sense-making tiers and the graduation boundary to Genesis memory.
+Cross-time speaker identity now EXISTS (the `is_user` voiceprint registry above); cross-window
+diar *cluster* identity (comparable cluster ids across windows) is still not built — `is_user`
+sidesteps it by matching a fixed enrolled voiceprint.
