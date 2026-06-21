@@ -18,11 +18,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import glob
+import json
 import logging
 import os
 import signal
 import sys
+import time
+import uuid
+from datetime import UTC, datetime
 
 import numpy as np
 import sherpa_onnx
@@ -38,6 +43,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("ambient.enroll")
 
 TARGET_SR = 16000
+# Wait this much beyond the bridge's max collection window for its result file (covers the
+# bridge's embed/finalize time, which is O(clips)).
+_RESULT_POLL_PAD_S = 60
 
 
 def _load_16k_mono(path: str) -> np.ndarray:
@@ -107,17 +115,64 @@ async def _capture_live(cfg, *, target_s: float, min_dur: float, port: int) -> l
     return collected
 
 
+def _enroll_online(cfg, *, name: str, target_s: float) -> int:
+    """No-teardown enrollment: write a request file the RUNNING bridge polls, then wait for
+    its result. The bridge collects the speaker's live utterances + builds the voiceprint;
+    ambient capture keeps running throughout. Requires the bridge up + the device streaming."""
+    req_id = uuid.uuid4().hex[:12]
+    req_path = os.path.expanduser(cfg.enroll_request_path)
+    res_path = os.path.expanduser(cfg.enroll_result_path)
+    with contextlib.suppress(OSError):
+        os.remove(res_path)  # clear any stale result before requesting
+    with open(req_path, "w") as f:
+        json.dump({"id": req_id, "name": name, "target_s": target_s,
+                   "ts": datetime.now(UTC).isoformat()}, f)
+    log.info("online enroll requested (id=%s name=%r target=%.0fs) — have %r speak now; "
+             "the bridge stays up. Waiting for the result…", req_id, name, target_s, name)
+    deadline = time.monotonic() + cfg.enroll_max_wait_s + _RESULT_POLL_PAD_S
+    while time.monotonic() < deadline:
+        time.sleep(2)
+        if not os.path.exists(res_path):
+            continue
+        try:
+            with open(res_path) as f:
+                res = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if res.get("id") != req_id:
+            continue
+        if res.get("status") == "done":
+            if res.get("partial"):
+                log.warning("online enroll PARTIAL name=%r clips=%s — timed out before the target; "
+                            "voiceprint built from less speech. Consider re-enrolling.",
+                            name, res.get("clips"))
+            else:
+                log.info("✓ online enroll DONE name=%r clips=%s speakers=%s",
+                         name, res.get("clips"), res.get("speakers"))
+            return 0
+        log.error("online enroll %s: %s", res.get("status"), res.get("error", ""))
+        return 1
+    log.error("online enroll timed out — is ambient-bridge running + the device connected/streaming?")
+    return 1
+
+
 def main() -> int:
     cfg = load_config()
     ap = argparse.ArgumentParser(description="Enroll a speaker voiceprint")
     ap.add_argument("--name", default=cfg.user_speaker_name, help="speaker name (default: the user)")
     ap.add_argument("--from-dir", help="enroll from existing 16k wavs in this dir (no live capture)")
+    ap.add_argument("--online", action="store_true",
+                    help="no-teardown: ask the RUNNING bridge to capture + enroll (no model load here)")
     ap.add_argument("--model", default=cfg.speaker_id_model, help="embedding ONNX (default: autodetect)")
     ap.add_argument("--registry", default=cfg.speaker_registry_path, help="registry JSON path")
     ap.add_argument("--target-s", type=float, default=30.0, help="live: seconds of speech to collect")
     ap.add_argument("--min-dur", type=float, default=1.0, help="live: min utterance seconds to keep")
     ap.add_argument("--port", type=int, default=cfg.port, help="live: WS port (bridge must be stopped)")
     args = ap.parse_args()
+
+    if args.online:
+        # The running bridge owns the model + registry; don't load sherpa here.
+        return _enroll_online(cfg, name=args.name, target_s=args.target_s)
 
     model = args.model or _autodetect_embedding(cfg.models_dir)
     registry = SpeakerIDRegistry(

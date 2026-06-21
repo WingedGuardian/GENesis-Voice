@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import threading
 
 import numpy as np
@@ -205,6 +206,15 @@ class SpeakerIDRegistry:
                 for k, v in self._voiceprints.items()
             ],
         }
+        # Back up the prior registry before overwriting, so a bad/low-quality (online)
+        # re-enroll of an existing name can't silently clobber a good voiceprint —
+        # `<path>.bak` is a one-step rollback. Best-effort: a backup failure must not
+        # block the enroll.
+        if os.path.exists(self._persist_path):
+            try:
+                shutil.copy2(self._persist_path, self._persist_path + ".bak")
+            except OSError:
+                logger.warning("registry backup failed (continuing)", exc_info=True)
         tmp = self._persist_path + ".tmp"
         with open(tmp, "w") as f:
             json.dump(data, f)

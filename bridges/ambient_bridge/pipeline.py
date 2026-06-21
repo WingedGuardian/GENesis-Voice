@@ -85,11 +85,18 @@ class AmbientEngine:
         self._rec_lock = threading.Lock()
         self._diar_submit: Callable[[DiarWindow], Awaitable[None]] | None = None
         self._diar_window_samples = 0
+        self._enroll_collect: Callable[[np.ndarray, float], None] | None = None
         logger.info("Zipformer recognizer loaded from %s", d)
 
     def enable_diarization(self, submit: Callable[[DiarWindow], Awaitable[None]], window_samples: int) -> None:
         self._diar_submit = submit
         self._diar_window_samples = window_samples
+
+    def enable_enroll(self, collect: Callable[[np.ndarray, float], None]) -> None:
+        """Wire a per-utterance collect callback for online (no-teardown) enrollment. The
+        callback is a no-op unless an enroll session is active; it must be cheap + must not
+        raise (the pipeline guards it)."""
+        self._enroll_collect = collect
 
     def transcribe(self, samples) -> str:
         """Thread-safe STT. The recognizer is shared across connections, so serialize
@@ -105,6 +112,7 @@ class AmbientEngine:
             self._cfg, self._store, self, source,
             submit_window=self._diar_submit,
             diar_window_samples=self._diar_window_samples,
+            collect_enroll=self._enroll_collect,
         )
 
 
@@ -143,7 +151,8 @@ class DiarizationEngine:
 class AmbientPipeline:
     def __init__(self, cfg, store, engine, source: str,
                  submit_window: Callable[[DiarWindow], Awaitable[None]] | None = None,
-                 diar_window_samples: int = 0) -> None:
+                 diar_window_samples: int = 0,
+                 collect_enroll: Callable[[np.ndarray, float], None] | None = None) -> None:
         self._cfg = cfg
         self._store = store
         self._engine = engine
@@ -151,6 +160,7 @@ class AmbientPipeline:
         self._submit_window = submit_window
         self._diar_on = submit_window is not None
         self._diar_window_samples = diar_window_samples
+        self._collect_enroll = collect_enroll
         # Stateful resampler → phase-continuous audio for the diar window.
         if cfg.input_sample_rate != cfg.model_sample_rate:
             self._resampler = soxr.ResampleStream(
@@ -258,9 +268,21 @@ class AmbientPipeline:
         while not self._vad.empty():
             seg = self._vad.front
             abs_start = int(seg.start)
-            samples = seg.samples
+            # Own the samples with a copy BEFORE pop(): the VAD may recycle its internal buffer
+            # on pop, so this makes both STT and the enroll tap safe by construction (not by
+            # assuming the binding returns an independent array).
+            samples = np.asarray(seg.samples, dtype=np.float32).copy()
             self._vad.pop()
             dur = len(samples) / sr
+            # Online-enrollment tap: a no-op unless an enroll session is active. Guarded so a
+            # bug here can NEVER break capture. Runs before STT so it captures even empty-text
+            # utterances (enrollment wants the voice, not the transcript). `samples` is already
+            # an owned copy, so the collector can keep the reference directly.
+            if self._collect_enroll is not None:
+                try:
+                    self._collect_enroll(samples, dur)
+                except Exception:  # noqa: BLE001
+                    logger.warning("enroll collect failed (capture unaffected)", exc_info=True)
             text = self._engine.transcribe(samples)
             if not text:
                 continue
