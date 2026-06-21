@@ -70,6 +70,7 @@ class WebSocketHandler:
         noise_gate_hangover_ms: float = 250,
         noise_gate_log_interval_s: float = 2.0,
         idle_timeout_seconds: float = 45,
+        max_pending_active_seconds: float = 180,
     ):
         """
         Initialize WebSocket handler.
@@ -89,6 +90,10 @@ class WebSocketHandler:
                 diagnostic logging; <= 0 disables it (post-calibration).
             idle_timeout_seconds: Seconds of genuine idle (no speech, response,
                 or pending tool) after which the client WS is closed.
+            max_pending_active_seconds: Upper bound on a continuously-'pending'
+                response/tool before the session is force-closed (recovers the
+                device if an LLM response or tool call stalls and never emits its
+                End/Result frame).
         """
         self.host = host
         self.port = port
@@ -99,6 +104,7 @@ class WebSocketHandler:
         self._noise_gate_hangover_ms = noise_gate_hangover_ms
         self._noise_gate_log_interval_s = noise_gate_log_interval_s
         self._idle_timeout_seconds = idle_timeout_seconds
+        self._max_pending_active_seconds = max_pending_active_seconds
 
         self.transport: WebsocketServerTransport | None = None
         self.pipeline: Pipeline | None = None
@@ -210,6 +216,7 @@ class WebSocketHandler:
         session_idle_manager = SessionIdleManager(
             transport=transport,
             idle_timeout=self._idle_timeout_seconds,
+            max_pending_active=self._max_pending_active_seconds,
         )
         self.session_idle_manager = session_idle_manager
 

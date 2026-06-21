@@ -308,3 +308,113 @@ def test_disconnect_guard_false_on_fresh_session(monkeypatch):
     mgr, _ws, _pushed, _clock = _make_manager(monkeypatch)
     _run(_arm_quiet(mgr))
     assert mgr.user_turn_since_last_bot_response() is False
+
+
+# ── stuck-pending guard: bound a response/tool that never resolves ───────────
+
+def test_stuck_pending_response_forces_close(monkeypatch):
+    """An LLM response that goes 'pending' and never ends (OpenAI stalls with no
+    response.done → no LLMFullResponseEndFrame) is force-closed after
+    _max_pending_active so the device recovers instead of hanging."""
+    mgr, ws, _pushed, clock = _make_manager(monkeypatch, idle_timeout=45.0)
+    mgr._max_pending_active = 60.0
+    _run(_arm_quiet(mgr))
+
+    _feed(mgr, LLMFullResponseStartFrame())  # pending @1000, no End ever arrives
+    # Past the cap. The response is 'active', so the normal idle path can't fire;
+    # only the stuck-pending guard can close it.
+    clock["t"] = 1000.0 + 61.0
+    _run(mgr._check_idle_once())
+
+    assert ws.close_count == 1
+    assert ws.calls == ["send", "close"]          # signal device first, THEN close
+    sent = json.loads(ws.sent[0])
+    assert sent["type"] == "disconnect"
+    assert sent["reason"] == "stuck_pending"
+
+
+def test_stuck_pending_tool_forces_close(monkeypatch):
+    """A tool call whose Result/Cancel never arrives is bounded the same way."""
+    mgr, ws, _pushed, clock = _make_manager(monkeypatch, idle_timeout=45.0)
+    mgr._max_pending_active = 60.0
+    _run(_arm_quiet(mgr))
+
+    _feed(mgr, FunctionCallInProgressFrame(
+        function_name="recall", tool_call_id="stuck", arguments={}))
+    clock["t"] = 1000.0 + 61.0
+    _run(mgr._check_idle_once())
+
+    assert ws.close_count == 1
+    assert json.loads(ws.sent[0])["reason"] == "stuck_pending"
+
+
+def test_pending_under_cap_keeps_alive(monkeypatch):
+    """Below the cap, a pending response is normal in-flight work — not closed."""
+    mgr, ws, _pushed, clock = _make_manager(monkeypatch, idle_timeout=45.0)
+    mgr._max_pending_active = 60.0
+    _run(_arm_quiet(mgr))
+
+    _feed(mgr, LLMFullResponseStartFrame())
+    clock["t"] = 1000.0 + 59.0  # under the cap
+    _run(mgr._check_idle_once())
+    assert ws.close_count == 0
+
+
+def test_pending_resolved_resets_stuck_clock(monkeypatch):
+    """When a pending response ends, the stuck clock clears — a later response
+    gets a FRESH budget, so prior in-flight time never carries over."""
+    mgr, ws, _pushed, clock = _make_manager(monkeypatch, idle_timeout=45.0)
+    mgr._max_pending_active = 60.0
+    _run(_arm_quiet(mgr))
+
+    # First response runs 50s then ENDS cleanly.
+    _feed(mgr, LLMFullResponseStartFrame())          # pending @1000
+    clock["t"] = 1050.0
+    _feed(mgr, LLMFullResponseEndFrame())            # clears pending @1050
+    assert mgr._pending_active_since is None
+
+    # A second response starts — its budget is fresh from 1050, not 1000.
+    _feed(mgr, LLMFullResponseStartFrame())          # pending @1050
+    clock["t"] = 1050.0 + 59.0                        # 59s into the 2nd → under cap
+    _run(mgr._check_idle_once())
+    assert ws.close_count == 0
+
+
+def test_stuck_guard_ignores_speaking_only(monkeypatch):
+    """The guard targets ONLY response/tool pending — a long user/bot SPEAKING
+    stretch (no pending flag) is never force-closed, even far past the cap."""
+    mgr, ws, _pushed, clock = _make_manager(monkeypatch, idle_timeout=45.0)
+    mgr._max_pending_active = 60.0
+    _run(_arm_quiet(mgr))
+
+    _feed(mgr, UserStartedSpeakingFrame())           # active, but NOT pending
+    clock["t"] = 1000.0 + 300.0                       # far past the cap
+    _run(mgr._check_idle_once())
+    assert ws.close_count == 0
+
+
+def test_max_pending_active_default_is_180(monkeypatch):
+    """The shipped default cap is 180s (well above the ~60s legit tool max)."""
+    mgr, _ws, _pushed, _clock = _make_manager(monkeypatch)
+    assert mgr._max_pending_active == 180.0
+
+
+def test_pending_cleared_while_bot_speaking_resets_stuck_clock(monkeypatch):
+    """Concurrent case: a response ENDS while the bot is still speaking. The
+    stuck clock must clear (pending is gone) even though _is_active() stays True
+    — so the guard must NOT fire on the lingering bot-speech."""
+    mgr, ws, _pushed, clock = _make_manager(monkeypatch, idle_timeout=45.0)
+    mgr._max_pending_active = 60.0
+    _run(_arm_quiet(mgr))
+
+    _feed(mgr, LLMFullResponseStartFrame())                              # pending @1000
+    _feed(mgr, BotStartedSpeakingFrame(), direction=FrameDirection.UPSTREAM)
+    clock["t"] = 1050.0
+    _feed(mgr, LLMFullResponseEndFrame())   # pending ends; bot still speaking
+    assert mgr._pending_active_since is None  # cleared despite _is_active() True
+    assert mgr._bot_speaking is True
+
+    # Past the cap, but no pending flag is set → speaking alone never force-closes.
+    clock["t"] = 1050.0 + 61.0
+    _run(mgr._check_idle_once())
+    assert ws.close_count == 0

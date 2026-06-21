@@ -109,14 +109,20 @@ class Application:
             os.environ.get("NOISE_GATE_LOG_INTERVAL_S", "2.0")
         )
         idle_timeout_seconds = float(os.environ.get("IDLE_TIMEOUT_SECONDS", "45"))
+        # Bound on a continuously-'pending' response/tool (recovers the device if
+        # an LLM response or tool call stalls without its End/Result frame).
+        max_pending_active_seconds = float(
+            os.environ.get("MAX_PENDING_ACTIVE_SECONDS", "180")
+        )
         logger.info(
             "Noise gate: open=%d, bot_speaking=%d, hangover=%.0fms, "
-            "log_interval=%.1fs; idle_timeout=%.0fs",
+            "log_interval=%.1fs; idle_timeout=%.0fs; max_pending_active=%.0fs",
             noise_gate_open_threshold,
             noise_gate_bot_speaking_threshold,
             noise_gate_hangover_ms,
             noise_gate_log_interval_s,
             idle_timeout_seconds,
+            max_pending_active_seconds,
         )
 
         # Get session reuse timeout and initialize session manager
@@ -168,6 +174,7 @@ class Application:
             noise_gate_hangover_ms=noise_gate_hangover_ms,
             noise_gate_log_interval_s=noise_gate_log_interval_s,
             idle_timeout_seconds=idle_timeout_seconds,
+            max_pending_active_seconds=max_pending_active_seconds,
         )
         self.websocket_transport = self.websocket_handler.create_transport()
 
