@@ -74,6 +74,17 @@ class AmbientConfig:
     speaker_registry_path: str = field(default_factory=lambda: _env("AMBIENT_SPEAKER_REGISTRY", os.path.expanduser("~/ambient_speaker_registry.json")))
     user_speaker_name: str = field(default_factory=lambda: _env("AMBIENT_USER_SPEAKER_NAME", "user"))
 
+    # --- online enrollment (no-teardown: enroll a voiceprint while the bridge keeps running) ---
+    # The bridge polls request_path; on a fresh request it collects live VAD utterances
+    # (>= enroll_min_dur each) until enroll_target_s total, builds the voiceprint, writes
+    # result_path. Paths default to ~/ (OUTSIDE the repo — biometric, never commit).
+    enroll_request_path: str = field(default_factory=lambda: _env("AMBIENT_ENROLL_REQUEST", os.path.expanduser("~/ambient_enroll_request.json")))
+    enroll_result_path: str = field(default_factory=lambda: _env("AMBIENT_ENROLL_RESULT", os.path.expanduser("~/ambient_enroll_result.json")))
+    enroll_check_interval_s: float = field(default_factory=lambda: float(_env("AMBIENT_ENROLL_CHECK_S", "2.0")))
+    enroll_min_dur_s: float = field(default_factory=lambda: float(_env("AMBIENT_ENROLL_MIN_DUR_S", "1.0")))
+    enroll_target_s: float = field(default_factory=lambda: float(_env("AMBIENT_ENROLL_TARGET_S", "30.0")))
+    enroll_max_wait_s: float = field(default_factory=lambda: float(_env("AMBIENT_ENROLL_MAX_WAIT_S", "120.0")))
+
 
 def load_config() -> AmbientConfig:
     return AmbientConfig()

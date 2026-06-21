@@ -16,8 +16,11 @@ import json
 import logging
 import os
 import signal
+import threading
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+import numpy as np
 import websockets
 
 from .config import AmbientConfig, load_config
@@ -27,6 +30,22 @@ from .store import AmbientStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("ambient.server")
+
+
+@dataclass
+class _EnrollSession:
+    """In-flight online-enrollment state. `samples` is appended by the pipeline worker
+    thread (under `lock`) and snapshotted by the async watcher, which owns all lifecycle
+    transitions (start/finalize/abort) — so the capture hot path only ever buffers."""
+
+    id: str
+    name: str
+    target_s: float
+    samples: list[np.ndarray] = field(default_factory=list)
+    total_dur: float = 0.0
+    start_time: float = 0.0          # event-loop clock at session start (wallclock-faithful timeout)
+    done: bool = False               # set under lock at finalize so the worker tap stops appending
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 def tracked_task(coro, *, name: str) -> asyncio.Task:
@@ -78,19 +97,26 @@ class AmbientServer:
         if cfg.speaker_id_enabled and self._diar is not None:
             try:
                 model = cfg.speaker_id_model or _autodetect_embedding(cfg.models_dir)
-                reg = SpeakerIDRegistry(
+                # Instantiate the registry even with NO voiceprint yet, so online enrollment
+                # can populate it. VERIFICATION gates on has_user() at call time (no voiceprint
+                # → is_user / speaker_name stay NULL; capture is unaffected).
+                self._speaker_id = SpeakerIDRegistry(
                     model, persist_path=cfg.speaker_registry_path,
                     num_threads=cfg.diar_num_threads, user_name=cfg.user_speaker_name,
                 )
-                if reg.has_user():
-                    self._speaker_id = reg
+                if self._speaker_id.has_user():
                     logger.info("Speaker-ID enabled (user=%r voiceprint loaded)", cfg.user_speaker_name)
                 else:
-                    logger.warning("Speaker-ID on but no %r voiceprint in %s — is_user stays NULL "
-                                   "until enrolled (python -m ambient_bridge.enroll)",
+                    logger.warning("Speaker-ID on but no %r voiceprint yet in %s — verdicts stay "
+                                   "NULL until enrolled (python -m ambient_bridge.enroll [--online])",
                                    cfg.user_speaker_name, cfg.speaker_registry_path)
             except Exception:
-                logger.warning("Speaker-ID init failed — is_user stays NULL", exc_info=True)
+                logger.warning("Speaker-ID init failed — verdicts stay NULL", exc_info=True)
+        # --- online enrollment (no-teardown), additive — needs the registry to enroll into ---
+        self._enroll: _EnrollSession | None = None
+        self._enroll_last_id: str | None = None
+        if self._speaker_id is not None:
+            self._engine.enable_enroll(self._collect_enroll)
         # Track active handler tasks so shutdown awaits their flush before closing the store.
         self._handler_tasks: set[asyncio.Task] = set()
 
@@ -141,12 +167,14 @@ class AmbientServer:
 
     def _verify_speaker_identities(self, window: DiarWindow,
                                    segs: list[tuple[float, float, int]]) -> None:
-        """Tag each utterance ``is_user`` via speaker-ID. Runs in the diar worker thread
-        (OFF the ingest path). Embeds each utterance from ``window.raw``; a DIRECT verdict
-        for utts >= min_embed_s, and the shorter utts inherit their diar cluster's centroid
-        verdict (recovery). No-op if speaker-id is disabled or unenrolled."""
+        """Tag each utterance with its speaker identity via speaker-ID. Runs in the diar worker
+        thread (OFF the ingest path). Embeds each utterance from ``window.raw``; a DIRECT verdict
+        for utts >= min_embed_s, and the shorter utts inherit their diar cluster's centroid verdict
+        (recovery). Writes ``speaker_name`` (best-matching enrolled name, NULL if no match) +
+        ``is_user`` (speaker_name == the user). No-op if speaker-id is off or NO voiceprint is
+        enrolled yet (``has_user`` false → verdicts stay NULL; capture is unaffected)."""
         reg = self._speaker_id
-        if reg is None or not window.spans:
+        if reg is None or not reg.has_user() or not window.spans:
             return
         sr = self._cfg.model_sample_rate
         raw = window.raw
@@ -161,12 +189,117 @@ class AmbientServer:
             threshold=self._cfg.user_verify_threshold, min_embed_s=self._cfg.min_embed_s,
         )
         n_user = 0
-        for row_id, (is_user, method) in zip(row_ids, verdicts):
+        for row_id, (speaker_name, is_user, method) in zip(row_ids, verdicts):
             if is_user is None:
                 continue
-            self._store.set_is_user(row_id, is_user, method)
+            self._store.set_identity(row_id, speaker_name=speaker_name, is_user=is_user, method=method)
             n_user += int(is_user)
         logger.info("speaker-id w%d: %d/%d utts → user", window.window_idx, n_user, len(row_ids))
+
+    # --- online enrollment (no-teardown) --------------------------------------
+
+    def _collect_enroll(self, samples: np.ndarray, dur: float) -> None:
+        """Buffer one utterance for an active enroll session (called from the pipeline worker
+        thread). No-op unless a session is active + the utterance is long enough. ONLY buffers —
+        the async watcher does finalize/abort, off the capture path. `samples` is already an
+        owned copy (the pipeline copies before VAD pop)."""
+        sess = self._enroll
+        if sess is None or dur < self._cfg.enroll_min_dur_s:
+            return
+        with sess.lock:
+            if sess.done or sess.total_dur >= sess.target_s:
+                return  # finalizing (or already enough) — the watcher takes it from here
+            sess.samples.append(samples)   # already an owned copy (pipeline copies pre-pop)
+            sess.total_dur += dur
+
+    def _read_enroll_request(self) -> dict | None:
+        path = self._cfg.enroll_request_path
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            req = {"id": str(data["id"]), "name": str(data["name"]),
+                   "target_s": float(data.get("target_s", self._cfg.enroll_target_s))}
+        except (OSError, ValueError, KeyError, TypeError):
+            logger.warning("bad enroll request file — ignoring", exc_info=True)
+            return None
+        ts = data.get("ts")  # staleness guard: drop leftovers from a crash/restart
+        if ts:
+            try:
+                age = (datetime.now(UTC) - datetime.fromisoformat(ts)).total_seconds()
+            except ValueError:
+                age = 0.0
+            if age > 600:
+                logger.warning("stale enroll request (age %.0fs) — clearing", age)
+                self._delete_enroll_request()
+                return None
+        return req
+
+    def _write_enroll_result(self, result: dict) -> None:
+        try:
+            tmp = self._cfg.enroll_result_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(result, f)
+            os.replace(tmp, self._cfg.enroll_result_path)
+        except OSError:
+            logger.warning("enroll result write failed", exc_info=True)
+
+    def _delete_enroll_request(self) -> None:
+        with contextlib.suppress(OSError):
+            os.remove(self._cfg.enroll_request_path)
+
+    async def _finalize_enroll(self, sess: _EnrollSession, *, timed_out: bool = False) -> None:
+        """Build + persist the voiceprint OFF the capture path (to_thread), write the result,
+        clear the request. Detaches the session first so collection stops."""
+        with sess.lock:
+            sess.done = True              # stop the worker tap from appending past the snapshot
+            samples = list(sess.samples)
+        self._enroll = None
+        self._enroll_last_id = sess.id
+        result = {"id": sess.id, "name": sess.name, "ts": datetime.now(UTC).isoformat()}
+        if not samples:
+            result.update(status="timeout", clips=0)
+            logger.warning("online enroll TIMEOUT name=%r — no speech collected", sess.name)
+        else:
+            try:
+                n = await asyncio.to_thread(self._speaker_id.enroll, sess.name, samples)
+                result.update(status="done", clips=n, partial=timed_out,
+                              speakers=self._speaker_id.names())
+                logger.info("online enroll DONE name=%r clips=%d%s speakers=%s", sess.name, n,
+                            " (partial)" if timed_out else "", self._speaker_id.names())
+            except Exception as exc:  # noqa: BLE001
+                result.update(status="failed", error=str(exc))
+                logger.warning("online enroll FAILED name=%r", sess.name, exc_info=True)
+        self._write_enroll_result(result)
+        self._delete_enroll_request()
+
+    async def _enroll_watcher(self) -> None:
+        """Poll for an enroll request + own all session lifecycle (start/finalize/abort).
+        Finalize runs via to_thread so the CPU embed never blocks the event loop or capture."""
+        while True:
+            await asyncio.sleep(self._cfg.enroll_check_interval_s)
+            try:
+                if self._enroll is None:
+                    req = self._read_enroll_request()
+                    if req is None or req["id"] == self._enroll_last_id:
+                        continue
+                    sess = _EnrollSession(id=req["id"], name=req["name"], target_s=req["target_s"])
+                    sess.start_time = asyncio.get_running_loop().time()
+                    self._enroll = sess
+                    logger.info("online enroll START name=%r target=%.0fs — have the speaker talk now",
+                                req["name"], req["target_s"])
+                    continue
+                sess = self._enroll
+                with sess.lock:
+                    enough = sess.total_dur >= sess.target_s
+                elapsed = asyncio.get_running_loop().time() - sess.start_time  # wallclock, not ticks
+                if enough:
+                    await self._finalize_enroll(sess)
+                elif elapsed > self._cfg.enroll_max_wait_s:
+                    await self._finalize_enroll(sess, timed_out=True)
+            except Exception:  # noqa: BLE001
+                logger.warning("enroll watcher tick failed", exc_info=True)
 
     async def _diar_worker(self) -> None:
         # Liveness flag is set at task-creation in run() (so the startup health snapshot reads
@@ -244,6 +377,7 @@ class AmbientServer:
                 "diar_queue_depth": self._diar_queue.qsize() if self._diar_queue else 0,
                 "diar_windows_dropped": self._diar_dropped,
                 "speaker_id_enabled": self._speaker_id is not None,
+                "enrolling": self._enroll.name if self._enroll else None,
                 **stats,
             }
             tmp = self._cfg.health_path + ".tmp"
@@ -289,6 +423,9 @@ class AmbientServer:
             # False (the worker's finally-block flips it back off on exit).
             self._diar_worker_alive = True
             tasks.append(tracked_task(self._diar_worker(), name="ambient-diar"))
+        if self._speaker_id is not None:
+            # Online (no-teardown) enrollment watcher — owns enroll session lifecycle.
+            tasks.append(tracked_task(self._enroll_watcher(), name="ambient-enroll"))
         # First health write AFTER tasks are wired, so the snapshot reflects real state.
         self._write_health()
         logger.info("Ambient bridge listening on ws://%s:%d/ (input_sr=%d → 16k, diar=%s)",

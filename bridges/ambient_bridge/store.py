@@ -40,10 +40,15 @@ class AmbientStore:
         # Stage-A: is_user column (NULL until speaker-id verifies). Idempotent ALTER so an
         # EXISTING db (created before this column) gains it — CREATE TABLE IF NOT EXISTS
         # would not add it. is_user: 1=enrolled user, 0=other, NULL=no verdict yet.
-        try:
-            self._db.execute("ALTER TABLE ambient_transcripts ADD COLUMN is_user INTEGER")
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        # speaker_name: best-matching enrolled identity (NULL = no confident match / no
+        # verdict). DISTINCT from speaker_label (the diar cluster tag wN:c/total). is_user is
+        # derived (speaker_name == the configured user name) but kept as its own column so the
+        # user-only graduation gate stays a cheap indexed lookup.
+        for col, typ in (("is_user", "INTEGER"), ("speaker_name", "TEXT")):
+            try:
+                self._db.execute(f"ALTER TABLE ambient_transcripts ADD COLUMN {col} {typ}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         self._db.commit()
         self._lock = threading.Lock()
 
@@ -69,11 +74,12 @@ class AmbientStore:
             )
             self._db.commit()
 
-    def set_is_user(self, row_id: int, is_user: bool, method: str) -> None:
-        """Record the speaker-id verdict (1=enrolled user / 0=other) plus how it was
-        derived (``method``: 'direct' per-utterance, or 'cluster' centroid) in meta JSON,
-        so a later graduation step can weight cluster verdicts lower. Merges into any
-        existing meta rather than clobbering it."""
+    def set_identity(self, row_id: int, *, speaker_name: str | None, is_user: bool, method: str) -> None:
+        """Record the speaker-id verdict: ``speaker_name`` (best-matching enrolled name, or
+        NULL for no confident match), ``is_user`` (1=enrolled user / 0=other), and how it was
+        derived (``method``: 'direct' per-utterance, or 'cluster' centroid) in meta JSON, so a
+        later graduation step can weight cluster verdicts lower. Merges into any existing meta
+        rather than clobbering it."""
         with self._lock:
             row = self._db.execute(
                 "SELECT meta FROM ambient_transcripts WHERE id=?", (row_id,)
@@ -86,8 +92,8 @@ class AmbientStore:
                     meta = {}
             meta["is_user_method"] = method
             self._db.execute(
-                "UPDATE ambient_transcripts SET is_user=?, meta=? WHERE id=?",
-                (1 if is_user else 0, json.dumps(meta), row_id),
+                "UPDATE ambient_transcripts SET is_user=?, speaker_name=?, meta=? WHERE id=?",
+                (1 if is_user else 0, speaker_name, json.dumps(meta), row_id),
             )
             self._db.commit()
 
