@@ -24,6 +24,13 @@ class AmbientConfig:
     # and the resample becomes a no-op.
     input_sample_rate: int = field(default_factory=lambda: int(_env("AMBIENT_INPUT_SR", "24000")))
     model_sample_rate: int = 16000  # sherpa VAD + Zipformer hard requirement
+    # TCP keep-alive on accepted client sockets: detect a silently-dead (half-open) Voice PE
+    # in ~idle + intvl*cnt seconds instead of the OS default (~2h). Needed because WS server
+    # PINGs are OFF (the device rejects them — see server.serve()), so without this a dead
+    # socket lingers ESTAB and inflates active_connections.
+    keepalive_idle_s: int = field(default_factory=lambda: int(_env("AMBIENT_KEEPALIVE_IDLE_S", "120")))
+    keepalive_intvl_s: int = field(default_factory=lambda: int(_env("AMBIENT_KEEPALIVE_INTVL_S", "10")))
+    keepalive_cnt: int = field(default_factory=lambda: int(_env("AMBIENT_KEEPALIVE_CNT", "3")))
 
     # --- models (paths on the VM) ---
     models_dir: str = field(default_factory=lambda: _env("AMBIENT_MODELS_DIR", os.path.expanduser("~/models")))
