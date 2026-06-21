@@ -18,6 +18,7 @@ def _reg(voiceprints=None, dim=3, user="user"):
     r._dim = dim
     r._sr = 16000
     r._lock = threading.Lock()
+    r._vp_lock = threading.Lock()
     return r
 
 
@@ -45,6 +46,17 @@ def test_score_and_verify():
     assert r.score(_unit([1, 0, 0]), name="ghost") == -1.0   # unknown speaker
     assert r.verify(_unit([1, 0, 0]), 0.35) is True
     assert r.verify(_unit([0, 1, 0]), 0.35) is False
+
+
+def test_best_match_argmax_threshold():
+    r = _reg({"user": _unit([1, 0, 0]), "alice": _unit([0, 1, 0])})
+    name, score = r.best_match(_unit([0.9, 0.1, 0]), 0.35)   # closest to user
+    assert name == "user" and score > 0.9
+    name, _ = r.best_match(_unit([0.1, 0.9, 0]), 0.35)       # closest to alice
+    assert name == "alice"
+    name, score = r.best_match(_unit([0, 0, 1]), 0.35)       # matches nobody ≥ threshold
+    assert name is None and score < 0.35
+    assert r.best_match(None, 0.35) == (None, -1.0)          # no embedding
 
 
 def test_save_load_roundtrip(tmp_path):
@@ -79,10 +91,10 @@ def test_classify_direct_and_cluster_anchored():
         [user_long, user_short, other_long], [4.0, 1.0, 4.0], [0, 0, 1],
         threshold=0.35, min_embed_s=3.0,
     )
-    assert v[0] == (True, "direct")
-    assert v[2] == (False, "direct")
+    assert v[0] == ("user", True, "direct")
+    assert v[2] == (None, False, "direct")    # orthogonal to user → matches nobody → name None
     # short user utt inherits cluster 0's centroid (anchored by user_long) → user
-    assert v[1] == (True, "cluster")
+    assert v[1] == ("user", True, "cluster")
 
 
 def test_classify_all_short_cluster_recovers():
@@ -91,13 +103,13 @@ def test_classify_all_short_cluster_recovers():
         [_unit([0.8, 0.2, 0]), _unit([0.7, 0.3, 0])], [1.0, 1.2], [0, 0],
         threshold=0.35, min_embed_s=3.0,
     )
-    assert all(m == "cluster" for _, m in v)
-    assert all(is_u is True for is_u, _ in v)   # averaged short embeddings → user
+    assert all(m == "cluster" for _, _, m in v)
+    assert all(name == "user" and is_u is True for name, is_u, _ in v)  # averaged short → user
 
 
 def test_classify_no_embedding_is_null():
     r = _reg({"user": _unit([1, 0, 0])})
-    assert r.classify_window([None], [4.0], [0], threshold=0.35, min_embed_s=3.0) == [(None, None)]
+    assert r.classify_window([None], [4.0], [0], threshold=0.35, min_embed_s=3.0) == [(None, None, None)]
 
 
 def test_classify_none_cluster_short_stays_null():
@@ -105,7 +117,7 @@ def test_classify_none_cluster_short_stays_null():
     # gap utts — it stays NULL (no direct verdict possible, no cluster to inherit).
     r = _reg({"user": _unit([1, 0, 0])})
     v = r.classify_window([_unit([0.8, 0.2, 0])], [1.0], [None], threshold=0.35, min_embed_s=3.0)
-    assert v == [(None, None)]
+    assert v == [(None, None, None)]
 
 
 def test_classify_none_cluster_long_is_direct():
@@ -113,4 +125,4 @@ def test_classify_none_cluster_long_is_direct():
     # does not depend on clustering).
     r = _reg({"user": _unit([1, 0, 0])})
     v = r.classify_window([_unit([0.9, 0.1, 0])], [4.0], [None], threshold=0.35, min_embed_s=3.0)
-    assert v == [(True, "direct")]
+    assert v == [("user", True, "direct")]

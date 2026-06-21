@@ -12,6 +12,18 @@ secrets.env
 models/
 *.onnx
 *.wav
+*.flac
+*.pcm
+
+# Voice enrollment / runtime artifacts — BIOMETRIC, never commit to a public repo
+# (these default to ~/ outside the repo; ignored here as defense-in-depth so a voiceprint
+#  can never be committed even if a path points into the tree or the bridge runs from here)
+*speaker_registry*.json
+ambient_speaker_registry.json
+ambient_enroll_request.json
+ambient_enroll_result.json
+ambient_health.json
+spike_audio*/
 
 # Python
 __pycache__/

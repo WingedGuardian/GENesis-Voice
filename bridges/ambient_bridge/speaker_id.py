@@ -51,7 +51,10 @@ class SpeakerIDRegistry:
         self._user_name = user_name
         self._persist_path = os.path.expanduser(persist_path)
         self._voiceprints: dict[str, np.ndarray] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()        # serializes the shared ONNX extractor
+        self._vp_lock = threading.Lock()     # guards the voiceprint dict (read in the diar
+        # worker via best_match, mutated by online enroll) — without it, adding a key while
+        # best_match iterates would raise "dict changed size during iteration".
         self._load()
         logger.info(
             "SpeakerIDRegistry loaded (model=%s dim=%d speakers=%s)",
@@ -115,6 +118,23 @@ class SpeakerIDRegistry:
         """True if ``emb`` matches the voiceprint at/above ``threshold``."""
         return bool(self.score(emb, name) >= threshold)
 
+    def best_match(self, emb: np.ndarray | None, threshold: float) -> tuple[str | None, float]:
+        """The closest enrolled speaker to ``emb`` by cosine: ``(name, score)`` if the best
+        score is at/above ``threshold``, else ``(None, best_score)`` (no confident match —
+        never fabricate a name). Thread-safe against a concurrent online enroll (snapshots
+        the dict under the voiceprint lock). Validated 2026-06-20: at threshold 0.35 a 2nd
+        human never crossed the user's voiceprint (cross-FA 0/151)."""
+        if emb is None:
+            return None, -1.0
+        with self._vp_lock:
+            items = list(self._voiceprints.items())
+        best_name, best_score = None, -1.0
+        for name, vp in items:
+            s = float(np.dot(emb, vp))
+            if s > best_score:
+                best_name, best_score = name, s
+        return (best_name, best_score) if best_score >= threshold else (None, best_score)
+
     def classify_window(
         self,
         embeddings: list[np.ndarray | None],
@@ -123,24 +143,27 @@ class SpeakerIDRegistry:
         *,
         threshold: float,
         min_embed_s: float,
-    ) -> list[tuple[bool | None, str | None]]:
-        """Per-utterance (is_user, method) for one diar window. Pure decision logic
-        (no ONNX) so it is unit-testable.
+    ) -> list[tuple[str | None, bool | None, str | None]]:
+        """Per-utterance (speaker_name, is_user, method) for one diar window. Pure decision
+        logic (no ONNX) so it is unit-testable. ``speaker_name`` is the best-matching enrolled
+        name (None = a usable embedding that matched nobody ≥ threshold); ``is_user`` =
+        (speaker_name == the user name); ``method`` ∈ {direct, cluster}.
 
         - DIRECT verdict for utts with a usable embedding AND duration >= min_embed_s
           (the individual embedding is reliable) → method 'direct'.
         - The remaining (short) utts inherit their diar CLUSTER's centroid verdict
           → method 'cluster'. The centroid is taken over ALL the cluster's usable
           embeddings (incl. any long/clean ones), which anchors the short utts.
-        - No usable embedding → (None, None) (leave is_user NULL).
+        - No usable embedding → (None, None, None) (leave the row's verdict NULL).
 
         ``embeddings``/``durations``/``clusters`` are aligned, one entry per utterance.
         """
         n = len(embeddings)
-        verdicts: list[tuple[bool | None, str | None]] = [(None, None)] * n
+        verdicts: list[tuple[str | None, bool | None, str | None]] = [(None, None, None)] * n
         for i in range(n):
             if embeddings[i] is not None and durations[i] >= min_embed_s:
-                verdicts[i] = (bool(self.score(embeddings[i]) >= threshold), "direct")
+                name, _ = self.best_match(embeddings[i], threshold)
+                verdicts[i] = (name, name == self._user_name, "direct")
         # Cluster centroid for the still-undecided utts (anchored by the whole cluster).
         # Skip utts with no diar cluster (clusters[i] is None — no segment overlapped):
         # averaging unrelated "gap" utts together would yield a spurious verdict, so they
@@ -150,13 +173,13 @@ class SpeakerIDRegistry:
             if embeddings[i] is not None and clusters[i] is not None:
                 groups.setdefault(clusters[i], []).append(i)
         for idxs in groups.values():
-            undecided = [i for i in idxs if verdicts[i][1] is None]
+            undecided = [i for i in idxs if verdicts[i][2] is None]
             if not undecided:
                 continue
             centroid = self.mean_embedding([embeddings[i] for i in idxs])
-            is_user = bool(self.score(centroid) >= threshold)
+            name, _ = self.best_match(centroid, threshold)
             for i in undecided:
-                verdicts[i] = (is_user, "cluster")
+                verdicts[i] = (name, name == self._user_name, "cluster")
         return verdicts
 
     # --- enrollment + persistence --------------------------------------------
@@ -168,8 +191,9 @@ class SpeakerIDRegistry:
         if not embs:
             raise ValueError(f"no usable enrollment audio for {name!r}")
         centroid = self.mean_embedding(embs)
-        self._voiceprints[name] = centroid
-        self._save()
+        with self._vp_lock:                  # safe vs the diar worker's best_match snapshot
+            self._voiceprints[name] = centroid
+            self._save()
         logger.info("enrolled %r from %d/%d clips", name, len(embs), len(samples_list))
         return len(embs)
 

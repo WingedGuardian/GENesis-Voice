@@ -78,19 +78,21 @@ class AmbientServer:
         if cfg.speaker_id_enabled and self._diar is not None:
             try:
                 model = cfg.speaker_id_model or _autodetect_embedding(cfg.models_dir)
-                reg = SpeakerIDRegistry(
+                # Instantiate the registry even with NO voiceprint yet, so online enrollment
+                # can populate it. VERIFICATION gates on has_user() at call time (no voiceprint
+                # → is_user / speaker_name stay NULL; capture is unaffected).
+                self._speaker_id = SpeakerIDRegistry(
                     model, persist_path=cfg.speaker_registry_path,
                     num_threads=cfg.diar_num_threads, user_name=cfg.user_speaker_name,
                 )
-                if reg.has_user():
-                    self._speaker_id = reg
+                if self._speaker_id.has_user():
                     logger.info("Speaker-ID enabled (user=%r voiceprint loaded)", cfg.user_speaker_name)
                 else:
-                    logger.warning("Speaker-ID on but no %r voiceprint in %s — is_user stays NULL "
-                                   "until enrolled (python -m ambient_bridge.enroll)",
+                    logger.warning("Speaker-ID on but no %r voiceprint yet in %s — verdicts stay "
+                                   "NULL until enrolled (python -m ambient_bridge.enroll [--online])",
                                    cfg.user_speaker_name, cfg.speaker_registry_path)
             except Exception:
-                logger.warning("Speaker-ID init failed — is_user stays NULL", exc_info=True)
+                logger.warning("Speaker-ID init failed — verdicts stay NULL", exc_info=True)
         # Track active handler tasks so shutdown awaits their flush before closing the store.
         self._handler_tasks: set[asyncio.Task] = set()
 
@@ -141,12 +143,14 @@ class AmbientServer:
 
     def _verify_speaker_identities(self, window: DiarWindow,
                                    segs: list[tuple[float, float, int]]) -> None:
-        """Tag each utterance ``is_user`` via speaker-ID. Runs in the diar worker thread
-        (OFF the ingest path). Embeds each utterance from ``window.raw``; a DIRECT verdict
-        for utts >= min_embed_s, and the shorter utts inherit their diar cluster's centroid
-        verdict (recovery). No-op if speaker-id is disabled or unenrolled."""
+        """Tag each utterance with its speaker identity via speaker-ID. Runs in the diar worker
+        thread (OFF the ingest path). Embeds each utterance from ``window.raw``; a DIRECT verdict
+        for utts >= min_embed_s, and the shorter utts inherit their diar cluster's centroid verdict
+        (recovery). Writes ``speaker_name`` (best-matching enrolled name, NULL if no match) +
+        ``is_user`` (speaker_name == the user). No-op if speaker-id is off or NO voiceprint is
+        enrolled yet (``has_user`` false → verdicts stay NULL; capture is unaffected)."""
         reg = self._speaker_id
-        if reg is None or not window.spans:
+        if reg is None or not reg.has_user() or not window.spans:
             return
         sr = self._cfg.model_sample_rate
         raw = window.raw
@@ -161,10 +165,10 @@ class AmbientServer:
             threshold=self._cfg.user_verify_threshold, min_embed_s=self._cfg.min_embed_s,
         )
         n_user = 0
-        for row_id, (is_user, method) in zip(row_ids, verdicts):
+        for row_id, (speaker_name, is_user, method) in zip(row_ids, verdicts):
             if is_user is None:
                 continue
-            self._store.set_is_user(row_id, is_user, method)
+            self._store.set_identity(row_id, speaker_name=speaker_name, is_user=is_user, method=method)
             n_user += int(is_user)
         logger.info("speaker-id w%d: %d/%d utts → user", window.window_idx, n_user, len(row_ids))
 
