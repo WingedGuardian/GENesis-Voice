@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import signal
+import socket
 import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -30,6 +31,27 @@ from .store import AmbientStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("ambient.server")
+
+
+def _enable_tcp_keepalive(sock, cfg: AmbientConfig) -> None:
+    """Enable + tune TCP keep-alive on an accepted client socket so a silently-dead
+    (half-open) peer is detected in ~idle + intvl*cnt seconds (minutes) instead of the OS
+    default (~2h). Needed because WS server PINGs are disabled (the Voice PE rejects them),
+    which otherwise leaves dead sockets ESTAB for ~2h and inflates active_connections.
+    Best-effort: a missing socket or an unsupported option is logged, never fatal."""
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for opt, val in (
+            ("TCP_KEEPIDLE", cfg.keepalive_idle_s),
+            ("TCP_KEEPINTVL", cfg.keepalive_intvl_s),
+            ("TCP_KEEPCNT", cfg.keepalive_cnt),
+        ):
+            if hasattr(socket, opt):
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
+    except OSError as exc:
+        logger.warning("could not set TCP keep-alive on client socket: %s", exc)
 
 
 @dataclass
@@ -324,6 +346,12 @@ class AmbientServer:
 
     async def _handler(self, websocket) -> None:
         source = f"ambient-{getattr(websocket, 'remote_address', ('?',))[0]}"
+        # Reap a silently-dead (half-open) peer in minutes: WS pings are off (the device
+        # rejects them), so without tuned TCP keep-alive a dead socket would sit ESTAB ~2h.
+        # get_extra_info("socket") may be None (non-TCP transport) → helper no-ops on None.
+        transport = getattr(websocket, "transport", None)
+        sock = transport.get_extra_info("socket") if transport is not None else None
+        _enable_tcp_keepalive(sock, self._cfg)
         pipeline = self._engine.new_pipeline(source)
         task = asyncio.current_task()
         self._handler_tasks.add(task)
@@ -440,10 +468,10 @@ class AmbientServer:
             # ping_interval=None: the Voice PE's minimal WS stack rejects server PING control
             # frames (-> 1002 invalid-opcode close ~every 60s, with no client-side reconnect),
             # which silently kills ambient capture. Audio is a continuous stream, so we rely on
-            # app-level liveness instead. CAVEAT: without WS pings a silently-dead (half-open)
-            # socket isn't detected until the OS TCP keep-alive fires (~2h default), so
-            # active_connections can read stale -> the health MONITOR must gate on `last_ts`
-            # (audio-gap) freshness, NOT on active_connections.
+            # app-level liveness instead. A silently-dead (half-open) socket is reaped via the
+            # per-connection TCP keep-alive set in _handler (_enable_tcp_keepalive: minutes, NOT
+            # the ~2h OS default) so active_connections self-corrects; the health MONITOR still gates
+            # on `last_ts` (audio-gap) freshness as the primary signal.
             async with websockets.serve(
                 self._handler, self._cfg.host, self._cfg.port, max_size=None, ping_interval=None,
             ):
