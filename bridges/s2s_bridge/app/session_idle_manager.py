@@ -47,10 +47,20 @@ class SessionIdleManager(FrameProcessor):
     Pure observer: every frame is pushed onward unchanged.
     """
 
-    def __init__(self, transport, idle_timeout: float, **kwargs):
+    def __init__(self, transport, idle_timeout: float, max_pending_active: float = 180.0, **kwargs):
         super().__init__(**kwargs)
         self._transport = transport
         self._idle_timeout = idle_timeout
+        # Upper bound on how long a 'pending' response/tool may stay CONTINUOUSLY
+        # active. A stalled OpenAI Realtime response (the model emits
+        # LLMFullResponseStart but the connection hangs with no response.done → no
+        # LLMFullResponseEnd) or an unresolved tool call would otherwise hold the
+        # session active forever — and while active the idle watchdog refreshes its
+        # OWN clock, so the device hangs until the 55-min rotation. This bounds that
+        # to ~max_pending_active seconds. Generous vs. the legit max (~60s tool /
+        # a few-second response) so it never cuts a real turn.
+        self._max_pending_active = max_pending_active
+        self._pending_active_since: float | None = None
         self._user_speaking = False
         self._bot_speaking = False
         self._response_pending = False
@@ -101,11 +111,24 @@ class SessionIdleManager(FrameProcessor):
             self._pending_tools.discard(frame.tool_call_id)
             self._touch()
 
+        self._update_pending_clock()
         await self.push_frame(frame, direction)
 
     def _touch(self) -> None:
         """Record the current time as the last activity."""
         self._last_activity = time.monotonic()
+
+    def _update_pending_clock(self) -> None:
+        """Track when the response/tool 'pending' state began so it can be
+        bounded. Set on the inactive→pending edge; cleared when nothing is
+        pending. Only the response/tool flags are bounded — they stick if an
+        End/Result frame never arrives — whereas user/bot SPEAKING self-limits
+        and is firmware-backstopped once bot audio plays."""
+        if self._response_pending or self._pending_tools:
+            if self._pending_active_since is None:
+                self._pending_active_since = time.monotonic()
+        else:
+            self._pending_active_since = None
 
     def _is_active(self) -> bool:
         """True if any user/bot speech, pending response, or pending tool."""
@@ -142,6 +165,7 @@ class SessionIdleManager(FrameProcessor):
         self._bot_speaking = False
         self._response_pending = False
         self._pending_tools = set()
+        self._pending_active_since = None
         self._last_user_transcript_t = 0.0
         self._last_bot_response_t = 0.0
         self._closing = False
@@ -154,6 +178,10 @@ class SessionIdleManager(FrameProcessor):
     def disarm(self) -> None:
         """Stop tracking idle (client disconnected) and cancel the watchdog."""
         self._armed = False
+        # Drop the stuck-pending clock so the object isn't left mid-state between
+        # disarm and the next arm() (arm() also resets it, but a session can end
+        # WITH a pending flag still set — the exact case this guard handles).
+        self._pending_active_since = None
         if self._watchdog is not None and not self._watchdog.done():
             self._watchdog.cancel()
         self._watchdog = None
@@ -169,30 +197,55 @@ class SessionIdleManager(FrameProcessor):
     async def _check_idle_once(self) -> None:
         """One idle evaluation. Closes the WS if armed, inactive, and the
         idle timeout has elapsed since the last activity. Idempotent: the
-        ``_closing`` guard makes a second call a no-op."""
+        ``_closing`` guard makes a second call a no-op.
+
+        Also enforces the stuck-pending guard: a response/tool that stays
+        'pending' for ``_max_pending_active`` seconds (a stalled LLM response
+        with no End frame, an unresolved tool call) is force-closed so the
+        device recovers instead of hanging."""
         if not self._armed:
             return
         if self._is_active():
+            if (
+                self._pending_active_since is not None
+                and time.monotonic() - self._pending_active_since >= self._max_pending_active
+            ):
+                logger.warning(
+                    "⚠️ Response/tool stuck 'pending' for ≥%.0fs (no End/Result frame) "
+                    "— forcing close so the device recovers",
+                    self._max_pending_active,
+                )
+                await self._close_idle(reason="stuck_pending")
+                return
             self._touch()
             return
         if time.monotonic() - self._last_activity >= self._idle_timeout:
             await self._close_idle()
 
-    async def _close_idle(self) -> None:
+    async def _close_idle(self, reason: str = "idle") -> None:
         """Signal the device the session is over, then close the client WS once.
 
         The bare ``ws.close()`` this used to do made the firmware reconnect into
         a torn-down session (spinning forever); ``send_disconnect_then_close``
         first tells the device to go idle so it stops cleanly instead.
+
+        ``reason`` distinguishes a genuine idle ("idle") from the stuck-pending
+        guard ("stuck_pending"); both go through the same device-signalling path.
         """
         if self._closing:
             return
         self._closing = True
         ws = self._transport.input()._websocket
         if ws is not None:
-            logger.info(
-                "💤 Session idle for %.0fs (no speech, response, or pending tool) "
-                "— signalling device + closing client WS",
-                self._idle_timeout,
-            )
-            await send_disconnect_then_close(ws, reason="idle")
+            if reason == "idle":
+                logger.info(
+                    "💤 Session idle for %.0fs (no speech, response, or pending tool) "
+                    "— signalling device + closing client WS",
+                    self._idle_timeout,
+                )
+            else:
+                logger.info(
+                    "🔌 Closing client WS (reason=%s) — signalling device first so it stops cleanly",
+                    reason,
+                )
+            await send_disconnect_then_close(ws, reason=reason)
