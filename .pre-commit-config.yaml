@@ -1,0 +1,19 @@
+# Local guards that run before each commit — mirror the CI "No private data" +
+# "Secret scan" jobs so leaks are caught BEFORE they ever reach the public repo.
+#
+# One-time setup:  pip install pre-commit && pre-commit install
+# Run manually:    pre-commit run --all-files
+repos:
+  - repo: local
+    hooks:
+      - id: check-private-data
+        name: check-private-data (IPs/emails/keys + biometric/data artifacts)
+        entry: bash .github/scripts/check-private-data.sh
+        language: system
+        pass_filenames: false
+        always_run: true
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks

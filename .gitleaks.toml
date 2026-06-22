@@ -1,0 +1,19 @@
+# gitleaks configuration.
+#
+# Keeps the full built-in ruleset (extend.useDefault) and documents where to put
+# confirmed false positives so the secret scan never blocks legitimate content.
+# gitleaks rejects an empty allowlist, so the template below stays commented until
+# we actually need an exception (uncomment the whole [[allowlists]] block + one
+# check). Inline alternative for a single line: append `# gitleaks:allow`.
+
+[extend]
+useDefault = true
+
+# [[allowlists]]
+# description = "Confirmed false positives (add sparingly, with a reason)"
+# paths = [
+#   '''docs/example-config\.md''',   # example tokens in documentation
+# ]
+# regexes = [
+#   '''EXAMPLE_[A-Z0-9]{16}''',      # placeholder keys used in docs/tests
+# ]
