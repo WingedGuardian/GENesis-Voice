@@ -1596,10 +1596,16 @@ select:
       - Slightly sensitive
       - Moderately sensitive
       - Very sensitive
+      - Disabled
     on_value:
-      # Sets wake word probability cutoff for hey_genesis model
-      # Values adapted from stock firmware (analogous to hey_jarvis, a 2-word wake phrase)
-      # Lower cutoff = more sensitive (more false accepts), higher cutoff = less sensitive
+      # Sets wake word probability cutoff for hey_genesis model.
+      # Values adapted from stock firmware (analogous to hey_jarvis, a 2-word wake phrase).
+      # Lower cutoff = more sensitive (more false accepts), higher cutoff = less sensitive.
+      # "Disabled" pins the cutoff to the 255 max (~1.0) so detection effectively never fires —
+      # i.e. the wake word is OFF at runtime (no flash), for clean recording/capture or privacy.
+      # It rides this select + restore_value, so it survives reboots/reconnects (unlike
+      # micro_wake_word.stop, which the API connect/disconnect automations would re-start).
+      # Set back to a sensitive level to re-enable.
       lambda: |-
         if (x == "Slightly sensitive") {
           id(hey_genesis).set_probability_cutoff(248);   // 0.97 — model default, lowest false accepts
@@ -1607,6 +1613,8 @@ select:
           id(hey_genesis).set_probability_cutoff(235);   // 0.92 — moderate sensitivity
         } else if (x == "Very sensitive") {
           id(hey_genesis).set_probability_cutoff(212);   // 0.83 — highest sensitivity
+        } else if (x == "Disabled") {
+          id(hey_genesis).set_probability_cutoff(255);   // 1.0 — wake word OFF (effectively never fires)
         }
 
 button:
