@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# Fail if private data leaks into this public repo: LAN/CGNAT IPs, the Tailscale ULA
-# prefix, personal-provider emails, or common API-key prefixes. Generic patterns only
-# (no specific values are stored here). Run in CI and locally before pushing.
+# Fail if private data leaks into this public repo:
+#   1. TEXT patterns — LAN/CGNAT IPs, the Tailscale ULA prefix, personal-provider
+#      emails, or common API-key prefixes (generic patterns only; no real values here).
+#   2. BINARY/DATA artifacts — biometric voiceprints, audio, and DB files. These match
+#      none of the text patterns, so a `git add -f` past .gitignore would slip a
+#      voiceprint or recording into this PUBLIC repo unnoticed. Block them outright.
+# Run in CI and locally (pre-commit) before pushing.
 set -uo pipefail
 
 PATTERN='192\.168\.[0-9]{1,3}\.[0-9]{1,3}'
@@ -24,4 +28,28 @@ if [ -n "$hits" ]; then
   echo "$hits"
   exit 1
 fi
+
+# --- Binary/data-artifact guard ----------------------------------------------
+# Voiceprints, audio, and DB files match NONE of the text patterns above, so the
+# scan would pass them. Block any TRACKED file of these types (catches `git add -f`
+# bypasses of .gitignore). Uses the git index, so untracked local data is ignored.
+data_globs=(
+  '*.wav' '*.flac' '*.pcm' '*.mp3' '*.m4a' '*.ogg' '*.opus'                 # audio
+  '*.db' '*.db-wal' '*.db-shm' '*.sqlite' '*.sqlite3'                       # databases
+  '*.onnx'                                                                  # models
+  '*speaker_registry*.json' 'ambient_enroll_*.json' 'ambient_health.json'   # voiceprint/runtime
+)
+# Allowlist: documented exceptions as git pathspecs. EMPTY by default — add a
+# ':(exclude)path' entry to permit ONE specific legit file (e.g. a tiny test
+# fixture) without weakening the guard for everything else. Example:
+#   data_allow=( ':(exclude)tests/fixtures/sample.wav' )
+data_allow=()
+data_hits=$(git ls-files -z -- "${data_globs[@]}" "${data_allow[@]}" 2>/dev/null | tr '\0' '\n')
+if [ -n "$data_hits" ]; then
+  echo "::error::Binary/data artifacts must never be committed to this public repo"
+  echo "::error::(voiceprints, audio, databases). Remove and add to .gitignore:"
+  echo "$data_hits"
+  exit 1
+fi
+
 echo "No private data found."
