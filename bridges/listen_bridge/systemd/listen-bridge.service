@@ -1,0 +1,21 @@
+[Unit]
+Description=Genesis Listen Bridge (Voice PE :8766 -> Speechmatics realtime -> transcript file)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+# %h = the service user's home; the deployed listen_bridge/ package sits there.
+# Its own lean venv (speechmatics-rt + websockets), separate from the ambient bench venv.
+ExecStart=%h/listen-venv/bin/python -m listen_bridge.server
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+# Speechmatics key at ~/.listen-bridge/speechmatics.key (chmod 600). Tuning overrides, e.g.:
+# Environment=LISTEN_SM_MODEL=enhanced
+# Environment=LISTEN_SM_MAX_SPEAKERS=2
+# Environment=LISTEN_SM_MAX_DELAY=1.0
+
+[Install]
+WantedBy=default.target
