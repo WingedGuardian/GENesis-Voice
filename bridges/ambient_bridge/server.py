@@ -23,7 +23,9 @@ from datetime import UTC, datetime
 
 import numpy as np
 import websockets
+from aiohttp import web
 
+from .active_session import ActiveSession
 from .config import AmbientConfig, load_config
 from .pipeline import AmbientEngine, DiarizationEngine, DiarWindow, _autodetect_embedding
 from .speaker_id import SpeakerIDRegistry
@@ -141,6 +143,9 @@ class AmbientServer:
             self._engine.enable_enroll(self._collect_enroll)
         # Track active handler tasks so shutdown awaits their flush before closing the store.
         self._handler_tasks: set[asyncio.Task] = set()
+        # ACTIVE/PASSIVE listening mode (bridge-level; one device → one connection). Set by the
+        # HTTP control endpoint. Default PASSIVE so a dropped/late mode POST fails safe to LOCAL.
+        self._mode = "passive"
 
     # --- diarization plumbing -------------------------------------------------
 
@@ -353,6 +358,7 @@ class AmbientServer:
         sock = transport.get_extra_info("socket") if transport is not None else None
         _enable_tcp_keepalive(sock, self._cfg)
         pipeline = self._engine.new_pipeline(source)
+        active: ActiveSession | None = None  # opened lazily while mode=active
         task = asyncio.current_task()
         self._handler_tasks.add(task)
         self._active += 1
@@ -361,7 +367,20 @@ class AmbientServer:
         try:
             async for message in websocket:
                 if isinstance(message, bytes):
-                    self._utterances_total += await pipeline.feed(message)
+                    # self._mode is read here + written by _handle_mode — both on THIS single
+                    # event loop, so no lock is needed. Default 'passive' fails safe to LOCAL.
+                    if self._mode == "active":
+                        # ACTIVE: relay to a cloud Speechmatics session (opened lazily).
+                        if active is None:
+                            active = ActiveSession(self._cfg, source=source)
+                            await active.start()
+                        await active.send_audio(message)
+                    else:
+                        # PASSIVE (default): local Zipformer pipeline — UNCHANGED path.
+                        if active is not None:
+                            await active.finalize()
+                            active = None
+                        self._utterances_total += await pipeline.feed(message)
                 elif isinstance(message, str):
                     self._on_control(source, message)
         except websockets.ConnectionClosed as exc:
@@ -369,8 +388,11 @@ class AmbientServer:
         except Exception:  # noqa: BLE001
             logger.exception("Handler error for %s", source)
         finally:
-            # Dirty or clean: flush any buffered partial utterance + close the final
-            # diar window (flush() submits it). Then drop our task from the tracked set.
+            # Dirty or clean: finalize any active cloud session, then flush any buffered
+            # partial utterance + close the final diar window (flush() submits it).
+            if active is not None:
+                with contextlib.suppress(Exception):
+                    await active.finalize()
             try:
                 self._utterances_total += await pipeline.flush()
             except Exception:  # noqa: BLE001
@@ -389,6 +411,21 @@ class AmbientServer:
         logger.info("[%s] control: %s", source, data)
         # Stage-1 has no playback to interrupt; we just log interrupt/disconnect.
 
+    async def _handle_mode(self, request: web.Request) -> web.Response:
+        """HTTP control: POST /mode {"mode":"active"|"passive"}. Bridge-level (one device →
+        one connection). Default stays passive so a dropped/late POST fails safe to LOCAL."""
+        try:
+            data = await request.json()
+            mode = data.get("mode")
+        except Exception:  # noqa: BLE001
+            return web.json_response({"error": "invalid json"}, status=400)
+        if mode not in ("active", "passive"):
+            return web.json_response({"error": "mode must be 'active' or 'passive'"}, status=400)
+        prev, self._mode = self._mode, mode
+        if mode != prev:
+            logger.warning("LISTENING MODE -> %s (was %s)", mode, prev)
+        return web.json_response({"mode": self._mode})
+
     # --- health + purge -------------------------------------------------------
 
     def _write_health(self) -> None:
@@ -397,6 +434,7 @@ class AmbientServer:
             payload = {
                 "ts": datetime.now(UTC).isoformat(),
                 "alive": True,
+                "mode": self._mode,
                 "active_connections": self._active,
                 "last_connection_ts": self._last_connection_ts,
                 "utterances_total": self._utterances_total,
@@ -464,6 +502,17 @@ class AmbientServer:
         for sig in (signal.SIGINT, signal.SIGTERM):
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, stop.set)
+        # HTTP control endpoint (same event loop): the device POSTs the active/passive mode
+        # here on its Active-Listening toggle. One device -> one connection -> a bridge-level flag.
+        # Trust boundary: LAN-internal + unauthenticated, like the ambient/s2s WS endpoints on this
+        # box (threat model = public exposure, NOT the LAN). Add a shared token if that changes.
+        control_app = web.Application()
+        control_app.add_routes([web.post("/mode", self._handle_mode)])
+        control_runner = web.AppRunner(control_app)
+        await control_runner.setup()
+        await web.TCPSite(control_runner, self._cfg.host, self._cfg.control_http_port).start()
+        logger.info("Listening-mode control endpoint on http://%s:%d/mode",
+                    self._cfg.host, self._cfg.control_http_port)
         try:
             # ping_interval=None: the Voice PE's minimal WS stack rejects server PING control
             # frames (-> 1002 invalid-opcode close ~every 60s, with no client-side reconnect),
@@ -477,6 +526,8 @@ class AmbientServer:
             ):
                 await stop.wait()
         finally:
+            with contextlib.suppress(Exception):
+                await control_runner.cleanup()
             # Let in-flight handlers finish their flush() (which may submit a final
             # window) before tearing down the store + background tasks.
             if self._handler_tasks:
