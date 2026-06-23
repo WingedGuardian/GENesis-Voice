@@ -92,6 +92,18 @@ class AmbientConfig:
     enroll_target_s: float = field(default_factory=lambda: float(_env("AMBIENT_ENROLL_TARGET_S", "30.0")))
     enroll_max_wait_s: float = field(default_factory=lambda: float(_env("AMBIENT_ENROLL_MAX_WAIT_S", "120.0")))
 
+    # --- ACTIVE mode (cloud Speechmatics; default is passive/local) ---
+    # Mode is set per-device via the HTTP control endpoint; passive stays the DEFAULT so a
+    # dropped/late POST fails safe to LOCAL. Active opens a Speechmatics realtime session that
+    # writes a live diarized transcript to active_output_dir (DISTINCT from ambient.db).
+    control_http_port: int = field(default_factory=lambda: int(_env("AMBIENT_CONTROL_HTTP_PORT", "8767")))
+    active_sm_key_path: str = field(default_factory=lambda: _env("AMBIENT_ACTIVE_SM_KEY_PATH", os.path.expanduser("~/.ambient-active/speechmatics.key")))
+    active_output_dir: str = field(default_factory=lambda: _env("AMBIENT_ACTIVE_OUTPUT_DIR", os.path.expanduser("~/listen-sessions")))
+    active_language: str = field(default_factory=lambda: _env("AMBIENT_ACTIVE_LANGUAGE", "en"))
+    active_model: str = field(default_factory=lambda: _env("AMBIENT_ACTIVE_MODEL", "enhanced"))
+    active_max_delay: float = field(default_factory=lambda: float(_env("AMBIENT_ACTIVE_MAX_DELAY", "1.0")))
+    active_max_speakers: int = field(default_factory=lambda: int(_env("AMBIENT_ACTIVE_MAX_SPEAKERS", "2")))
+
 
 def load_config() -> AmbientConfig:
     return AmbientConfig()

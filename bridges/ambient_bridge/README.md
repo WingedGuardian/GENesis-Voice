@@ -53,7 +53,7 @@ always re-run the feeder smoke test after deploying.
 ```bash
 # one-time: venv + deps + models (deploy/install.sh ambient does the venv + deps)
 python3 -m venv ~/ambient-venv
-~/ambient-venv/bin/pip install sherpa-onnx onnxruntime soxr soundfile websockets numpy
+~/ambient-venv/bin/pip install sherpa-onnx onnxruntime soxr soundfile websockets numpy aiohttp speechmatics-rt
 wget -P ~/models https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
 # Zipformer STT model dir expected at ~/models/sherpa-zip (encoder/decoder/joiner/tokens)
 # Diarization (Stage-1b) models in ~/models (deploy/install.sh ambient downloads these):
@@ -70,6 +70,21 @@ cd ~/genesis-voice/bridges && ~/ambient-venv/bin/python -m ambient_bridge.server
 cp deploy/systemd/ambient-bridge.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now ambient-bridge
 ```
+
+## Active mode (cloud — "Listen Mode")
+A dual-mode listening service. **Passive** (default) = the local Zipformer path above (private,
+fast). **Active** = high-accuracy CLOUD transcription (Speechmatics realtime, diarized) for e.g.
+interviews.
+
+- The device POSTs the mode to the HTTP control endpoint on its Active-Listening toggle:
+  `POST http://<edge>:8767/mode {"mode":"active"|"passive"}`. One device → one connection → a
+  bridge-level flag. **Default passive**, so a dropped/late POST fails safe to LOCAL.
+- Active opens a Speechmatics session that writes a live, diarized transcript to
+  `~/listen-sessions/<ts>.md` (DISTINCT from `ambient.db`). Every cloud-session open/close is
+  **loud-logged** — ambient audio never reaches the cloud without an explicit active POST.
+- Needs a Speechmatics key at `~/.ambient-active/speechmatics.key` (chmod 600). Active env:
+  `AMBIENT_CONTROL_HTTP_PORT` (8767) · `AMBIENT_ACTIVE_SM_KEY_PATH` · `AMBIENT_ACTIVE_OUTPUT_DIR`
+  (`~/listen-sessions`) · `AMBIENT_ACTIVE_MODEL` (enhanced) · `AMBIENT_ACTIVE_MAX_SPEAKERS` (2).
 
 ## Smoke test (canonical "did my code reach the box?")
 ```bash
