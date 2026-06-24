@@ -133,6 +133,15 @@ ota:
     id: ota_esphome
     password: !secret ota_password
 
+# HTTP control channel — the "Active Listening" switch POSTs here to tell the edge
+# ambient bridge to route THIS device's audio stream to the CLOUD (active) or the LOCAL
+# model (passive). Plain HTTP on the LAN (verify_ssl: false → no cert bundle embedded);
+# the 3 s timeout bounds any stall. http_request validated on this hardware (esp-idf).
+http_request:
+  id: http_req
+  timeout: 3s
+  verify_ssl: false
+
 i2c:
   - id: internal_i2c
     sda: GPIO5
@@ -262,6 +271,70 @@ switch:
       - lambda: 'id(voice_assistant_ws).set_ambient(true);'
     turn_off_action:
       - lambda: 'id(voice_assistant_ws).set_ambient(false);'
+  # Active Listening — explicit, SILENT, high-accuracy CLOUD transcription (interviews etc).
+  # ON: POST mode=active to the edge bridge (route THIS device's audio to the cloud), open the
+  # ambient stream, turn the wake word OFF (silent), stop any running S2S, light the LED magenta.
+  # OFF: POST mode=passive (back to local), restore the wake-word sensitivity, close the ambient
+  # stream if Ambient Mode is off, restore the LED. ALWAYS_OFF: never auto-resume cloud after a reboot.
+  - platform: template
+    id: active_listening_switch
+    name: "Active Listening"
+    icon: "mdi:cloud-search-outline"
+    entity_category: config
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    turn_on_action:
+      # Tear down any S2S session FIRST so its audio never overlaps the cloud stream. stop() no-ops
+      # when idle (safe to call unconditionally) and catches the STARTING state that is_running()
+      # would miss; then wait for the disconnect — instant if nothing was running, bounded at 2 s.
+      - voice_assistant_websocket.stop:
+          id: voice_assistant_ws
+      - wait_until:
+          condition:
+            lambda: 'return !id(voice_assistant_ws).is_connected();'
+          timeout: 2s
+      # Route to the cloud (a dropped POST fails safe to local), THEN open the stream. If Ambient
+      # Mode already has it open, this just re-routes the one existing stream.
+      - http_request.post:
+          url: !secret listen_control_url
+          request_headers:
+            Content-Type: application/json
+          json:
+            mode: "active"
+      - lambda: 'id(voice_assistant_ws).set_ambient(true);'
+      # wake word OFF (silent)
+      - lambda: 'id(hey_genesis).set_probability_cutoff(255);'
+    on_turn_on:
+      - script.execute: control_leds
+    turn_off_action:
+      # Guard: restore_mode ALWAYS_OFF fires turn_off_action ONCE at boot. Skip it during init so we
+      # don't POST before the network is up, and don't race the wake_word_sensitivity select's own
+      # boot restore of the cutoff. Real (post-boot) toggles run normally.
+      - if:
+          condition:
+            lambda: 'return !id(init_in_progress);'
+          then:
+            - http_request.post:
+                url: !secret listen_control_url
+                request_headers:
+                  Content-Type: application/json
+                json:
+                  mode: "passive"
+            # Restore the wake-word cutoff from the user's saved sensitivity selection.
+            - lambda: |-
+                auto s = id(wake_word_sensitivity).state;
+                if (s == "Moderately sensitive") { id(hey_genesis).set_probability_cutoff(235); }
+                else if (s == "Very sensitive") { id(hey_genesis).set_probability_cutoff(212); }
+                else if (s == "Disabled") { id(hey_genesis).set_probability_cutoff(255); }
+                else { id(hey_genesis).set_probability_cutoff(248); }  // Slightly sensitive / default
+            # If Ambient Mode is off, fully close the stream (Active Listening was the only reason it was open).
+            - if:
+                condition:
+                  switch.is_off: ambient_mode
+                then:
+                  - lambda: 'id(voice_assistant_ws).set_ambient(false);'
+    on_turn_off:
+      - script.execute: control_leds
   - platform: gpio
     pin: GPIO47
     id: internal_speaker_amp
@@ -301,29 +374,56 @@ binary_sensor:
               condition:
                 lambda: return !id(init_in_progress) && !id(color_changed);
               then:
+                # Active Listening ON → single-press drops a TRANSCRIPT MARKER (not the
+                # assistant). Else → the normal S2S abort/start. This stops a stray press from
+                # opening a hidden cloud assistant session mid-interview — the magenta ring
+                # out-ranks the session-phase LEDs, so such a session would be invisible.
                 - if:
                     condition:
-                      voice_assistant_websocket.is_running:
-                        id: voice_assistant_ws
+                      switch.is_on: active_listening_switch
                     then:
-                      - voice_assistant_websocket.stop:
-                          id: voice_assistant_ws
+                      # Fire-and-forget POST; a dropped one just misses the bookmark (3 s timeout
+                      # bounds any stall). The bridge ignores the body — it marks the live session.
+                      - http_request.post:
+                          url: !secret listen_marker_url
+                          request_headers:
+                            Content-Type: application/json
+                          json:
+                            event: "marker"
+                      # Silent confirm: a brief WHITE pulse, then restore the magenta ring.
+                      - light.turn_on:
+                          brightness: 100%
+                          red: 100%
+                          green: 100%
+                          blue: 100%
+                          id: voice_assistant_leds
+                          effect: "None"
+                      - delay: 150ms
+                      - script.execute: control_leds
                     else:
                       - if:
                           condition:
-                            and:
-                              - switch.is_off: master_mute_switch
-                              - not:
-                                  voice_assistant_websocket.is_running:
-                                    id: voice_assistant_ws
+                            voice_assistant_websocket.is_running:
+                              id: voice_assistant_ws
                           then:
-                            - script.execute:
-                                id: play_sound
-                                priority: true
-                                sound_file: !lambda 'return id(center_button_press_sound);'
-                            - delay: 300ms
-                            - voice_assistant_websocket.start:
+                            - voice_assistant_websocket.stop:
                                 id: voice_assistant_ws
+                          else:
+                            - if:
+                                condition:
+                                  and:
+                                    - switch.is_off: master_mute_switch
+                                    - not:
+                                        voice_assistant_websocket.is_running:
+                                          id: voice_assistant_ws
+                                then:
+                                  - script.execute:
+                                      id: play_sound
+                                      priority: true
+                                      sound_file: !lambda 'return id(center_button_press_sound);'
+                                  - delay: 300ms
+                                  - voice_assistant_websocket.start:
+                                      id: voice_assistant_ws
       # Double Click
       - timing:
           - ON for at most 1s
@@ -342,6 +442,8 @@ binary_sensor:
                 - event.trigger:
                     id: button_press_event
                     event_type: "double_press"
+                # Double-press toggles Active Listening (silent cloud transcription).
+                - switch.toggle: active_listening_switch
       # Triple Click
       - timing:
           - ON for at most 1s
@@ -374,7 +476,13 @@ binary_sensor:
                     id: play_sound
                     priority: false
                     sound_file: !lambda 'return id(center_button_long_press_sound);'
-                - light.turn_off: voice_assistant_leds
+                # Don't blank the ring during Active Listening — the magenta ring must persist to
+                # show we're still silently capturing. (A long-press otherwise clears the LEDs.)
+                - if:
+                    condition:
+                      switch.is_off: active_listening_switch
+                    then:
+                      - light.turn_off: voice_assistant_leds
                 - event.trigger:
                     id: button_press_event
                     event_type: "long_press"
@@ -967,6 +1075,10 @@ script:
             id(control_leds_jack_unplugged_recently).execute();
           } else if (id(dial_touched)) {
             id(control_leds_dial_touched).execute();
+          } else if (id(active_listening_switch).state) {
+            // Active Listening is a top-level mode (no session runs) — show magenta above the
+            // session-phase checks so a transient not_ready phase can't mask it.
+            id(control_leds_active_listening).execute();
           } else if (id(voice_assistant_phase) == ${voice_assist_waiting_for_command_phase_id}) {
             id(control_leds_voice_assistant_waiting_for_command_phase).execute();
           } else if (id(voice_assistant_phase) == ${voice_assist_listening_for_command_phase_id}) {
@@ -984,6 +1096,17 @@ script:
           } else if (id(voice_assistant_phase) == ${voice_assist_idle_phase_id}) {
             id(control_leds_voice_assistant_idle_phase).execute();
           }
+
+  # Active Listening indicator — steady magenta = silently capturing to the cloud.
+  - id: control_leds_active_listening
+    then:
+      - light.turn_on:
+          brightness: 60%
+          red: 80%
+          green: 0%
+          blue: 80%
+          id: voice_assistant_leds
+          effect: "None"
 
   # Script executed during Improv BLE
   - id: control_leds_improv_ble_state
@@ -1440,7 +1563,11 @@ micro_wake_word:
   on_wake_word_detected:
     - if:
         condition:
-          switch.is_off: master_mute_switch
+          and:
+            # Belt-and-suspenders: cutoff 255 already disables wake during Active Listening,
+            # but also hard-gate the handler so a stray detection can never start a session.
+            - switch.is_off: master_mute_switch
+            - switch.is_off: active_listening_switch
         then:
           # If voice assistant is already running or connecting, handle the
           # wake word as an interrupt (if bot is speaking) or ignore it.
