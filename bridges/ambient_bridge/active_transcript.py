@@ -48,11 +48,29 @@ def words_to_runs(results: list | None) -> list[tuple[str, float, str]]:
     return runs
 
 
+def runs_with_spans(
+    runs: list[tuple[str, float, str]], now_elapsed: float
+) -> list[tuple[str, float, float]]:
+    """Add an end_time to each run for audio-span extraction → ``[(speaker, start, end), …]``.
+    A run lasts until the NEXT run starts (Speechmatics gives no per-word end_time); the last
+    run extends to ``now_elapsed``. Marker sentinels are skipped (no audio). Pure."""
+    real = [(spk, start) for spk, start, _ in runs if spk != _MARKER]
+    out: list[tuple[str, float, float]] = []
+    for i, (spk, start) in enumerate(real):
+        end = real[i + 1][1] if i + 1 < len(real) else now_elapsed
+        if end > start:
+            out.append((spk, start, end))
+    return out
+
+
 @dataclass
 class TranscriptAccumulator:
     title: str = "Active listen session"
     committed: list[tuple[str, float, str]] = field(default_factory=list)  # (speaker, start, text)
     partial: str = ""  # provisional trailing text, superseded by the next final
+    # Speaker-ID display map: S-label -> resolved display name. Empty unless active speaker-ID is on
+    # AND a speaker matched an enrolled voiceprint, so when off this is {} → raw S# (unchanged).
+    labels: dict[str, str] = field(default_factory=dict)
 
     def add_final(self, msg: dict) -> None:
         self.partial = ""  # a final supersedes any in-flight partial
@@ -82,7 +100,8 @@ class TranscriptAccumulator:
             if speaker == _MARKER:
                 lines.append(f"[{_fmt_ts(start)}] --- marker ---")
             else:
-                lines.append(f"[{_fmt_ts(start)}] **{speaker}**: {text.strip()}")
+                display = self.labels.get(speaker, speaker)  # resolved name, else raw S#
+                lines.append(f"[{_fmt_ts(start)}] **{display}**: {text.strip()}")
         if self.partial:
             lines.append(f"_… {self.partial}_")
         return "\n".join(lines) + "\n"

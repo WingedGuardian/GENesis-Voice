@@ -1,5 +1,11 @@
 """Unit tests for the active-mode transcript accumulator (no SDK / no network)."""
-from ambient_bridge.active_transcript import TranscriptAccumulator, _fmt_ts, words_to_runs
+from ambient_bridge.active_transcript import (
+    _MARKER,
+    TranscriptAccumulator,
+    _fmt_ts,
+    runs_with_spans,
+    words_to_runs,
+)
 
 
 def _final(words):
@@ -92,3 +98,31 @@ def test_marker_does_not_clear_partial():
     # the in-flight provisional text still renders, AFTER the marker divider (speech continues)
     assert "_… mid sentence_" in out
     assert out.index("--- marker ---") < out.index("mid sentence")
+
+
+def test_runs_with_spans_infers_end_from_next_run():
+    runs = [("S1", 1.0, "a"), ("S2", 4.0, "b"), ("S1", 9.0, "c")]
+    assert runs_with_spans(runs, now_elapsed=12.0) == [
+        ("S1", 1.0, 4.0), ("S2", 4.0, 9.0), ("S1", 9.0, 12.0)]
+
+
+def test_runs_with_spans_skips_markers():
+    runs = [("S1", 1.0, "a"), (_MARKER, 3.0, ""), ("S1", 5.0, "b")]
+    # marker has no audio → skipped; S1's first run ends at the next REAL run's start
+    assert runs_with_spans(runs, now_elapsed=10.0) == [("S1", 1.0, 5.0), ("S1", 5.0, 10.0)]
+
+
+def test_render_uses_labels_for_resolved_only():
+    acc = TranscriptAccumulator(title="T", labels={"S1": "You"})
+    acc.add_final(_final([("hi", "S1", "word", 1.0)]))
+    acc.add_final(_final([("yo", "S2", "word", 3.0)]))
+    out = acc.render()
+    assert "**You**: hi" in out   # S1 resolved → display name
+    assert "**S2**: yo" in out    # S2 unresolved → raw label (byte-identical to off)
+
+
+def test_render_empty_labels_is_unchanged():
+    # default labels={} → identical to pre-feature rendering (graceful no-op)
+    acc = TranscriptAccumulator(title="T")
+    acc.add_final(_final([("hi", "S1", "word", 1.0)]))
+    assert "**S1**: hi" in acc.render()
