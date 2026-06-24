@@ -374,29 +374,56 @@ binary_sensor:
               condition:
                 lambda: return !id(init_in_progress) && !id(color_changed);
               then:
+                # Active Listening ON → single-press drops a TRANSCRIPT MARKER (not the
+                # assistant). Else → the normal S2S abort/start. This stops a stray press from
+                # opening a hidden cloud assistant session mid-interview — the magenta ring
+                # out-ranks the session-phase LEDs, so such a session would be invisible.
                 - if:
                     condition:
-                      voice_assistant_websocket.is_running:
-                        id: voice_assistant_ws
+                      switch.is_on: active_listening_switch
                     then:
-                      - voice_assistant_websocket.stop:
-                          id: voice_assistant_ws
+                      # Fire-and-forget POST; a dropped one just misses the bookmark (3 s timeout
+                      # bounds any stall). The bridge ignores the body — it marks the live session.
+                      - http_request.post:
+                          url: !secret listen_marker_url
+                          request_headers:
+                            Content-Type: application/json
+                          json:
+                            event: "marker"
+                      # Silent confirm: a brief WHITE pulse, then restore the magenta ring.
+                      - light.turn_on:
+                          brightness: 100%
+                          red: 100%
+                          green: 100%
+                          blue: 100%
+                          id: voice_assistant_leds
+                          effect: "None"
+                      - delay: 150ms
+                      - script.execute: control_leds
                     else:
                       - if:
                           condition:
-                            and:
-                              - switch.is_off: master_mute_switch
-                              - not:
-                                  voice_assistant_websocket.is_running:
-                                    id: voice_assistant_ws
+                            voice_assistant_websocket.is_running:
+                              id: voice_assistant_ws
                           then:
-                            - script.execute:
-                                id: play_sound
-                                priority: true
-                                sound_file: !lambda 'return id(center_button_press_sound);'
-                            - delay: 300ms
-                            - voice_assistant_websocket.start:
+                            - voice_assistant_websocket.stop:
                                 id: voice_assistant_ws
+                          else:
+                            - if:
+                                condition:
+                                  and:
+                                    - switch.is_off: master_mute_switch
+                                    - not:
+                                        voice_assistant_websocket.is_running:
+                                          id: voice_assistant_ws
+                                then:
+                                  - script.execute:
+                                      id: play_sound
+                                      priority: true
+                                      sound_file: !lambda 'return id(center_button_press_sound);'
+                                  - delay: 300ms
+                                  - voice_assistant_websocket.start:
+                                      id: voice_assistant_ws
       # Double Click
       - timing:
           - ON for at most 1s
@@ -449,7 +476,13 @@ binary_sensor:
                     id: play_sound
                     priority: false
                     sound_file: !lambda 'return id(center_button_long_press_sound);'
-                - light.turn_off: voice_assistant_leds
+                # Don't blank the ring during Active Listening — the magenta ring must persist to
+                # show we're still silently capturing. (A long-press otherwise clears the LEDs.)
+                - if:
+                    condition:
+                      switch.is_off: active_listening_switch
+                    then:
+                      - light.turn_off: voice_assistant_leds
                 - event.trigger:
                     id: button_press_event
                     event_type: "long_press"
