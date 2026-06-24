@@ -14,6 +14,31 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() not in ("0", "false", "no", "")
+
+
+def _env_int_or_none(name: str, default: int | None) -> int | None:
+    """Int env, or None for 'auto'/unbounded. Sentinels '', '0', 'auto', 'none' → None."""
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    v = v.strip().lower()
+    return None if v in ("", "0", "auto", "none") else int(v)
+
+
+def _env_float_or_none(name: str, default: float | None) -> float | None:
+    """Float env, or None to defer to the downstream default. '', 'auto', 'none' → None."""
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    v = v.strip().lower()
+    return None if v in ("", "auto", "none") else float(v)
+
+
 @dataclass(frozen=True)
 class AmbientConfig:
     # --- WebSocket ingest ---
@@ -102,7 +127,15 @@ class AmbientConfig:
     active_language: str = field(default_factory=lambda: _env("AMBIENT_ACTIVE_LANGUAGE", "en"))
     active_model: str = field(default_factory=lambda: _env("AMBIENT_ACTIVE_MODEL", "enhanced"))
     active_max_delay: float = field(default_factory=lambda: float(_env("AMBIENT_ACTIVE_MAX_DELAY", "1.0")))
-    active_max_speakers: int = field(default_factory=lambda: int(_env("AMBIENT_ACTIVE_MAX_SPEAKERS", "2")))
+    # Speaker diarization tuning (Speechmatics). max_speakers defaults to None = AUTO-DETECT, so
+    # 3+ real speakers aren't capped into 2 labels (the old default of 2 was a hard ceiling).
+    # prefer_current_speaker=True suppresses spurious speaker flips — the main over-split cause —
+    # WITHOUT hurting genuine multi-speaker separation. speaker_sensitivity defers to the SDK
+    # default (None); raise it to split more eagerly, lower it to merge. All env-tunable: set
+    # AMBIENT_ACTIVE_MAX_SPEAKERS to a positive int to re-impose a cap (''/0/auto → auto-detect).
+    active_max_speakers: int | None = field(default_factory=lambda: _env_int_or_none("AMBIENT_ACTIVE_MAX_SPEAKERS", None))
+    active_prefer_current_speaker: bool = field(default_factory=lambda: _env_bool("AMBIENT_ACTIVE_PREFER_CURRENT_SPEAKER", True))
+    active_speaker_sensitivity: float | None = field(default_factory=lambda: _env_float_or_none("AMBIENT_ACTIVE_SPEAKER_SENSITIVITY", None))
 
 
 def load_config() -> AmbientConfig:

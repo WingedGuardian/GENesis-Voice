@@ -30,6 +30,20 @@ from .active_transcript import TranscriptAccumulator
 logger = logging.getLogger("ambient.active")
 
 
+def _diar_kwargs(cfg) -> dict:
+    """Build SpeakerDiarizationConfig kwargs from config, OMITTING unset (None) fields so the
+    SDK applies its own defaults. max_speakers None → auto-detect (no cap). Pure (no SDK types)
+    so it unit-tests without the speechmatics SDK installed."""
+    kw: dict = {}
+    if cfg.active_max_speakers is not None:
+        kw["max_speakers"] = cfg.active_max_speakers
+    if cfg.active_prefer_current_speaker is not None:
+        kw["prefer_current_speaker"] = cfg.active_prefer_current_speaker
+    if cfg.active_speaker_sensitivity is not None:
+        kw["speaker_sensitivity"] = cfg.active_speaker_sensitivity
+    return kw
+
+
 class ActiveSession:
     """One cloud transcription session, tied to one device WS connection."""
 
@@ -79,13 +93,16 @@ class ActiveSession:
         client.on(ServerMessageType.WARNING, lambda m: logger.warning("Speechmatics WARNING: %s", str(m)[:200]))
         self._flush()  # header now, so the file exists for tailing immediately
         audio_format = AudioFormat(encoding=AudioEncoding.PCM_S16LE, sample_rate=16000, chunk_size=4096)
+        diar_kwargs = _diar_kwargs(self._cfg)
+        logger.info("active diarization config: max_speakers=%s (auto if absent), %s",
+                    diar_kwargs.get("max_speakers", "AUTO"), diar_kwargs)
         config = TranscriptionConfig(
             language=self._cfg.active_language,
             model=self._cfg.active_model,
             max_delay=self._cfg.active_max_delay,
             enable_partials=True,
             diarization="speaker",
-            speaker_diarization_config=SpeakerDiarizationConfig(max_speakers=self._cfg.active_max_speakers),
+            speaker_diarization_config=SpeakerDiarizationConfig(**diar_kwargs),
         )
         await client.start_session(transcription_config=config, audio_format=audio_format)
         self._client = client

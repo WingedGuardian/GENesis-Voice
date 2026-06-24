@@ -3,7 +3,7 @@ touching AsyncClient on key-missing, and finalize() with no client never uses it
 import asyncio
 import types
 
-from ambient_bridge.active_session import ActiveSession
+from ambient_bridge.active_session import ActiveSession, _diar_kwargs
 
 
 def _cfg(outdir):
@@ -14,6 +14,8 @@ def _cfg(outdir):
         active_model="enhanced",
         active_max_delay=1.0,
         active_max_speakers=2,
+        active_prefer_current_speaker=True,
+        active_speaker_sensitivity=None,
     )
 
 
@@ -49,3 +51,26 @@ def test_add_marker_elapsed_measured_from_t0(tmp_path):
     s._t0 = time.monotonic() - 5.0  # simulate a session that opened ~5s ago
     s.add_marker()
     assert "[00:00:05] --- marker ---" in next(tmp_path.glob("*.md")).read_text()
+
+
+def _diarcfg(max_speakers=None, prefer=True, sensitivity=None):
+    return types.SimpleNamespace(
+        active_max_speakers=max_speakers,
+        active_prefer_current_speaker=prefer,
+        active_speaker_sensitivity=sensitivity,
+    )
+
+
+def test_diar_kwargs_auto_detect_default():
+    # auto-detect: NO max_speakers key (SDK auto-detects); prefer_current_speaker on; no sensitivity
+    assert _diar_kwargs(_diarcfg()) == {"prefer_current_speaker": True}
+
+
+def test_diar_kwargs_with_cap_and_sensitivity():
+    kw = _diar_kwargs(_diarcfg(max_speakers=5, prefer=True, sensitivity=0.4))
+    assert kw == {"max_speakers": 5, "prefer_current_speaker": True, "speaker_sensitivity": 0.4}
+
+
+def test_diar_kwargs_prefer_false_is_included():
+    # False is a deliberate choice (not None) → still passed to the SDK
+    assert _diar_kwargs(_diarcfg(prefer=False)) == {"prefer_current_speaker": False}
