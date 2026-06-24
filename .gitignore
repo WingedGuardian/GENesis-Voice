@@ -35,3 +35,6 @@ venv/
 # OS / editor
 .DS_Store
 *.swp
+
+# ESPHome build artifacts / cache (per-config .esphome dir — large, machine-specific)
+.esphome/
