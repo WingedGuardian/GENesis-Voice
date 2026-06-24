@@ -50,3 +50,22 @@ def test_active_diar_defaults_auto_detect(monkeypatch):
 def test_active_max_speakers_env_cap(monkeypatch):
     monkeypatch.setenv("AMBIENT_ACTIVE_MAX_SPEAKERS", "5")
     assert AmbientConfig().active_max_speakers == 5
+
+
+def test_active_speaker_id_defaults(monkeypatch):
+    for k in ("AMBIENT_ACTIVE_SPEAKER_ID_ENABLED", "AMBIENT_ACTIVE_USER_DISPLAY",
+              "AMBIENT_ACTIVE_MIN_SPEAKER_S", "AMBIENT_ACTIVE_RECHECK_S",
+              "AMBIENT_ACTIVE_USER_VERIFY_THRESHOLD", "AMBIENT_ACTIVE_SPEAKER_RING_S"):
+        monkeypatch.delenv(k, raising=False)
+    c = AmbientConfig()
+    assert c.active_speaker_id_enabled is True
+    assert c.active_user_display_name == "You"
+    assert c.active_min_speaker_s == 6.0
+    assert c.active_recheck_s == 10.0
+    assert c.active_user_verify_threshold == 0.35
+    assert c.active_speaker_ring_s == 120.0
+
+
+def test_active_user_display_env_override(monkeypatch):
+    monkeypatch.setenv("AMBIENT_ACTIVE_USER_DISPLAY", "Jay")
+    assert AmbientConfig().active_user_display_name == "Jay"

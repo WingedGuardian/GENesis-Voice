@@ -377,7 +377,9 @@ class AmbientServer:
                     if self._mode == "active":
                         # ACTIVE: relay to a cloud Speechmatics session (opened lazily).
                         if active is None:
-                            active = ActiveSession(self._cfg, source=source)
+                            # Pass the shared eres2net registry so active mode can relabel S1/S2 →
+                            # enrolled names (None when speaker-ID is off/unenrolled → positional).
+                            active = ActiveSession(self._cfg, source=source, speaker_id=self._speaker_id)
                             await active.start()
                             self._active_session = active  # expose to /marker
                         await active.send_audio(message)

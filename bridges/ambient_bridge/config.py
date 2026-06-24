@@ -137,6 +137,25 @@ class AmbientConfig:
     active_prefer_current_speaker: bool = field(default_factory=lambda: _env_bool("AMBIENT_ACTIVE_PREFER_CURRENT_SPEAKER", True))
     active_speaker_sensitivity: float | None = field(default_factory=lambda: _env_float_or_none("AMBIENT_ACTIVE_SPEAKER_SENSITIVITY", None))
 
+    # --- ACTIVE-mode speaker IDENTITY (relabel Speechmatics S1/S2/S3 → enrolled names) ---
+    # Reuses the eres2net SpeakerIDRegistry (passive path). V1 identifies the USER (others stay
+    # positional until enrolled). Off, or no user voiceprint → positional labels, byte-identical
+    # to before (zero ring memory). NOT permanent-sticky: a labelled speaker is RE-VERIFIED every
+    # recheck_s and REVERTED to positional if its recent audio stops matching — so if Speechmatics
+    # REUSES a label for a new person, a wrong name shows for at most recheck_s, never permanently.
+    active_speaker_id_enabled: bool = field(default_factory=lambda: _env_bool("AMBIENT_ACTIVE_SPEAKER_ID_ENABLED", True))
+    active_speaker_ring_s: float = field(default_factory=lambda: float(_env("AMBIENT_ACTIVE_SPEAKER_RING_S", "120")))
+    active_min_speaker_s: float = field(default_factory=lambda: float(_env("AMBIENT_ACTIVE_MIN_SPEAKER_S", "6.0")))
+    # Separate knob from the passive 0.35 (active is the same far-field mic but a distinct path).
+    active_user_verify_threshold: float = field(default_factory=lambda: float(_env("AMBIENT_ACTIVE_USER_VERIFY_THRESHOLD", "0.35")))
+    active_resolve_interval_s: float = field(default_factory=lambda: float(_env("AMBIENT_ACTIVE_RESOLVE_INTERVAL_S", "5.0")))
+    active_recheck_s: float = field(default_factory=lambda: float(_env("AMBIENT_ACTIVE_RECHECK_S", "10.0")))
+    # Cap the audio embedded per speaker per check (most-recent seconds) to bound embed cost.
+    active_embed_window_s: float = field(default_factory=lambda: float(_env("AMBIENT_ACTIVE_EMBED_WINDOW_S", "8.0")))
+    # The user's voiceprint is enrolled under `user_speaker_name` ("user"); show it as this in the
+    # transcript. Other enrolled speakers display under their own registry name.
+    active_user_display_name: str = field(default_factory=lambda: _env("AMBIENT_ACTIVE_USER_DISPLAY", "You"))
+
 
 def load_config() -> AmbientConfig:
     return AmbientConfig()
