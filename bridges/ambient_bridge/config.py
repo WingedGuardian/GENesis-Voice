@@ -76,6 +76,12 @@ class AmbientConfig:
     # --- health / observability ---
     health_path: str = field(default_factory=lambda: _env("AMBIENT_HEALTH", os.path.expanduser("~/ambient_health.json")))
     health_interval_s: int = field(default_factory=lambda: int(_env("AMBIENT_HEALTH_INTERVAL_S", "60")))
+    # --- connection telemetry (records device connect/disconnect to quantify the ambient WS wedge) ---
+    conn_events_path: str = field(default_factory=lambda: _env("AMBIENT_CONN_EVENTS", os.path.expanduser("~/ambient_connection_events.jsonl")))
+    conn_stats_path: str = field(default_factory=lambda: _env("AMBIENT_CONN_STATS", os.path.expanduser("~/ambient_connection_stats.json")))
+    conn_dark_threshold_s: float = field(default_factory=lambda: float(_env("AMBIENT_CONN_DARK_THRESHOLD_S", "120")))
+    # Cap the detailed JSONL event log (cumulative aggregates in conn_stats_path persist forever).
+    conn_events_max: int = field(default_factory=lambda: int(_env("AMBIENT_CONN_EVENTS_MAX", "5000")))
 
     # --- diarization (Stage-1b, additive) ---
     # Speaker diarization runs DEFERRED on closed windows; if models are missing or

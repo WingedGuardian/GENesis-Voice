@@ -27,6 +27,7 @@ from aiohttp import web
 
 from .active_session import ActiveSession
 from .config import AmbientConfig, load_config
+from .connection_stats import ConnectionStats
 from .pipeline import AmbientEngine, DiarizationEngine, DiarWindow, _autodetect_embedding
 from .speaker_id import SpeakerIDRegistry
 from .store import AmbientStore
@@ -95,6 +96,11 @@ class AmbientServer:
         self._active = 0
         self._utterances_total = 0
         self._last_connection_ts: str | None = None  # last client connect (for the health monitor)
+        # Connection telemetry — records device connect/disconnect + dark gaps (the wedge signal),
+        # persists across bridge restarts, surfaces in ambient_health.json.
+        self._conn_stats = ConnectionStats(
+            events_path=cfg.conn_events_path, stats_path=cfg.conn_stats_path,
+            dark_threshold_s=cfg.conn_dark_threshold_s, events_max=cfg.conn_events_max)
         # --- diarization (deferred, additive; capture works fine without it) ---
         self._diar: DiarizationEngine | None = None
         self._diar_queue: asyncio.Queue[DiarWindow] | None = None
@@ -368,6 +374,8 @@ class AmbientServer:
         self._handler_tasks.add(task)
         self._active += 1
         self._last_connection_ts = datetime.now(UTC).isoformat()
+        if self._active == 1:  # device came online (0→1); ignores zombie-overlap re-counts
+            self._conn_stats.on_connect()
         logger.info("Client connected: %s (active=%d)", source, self._active)
         try:
             async for message in websocket:
@@ -411,6 +419,8 @@ class AmbientServer:
                 logger.warning("flush failed for %s", source, exc_info=True)
             self._handler_tasks.discard(task)
             self._active -= 1
+            if self._active == 0:  # device fully gone (1→0); starts a dark-period timer
+                self._conn_stats.on_disconnect()
             logger.info("Client gone: %s (active=%d, utterances=%d)",
                         source, self._active, pipeline.utterances)
 
@@ -454,6 +464,7 @@ class AmbientServer:
 
     def _write_health(self) -> None:
         try:
+            self._conn_stats.tick()  # count an ongoing dark period once it crosses the threshold
             stats = self._store.stats()
             payload = {
                 "ts": datetime.now(UTC).isoformat(),
@@ -468,6 +479,7 @@ class AmbientServer:
                 "diar_windows_dropped": self._diar_dropped,
                 "speaker_id_enabled": self._speaker_id is not None,
                 "enrolling": self._enroll.name if self._enroll else None,
+                **self._conn_stats.snapshot(),
                 **stats,
             }
             tmp = self._cfg.health_path + ".tmp"
