@@ -44,6 +44,9 @@ class ActiveSession:
         self._client: AsyncClient | None = None
         self._last_partial = 0.0
         self._finalized = False
+        # Set once audio streaming begins (end of start()) — the session's t=0, against which a
+        # user marker's elapsed time is measured so its [ts] aligns with the Speechmatics ones.
+        self._t0: float | None = None
 
     @property
     def path(self) -> str:
@@ -86,10 +89,22 @@ class ActiveSession:
         )
         await client.start_session(transcription_config=config, audio_format=audio_format)
         self._client = client
+        self._t0 = time.monotonic()  # audio is about to flow → session clock starts here
 
     async def send_audio(self, frame: bytes) -> None:
         if self._client is not None:
             await self._client.send_audio(frame)
+
+    def add_marker(self) -> None:
+        """Drop a user bookmark into the live transcript at the current session time.
+        Called from the /marker HTTP handler (single-press) — same event loop as the audio
+        relay + Speechmatics callbacks, so no lock is needed. Elapsed is measured from _t0
+        (audio start); falls back to 0.0 if the session never opened (e.g. missing key)."""
+        elapsed = (time.monotonic() - self._t0) if self._t0 is not None else 0.0
+        self._acc.add_marker(elapsed)
+        self._flush()
+        logger.info("transcript MARKER dropped for %s at %.1fs (%s)",
+                    self._source, elapsed, self._path)
 
     async def finalize(self) -> None:
         if self._finalized:  # idempotent: one CLOSED log per session (clean audit trail)

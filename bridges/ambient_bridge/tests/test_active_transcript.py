@@ -68,3 +68,27 @@ def test_consecutive_same_speaker_finals_merge_into_one_turn():
     acc.add_final(_final([("two", "S1", "word", 2.0)]))
     assert acc.render().count("**S1**") == 1
     assert "one two" in acc.render()
+
+
+def test_marker_renders_divider_and_breaks_speaker_merge():
+    acc = TranscriptAccumulator(title="T")
+    acc.add_final(_final([("before", "S1", "word", 10.0)]))
+    acc.add_marker(12.0)
+    acc.add_final(_final([("after", "S1", "word", 14.0)]))
+    out = acc.render()
+    assert "[00:00:12] --- marker ---" in out
+    # the marker breaks the same-speaker merge chain → 'after' is its own S1 line
+    assert out.count("**S1**") == 2
+    assert "before after" not in out
+    # ordering: speech before → marker → speech after
+    assert out.index("before") < out.index("--- marker ---") < out.index("after")
+
+
+def test_marker_does_not_clear_partial():
+    acc = TranscriptAccumulator()
+    acc.set_partial({"metadata": {"transcript": "mid sentence"}})
+    acc.add_marker(3.0)
+    out = acc.render()
+    # the in-flight provisional text still renders, AFTER the marker divider (speech continues)
+    assert "_… mid sentence_" in out
+    assert out.index("--- marker ---") < out.index("mid sentence")

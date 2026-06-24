@@ -32,3 +32,20 @@ def test_finalize_is_idempotent(tmp_path):
     asyncio.run(s.finalize())  # no client → flush + CLOSED log
     asyncio.run(s.finalize())  # second call is a no-op (guarded) — no error, no double log
     assert len(list(tmp_path.glob("*.md"))) == 1
+
+
+def test_add_marker_no_session_writes_divider_at_zero(tmp_path):
+    # No start() → _t0 is None → marker lands at 00:00:00, file flushed immediately.
+    s = ActiveSession(_cfg(str(tmp_path)), source="test")
+    s.add_marker()
+    files = list(tmp_path.glob("*.md"))
+    assert len(files) == 1
+    assert "[00:00:00] --- marker ---" in files[0].read_text()
+
+
+def test_add_marker_elapsed_measured_from_t0(tmp_path):
+    import time
+    s = ActiveSession(_cfg(str(tmp_path)), source="test")
+    s._t0 = time.monotonic() - 5.0  # simulate a session that opened ~5s ago
+    s.add_marker()
+    assert "[00:00:05] --- marker ---" in next(tmp_path.glob("*.md")).read_text()

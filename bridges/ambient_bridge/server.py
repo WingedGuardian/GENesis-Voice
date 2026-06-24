@@ -146,6 +146,11 @@ class AmbientServer:
         # ACTIVE/PASSIVE listening mode (bridge-level; one device → one connection). Set by the
         # HTTP control endpoint. Default PASSIVE so a dropped/late mode POST fails safe to LOCAL.
         self._mode = "passive"
+        # Bridge-level pointer to the live ActiveSession (if any), so the /marker HTTP handler can
+        # reach it from outside the per-connection _handler scope. Mirrors the _handler's local
+        # `active` at the 3 points it changes (open / passive-flip / disconnect). One device → one
+        # connection, so a single ref suffices; None when no cloud session is open.
+        self._active_session: ActiveSession | None = None
 
     # --- diarization plumbing -------------------------------------------------
 
@@ -374,11 +379,14 @@ class AmbientServer:
                         if active is None:
                             active = ActiveSession(self._cfg, source=source)
                             await active.start()
+                            self._active_session = active  # expose to /marker
                         await active.send_audio(message)
                     else:
                         # PASSIVE (default): local Zipformer pipeline — UNCHANGED path.
                         if active is not None:
                             await active.finalize()
+                            if self._active_session is active:
+                                self._active_session = None
                             active = None
                         self._utterances_total += await pipeline.feed(message)
                 elif isinstance(message, str):
@@ -393,6 +401,8 @@ class AmbientServer:
             if active is not None:
                 with contextlib.suppress(Exception):
                     await active.finalize()
+                if self._active_session is active:
+                    self._active_session = None
             try:
                 self._utterances_total += await pipeline.flush()
             except Exception:  # noqa: BLE001
@@ -425,6 +435,18 @@ class AmbientServer:
         if mode != prev:
             logger.warning("LISTENING MODE -> %s (was %s)", mode, prev)
         return web.json_response({"mode": self._mode})
+
+    async def _handle_marker(self, request: web.Request) -> web.Response:
+        """HTTP control: POST /marker — drop a timestamped bookmark into the live ACTIVE
+        transcript (the device's single-press while Active Listening is on). Graceful no-op
+        (200, marked=false) when no cloud session is open, so a stray press in passive mode —
+        or a race against session open/close — is harmless. Same event loop as the audio relay
+        + Speechmatics callbacks, so reading/mutating the session needs no lock."""
+        session = self._active_session
+        if session is None:
+            return web.json_response({"marked": False})
+        session.add_marker()
+        return web.json_response({"marked": True})
 
     # --- health + purge -------------------------------------------------------
 
@@ -507,7 +529,10 @@ class AmbientServer:
         # Trust boundary: LAN-internal + unauthenticated, like the ambient/s2s WS endpoints on this
         # box (threat model = public exposure, NOT the LAN). Add a shared token if that changes.
         control_app = web.Application()
-        control_app.add_routes([web.post("/mode", self._handle_mode)])
+        control_app.add_routes([
+            web.post("/mode", self._handle_mode),
+            web.post("/marker", self._handle_marker),
+        ])
         control_runner = web.AppRunner(control_app)
         await control_runner.setup()
         await web.TCPSite(control_runner, self._cfg.host, self._cfg.control_http_port).start()
