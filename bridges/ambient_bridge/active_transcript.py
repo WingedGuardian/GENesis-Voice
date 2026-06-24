@@ -9,6 +9,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+# Sentinel "speaker" for a user-dropped transcript marker (a single-press bookmark).
+# Distinct from any Speechmatics label (S1/S2/?) or the SYSTEM error line, so it never
+# collides with — or merges into — a real speaker run.
+_MARKER = "__MARKER__"
+
 
 def _fmt_ts(seconds: float) -> str:
     s = max(0, int(seconds))
@@ -62,10 +67,22 @@ class TranscriptAccumulator:
         md = msg.get("metadata") or {}
         self.partial = (md.get("transcript") or "").strip()
 
+    def add_marker(self, elapsed_s: float) -> None:
+        """Drop a timestamped user bookmark at ``elapsed_s`` (seconds into the session).
+        Appended to the committed stream as a sentinel run → rendered as a divider line.
+        Does NOT clear ``partial``: the in-flight provisional text is current speech that
+        renders just AFTER the marker. The sentinel also breaks the speaker-merge chain in
+        ``add_final`` (no real speaker equals it), so speech after the marker starts fresh —
+        exactly the intent of bookmarking a point mid-utterance."""
+        self.committed.append((_MARKER, float(elapsed_s), ""))
+
     def render(self) -> str:
         lines = [f"# {self.title}", ""]
         for speaker, start, text in self.committed:
-            lines.append(f"[{_fmt_ts(start)}] **{speaker}**: {text.strip()}")
+            if speaker == _MARKER:
+                lines.append(f"[{_fmt_ts(start)}] --- marker ---")
+            else:
+                lines.append(f"[{_fmt_ts(start)}] **{speaker}**: {text.strip()}")
         if self.partial:
             lines.append(f"_… {self.partial}_")
         return "\n".join(lines) + "\n"
