@@ -9,6 +9,15 @@ is **silent** in Stage 1: it captures, transcribes, and stores to its own isolat
 `WS (raw 16-bit PCM, 24 kHz) -> soxr 24->16k -> sherpa Silero VAD -> Zipformer STT -> ambient.db`
 (+ rolling TTL/row-ceiling purge, + a health heartbeat file).
 
+**STT-quality instrumentation (shadow).** Each row's `meta` also carries a per-utterance quality
+fingerprint, logged-only (it never gates capture): `asr_feats` = raw per-token `ys_log_probs`
+(decode confidence; closer to 0 = more confident) + `n_tokens` (+ `lang`/`emotion`/`event` when
+populated); `audio` = `rms`/`peak`/`zcr` of the VAD segment; `shadow_ver` tags the schema
+generation. These exist to characterize and later reduce ASR hallucination from background
+TV/music/noise (~60% of the raw stream) — the prerequisite for the filter/attention tiers below.
+Both extractors are guarded so they can never break capture. (`ys_log_probs` is stored RAW so the
+offline analysis can pick the discriminating statistic rather than pre-committing to one.)
+
 **Speaker diarization (Stage-1b)** runs DEFERRED, off the ingest path: utterances are
 batched into continuous windows; each closed window is diarized by a bounded async worker
 (sherpa pyannote-segmentation + 3dspeaker embedding + clustering), and each utterance gets
