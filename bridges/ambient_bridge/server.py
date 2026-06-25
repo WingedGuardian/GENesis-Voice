@@ -18,6 +18,7 @@ import os
 import signal
 import socket
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -96,6 +97,7 @@ class AmbientServer:
         self._active = 0
         self._utterances_total = 0
         self._last_connection_ts: str | None = None  # last client connect (for the health monitor)
+        self._max_loop_lag_s = 0.0  # diagnostic: peak event-loop scheduling lag (AMBIENT_INSTRUMENT)
         # Connection telemetry — records device connect/disconnect + dark gaps (the wedge signal),
         # persists across bridge restarts, surfaces in ambient_health.json.
         self._conn_stats = ConnectionStats(
@@ -342,14 +344,30 @@ class AmbientServer:
     async def _diar_worker(self) -> None:
         # Liveness flag is set at task-creation in run() (so the startup health snapshot reads
         # accurately); the finally-block below clears it on exit.
+        loop = asyncio.get_running_loop()
         try:
             while True:
                 window = await self._diar_queue.get()
                 try:
+                    t0 = loop.time()
                     segs = await asyncio.to_thread(self._diar.process, window.raw)
+                    t1 = loop.time()
                     await asyncio.to_thread(self._assign_labels, window, segs)
+                    t2 = loop.time()
                     if self._speaker_id is not None:
                         await asyncio.to_thread(self._verify_speaker_identities, window, segs)
+                    t3 = loop.time()
+                    if self._cfg.instrument:
+                        # Per-phase wall-time (loop's view). Correlate with the loop-lag monitor:
+                        # a phase whose duration matches a coincident loop-lag spike is holding the
+                        # GIL in its worker thread → starving the WS auto-PONG.
+                        n_spk = len({spk for _, _, spk in segs}) if segs else 0
+                        logger.warning(
+                            "INSTRUMENT diar w%d phases: process=%.2fs assign=%.2fs verify=%.2fs "
+                            "(%d spk, %d utts, %.1fs audio)",
+                            window.window_idx, t1 - t0, t2 - t1, t3 - t2,
+                            n_spk, len(window.spans),
+                            len(window.raw) / self._cfg.model_sample_rate)
                 except Exception:
                     logger.error("diar failed for window w%d (%d utts) — labels stay NULL",
                                  window.window_idx, len(window.spans), exc_info=True)
@@ -357,6 +375,23 @@ class AmbientServer:
                     self._diar_queue.task_done()
         finally:
             self._diar_worker_alive = False
+
+    async def _loop_lag_monitor(self) -> None:
+        """Diagnostic (AMBIENT_INSTRUMENT): sample event-loop scheduling lag every 100ms. A spike
+        means a coroutine or a worker-thread C call (holding the GIL) monopolised the loop — which
+        delays the websockets auto-PONG and trips the device's 10s pong-timeout. Each spike >
+        instrument_lag_warn_s is logged with a wall-clock stamp so it can be correlated against the
+        diar-worker phase logs and the 1006 closes. Started only when instrument is on."""
+        loop = asyncio.get_running_loop()
+        interval = 0.1
+        while True:
+            t0 = loop.time()
+            await asyncio.sleep(interval)
+            lag = loop.time() - t0 - interval
+            if lag > self._max_loop_lag_s:
+                self._max_loop_lag_s = lag
+            if lag > self._cfg.instrument_lag_warn_s:
+                logger.warning("INSTRUMENT loop-lag %.2fs (loop stalled — WS PONG delayed)", lag)
 
     # --- connection handling --------------------------------------------------
 
@@ -465,7 +500,16 @@ class AmbientServer:
     def _write_health(self) -> None:
         try:
             self._conn_stats.tick()  # count an ongoing dark period once it crosses the threshold
-            stats = self._store.stats()
+            if self._cfg.instrument:
+                # store.stats() runs a SQLite query ON the event loop — time it to rule the on-loop
+                # DB path in/out as a pong-stall contributor (vs the diar worker).
+                _t = time.monotonic()
+                stats = self._store.stats()
+                _dt = time.monotonic() - _t
+                if _dt > 0.2:
+                    logger.warning("INSTRUMENT store.stats() blocked the loop %.2fs", _dt)
+            else:
+                stats = self._store.stats()
             payload = {
                 "ts": datetime.now(UTC).isoformat(),
                 "alive": True,
@@ -479,6 +523,8 @@ class AmbientServer:
                 "diar_windows_dropped": self._diar_dropped,
                 "speaker_id_enabled": self._speaker_id is not None,
                 "enrolling": self._enroll.name if self._enroll else None,
+                # Surfaced only under instrumentation, so the default health JSON is unchanged.
+                **({"max_loop_lag_s": round(self._max_loop_lag_s, 3)} if self._cfg.instrument else {}),
                 **self._conn_stats.snapshot(),
                 **stats,
             }
@@ -518,6 +564,9 @@ class AmbientServer:
             tracked_task(self._health_loop(), name="ambient-health"),
             tracked_task(self._purge_loop(), name="ambient-purge"),
         ]
+        if self._cfg.instrument:
+            tasks.append(tracked_task(self._loop_lag_monitor(), name="ambient-loop-lag"))
+            logger.warning("INSTRUMENT mode ON — event-loop-lag monitor + diar-phase timing active")
         if self._diar is not None:
             # Create the queue inside the running loop, before any connection can submit.
             self._diar_queue = asyncio.Queue(maxsize=self._cfg.diar_queue_max)
