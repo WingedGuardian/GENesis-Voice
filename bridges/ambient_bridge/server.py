@@ -95,6 +95,7 @@ class AmbientServer:
         self._engine = AmbientEngine(cfg, self._store)
         self._active = 0
         self._utterances_total = 0
+        self._frames_dropped = 0  # inbound audio frames shed under sustained overload (memory bound)
         self._last_connection_ts: str | None = None  # last client connect (for the health monitor)
         # Connection telemetry — records device connect/disconnect + dark gaps (the wedge signal),
         # persists across bridge restarts, surfaces in ambient_health.json.
@@ -360,51 +361,55 @@ class AmbientServer:
 
     # --- connection handling --------------------------------------------------
 
-    async def _handler(self, websocket) -> None:
-        source = f"ambient-{getattr(websocket, 'remote_address', ('?',))[0]}"
-        # Reap a silently-dead (half-open) peer in minutes: WS pings are off (the device
-        # rejects them), so without tuned TCP keep-alive a dead socket would sit ESTAB ~2h.
-        # get_extra_info("socket") may be None (non-TCP transport) → helper no-ops on None.
-        transport = getattr(websocket, "transport", None)
-        sock = transport.get_extra_info("socket") if transport is not None else None
-        _enable_tcp_keepalive(sock, self._cfg)
-        pipeline = self._engine.new_pipeline(source)
-        active: ActiveSession | None = None  # opened lazily while mode=active
-        task = asyncio.current_task()
-        self._handler_tasks.add(task)
-        self._active += 1
-        self._last_connection_ts = datetime.now(UTC).isoformat()
-        if self._active == 1:  # device came online (0→1); ignores zombie-overlap re-counts
-            self._conn_stats.on_connect()
-        logger.info("Client connected: %s (active=%d)", source, self._active)
+    @staticmethod
+    def _enqueue_drop_oldest(queue: asyncio.Queue, message: bytes) -> bool:
+        """Non-blocking enqueue. If the queue is full (the consumer fell behind under audio
+        load), drop the OLDEST frame to make room — shedding a little ambient audio is far
+        better than blocking the WS read loop (which would stall the socket → the device's
+        ping goes unanswered → 10s pong-timeout → 1006 drop → churn). Returns True if a frame
+        was dropped. Read-loop only; runs on the single event loop, so no lock is needed."""
+        dropped = False
+        if queue.full():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
+                dropped = True
+        queue.put_nowait(message)
+        return dropped
+
+    async def _consume_frames(self, source: str, pipeline, queue: asyncio.Queue) -> None:
+        """Single per-connection consumer: does the heavy, ORDERED per-frame work (mode
+        routing + STT/diar/speaker-id or the active cloud relay) OFF the WS read path, so the
+        read loop never blocks. Runs until it gets the ``None`` sentinel (sent by _handler on
+        close), then finalizes + flushes. A per-frame error is logged but never kills the
+        consumer or the socket (one bad frame must not drop capture)."""
+        active: ActiveSession | None = None
         try:
-            async for message in websocket:
-                if isinstance(message, bytes):
+            while True:
+                message = await queue.get()
+                if message is None:  # sentinel: read loop ended → drain done, stop
+                    break
+                try:
                     # self._mode is read here + written by _handle_mode — both on THIS single
                     # event loop, so no lock is needed. Default 'passive' fails safe to LOCAL.
                     if self._mode == "active":
-                        # ACTIVE: relay to a cloud Speechmatics session (opened lazily).
+                        # ACTIVE: relay to a cloud Speechmatics session (opened lazily). Pass the
+                        # shared eres2net registry so active mode can relabel S1/S2 → enrolled names
+                        # (None when speaker-ID is off/unenrolled → positional).
                         if active is None:
-                            # Pass the shared eres2net registry so active mode can relabel S1/S2 →
-                            # enrolled names (None when speaker-ID is off/unenrolled → positional).
                             active = ActiveSession(self._cfg, source=source, speaker_id=self._speaker_id)
                             await active.start()
                             self._active_session = active  # expose to /marker
                         await active.send_audio(message)
                     else:
-                        # PASSIVE (default): local Zipformer pipeline — UNCHANGED path.
+                        # PASSIVE (default): local Zipformer pipeline.
                         if active is not None:
                             await active.finalize()
                             if self._active_session is active:
                                 self._active_session = None
                             active = None
                         self._utterances_total += await pipeline.feed(message)
-                elif isinstance(message, str):
-                    self._on_control(source, message)
-        except websockets.ConnectionClosed as exc:
-            logger.info("Client %s closed (code=%s reason=%r)", source, exc.code, exc.reason)
-        except Exception:  # noqa: BLE001
-            logger.exception("Handler error for %s", source)
+                except Exception:  # noqa: BLE001 — one bad frame must not kill capture or the socket
+                    logger.exception("frame processing error for %s", source)
         finally:
             # Dirty or clean: finalize any active cloud session, then flush any buffered
             # partial utterance + close the final diar window (flush() submits it).
@@ -417,6 +422,54 @@ class AmbientServer:
                 self._utterances_total += await pipeline.flush()
             except Exception:  # noqa: BLE001
                 logger.warning("flush failed for %s", source, exc_info=True)
+
+    async def _handler(self, websocket) -> None:
+        source = f"ambient-{getattr(websocket, 'remote_address', ('?',))[0]}"
+        # Reap a silently-dead (half-open) peer in minutes: WS pings are off (the device
+        # rejects them), so without tuned TCP keep-alive a dead socket would sit ESTAB ~2h.
+        # get_extra_info("socket") may be None (non-TCP transport) → helper no-ops on None.
+        transport = getattr(websocket, "transport", None)
+        sock = transport.get_extra_info("socket") if transport is not None else None
+        _enable_tcp_keepalive(sock, self._cfg)
+        pipeline = self._engine.new_pipeline(source)
+        task = asyncio.current_task()
+        self._handler_tasks.add(task)
+        self._active += 1
+        self._last_connection_ts = datetime.now(UTC).isoformat()
+        if self._active == 1:  # device came online (0→1); ignores zombie-overlap re-counts
+            self._conn_stats.on_connect()
+        logger.info("Client connected: %s (active=%d)", source, self._active)
+        # Decouple WS I/O from processing: the read loop ONLY enqueues frames (instant), so the
+        # socket is drained as fast as the device sends → pings stay answered → no pong-timeout
+        # churn. A single consumer task does the heavy per-frame work in order. See _consume_frames.
+        queue: asyncio.Queue = asyncio.Queue(maxsize=self._cfg.frame_queue_max)
+        consumer = tracked_task(self._consume_frames(source, pipeline, queue),
+                                name=f"ambient-consume-{source}")
+        try:
+            async for message in websocket:
+                if isinstance(message, bytes):
+                    if self._enqueue_drop_oldest(queue, message):
+                        self._frames_dropped += 1
+                elif isinstance(message, str):
+                    self._on_control(source, message)
+        except websockets.ConnectionClosed as exc:
+            logger.info("Client %s closed (code=%s reason=%r)", source, exc.code, exc.reason)
+        except Exception:  # noqa: BLE001
+            logger.exception("Handler error for %s", source)
+        finally:
+            # Signal the consumer (None sentinel) to drain remaining frames then finalize+flush,
+            # then join it. The sentinel put MUST NOT block — at close the queue may be full of
+            # unconsumed frames — so drop one to make room if needed. Awaiting the consumer is then
+            # bounded: it gets the sentinel and stops, or has already finished/crashed and returns
+            # immediately (tracked_task logged any crash; suppress() guards the join).
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                with contextlib.suppress(asyncio.QueueEmpty):
+                    queue.get_nowait()
+                queue.put_nowait(None)
+            with contextlib.suppress(Exception):
+                await consumer
             self._handler_tasks.discard(task)
             self._active -= 1
             if self._active == 0:  # device fully gone (1→0); starts a dark-period timer
@@ -477,6 +530,7 @@ class AmbientServer:
                 "diar_worker_alive": self._diar_worker_alive,
                 "diar_queue_depth": self._diar_queue.qsize() if self._diar_queue else 0,
                 "diar_windows_dropped": self._diar_dropped,
+                "frames_dropped": self._frames_dropped,
                 "speaker_id_enabled": self._speaker_id is not None,
                 "enrolling": self._enroll.name if self._enroll else None,
                 **self._conn_stats.snapshot(),

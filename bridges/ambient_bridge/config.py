@@ -57,6 +57,13 @@ class AmbientConfig:
     keepalive_intvl_s: int = field(default_factory=lambda: int(_env("AMBIENT_KEEPALIVE_INTVL_S", "10")))
     keepalive_cnt: int = field(default_factory=lambda: int(_env("AMBIENT_KEEPALIVE_CNT", "3")))
 
+    # Per-connection inbound audio-frame queue. Decouples the WS read loop from heavy
+    # per-utterance processing (STT/diar/speaker-id): the read loop only enqueues, so the
+    # socket is always drained and the device's WS pings get ponged in time — preventing the
+    # ~10s pong-timeout that abnormally drops + churns the ambient connection under audio load.
+    # Drop-oldest when full bounds memory (256 frames ≈ tens of seconds of audio).
+    frame_queue_max: int = field(default_factory=lambda: int(_env("AMBIENT_FRAME_QUEUE_MAX", "256")))
+
     # --- models (paths on the VM) ---
     models_dir: str = field(default_factory=lambda: _env("AMBIENT_MODELS_DIR", os.path.expanduser("~/models")))
     silero_vad: str = field(default_factory=lambda: _env("AMBIENT_SILERO_VAD", os.path.expanduser("~/models/silero_vad.onnx")))
