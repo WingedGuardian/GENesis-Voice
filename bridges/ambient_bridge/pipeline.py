@@ -57,6 +57,57 @@ def _autodetect_embedding(model_dir: str) -> str:
     raise FileNotFoundError(f"no speaker-embedding model (e.g. *eres2net*16k*.onnx) in {model_dir}")
 
 
+# --- shadow STT-quality instrumentation (Phase 0) -------------------------------------------
+# Per-utterance quality signals logged into the row ``meta`` to characterize (and later gate)
+# ASR hallucination — see ~/.genesis/output/specs/ambient-stt-quality-design.md. SHADOW-ONLY:
+# never affects capture. The decode signals (per-token log-probs) and the VAD-segment audio
+# energy are byproducts of work already done and are IRRECOVERABLE later (the audio never leaves
+# the edge); text-derived features are computed offline from the stored text. Both extractors
+# are guarded — instrumentation must never break the 24/7 capture path.
+_SHADOW_VER = "p0.1"  # bump when this meta schema changes (lets offline analysis filter by gen)
+
+
+def _asr_feats(result) -> dict:
+    """Quality fingerprint of a sherpa decode. ``ys_log_probs`` (per-token log-probs, closer to
+    0 = more confident) is stored RAW so the offline analysis can pick the discriminating
+    statistic (mean / min / frac-below-θ) instead of pre-committing to one. lang/emotion/event
+    are kept only when populated (this Zipformer usually leaves them empty)."""
+    try:
+        feats: dict = {
+            "ys_log_probs": [round(float(x), 3) for x in result.ys_log_probs],
+            "n_tokens": len(result.tokens),
+        }
+        for k in ("lang", "emotion", "event"):
+            v = (getattr(result, k, "") or "").strip()
+            if v:
+                feats[k] = v
+        return feats
+    except Exception:  # noqa: BLE001 — instrumentation must never break capture
+        logger.warning("asr feats extraction failed (capture unaffected)", exc_info=True)
+        return {}
+
+
+def _audio_feats(samples) -> dict:
+    """Cheap acoustic fingerprint of the VAD segment — IRRECOVERABLE once the buffer is dropped.
+    Garble from hiss/music tends to cluster at low energy; the offline analysis derives a
+    pseudo-SNR from ``rms`` against a rolling floor. Token-rate is derivable offline from
+    ``n_tokens`` and the row's ``duration_s``, so it is not stored here."""
+    try:
+        s = np.asarray(samples, dtype=np.float32)
+        if s.size == 0:
+            return {}
+        feats = {
+            "rms": round(float(np.sqrt(np.mean(s ** 2))), 5),
+            "peak": round(float(np.max(np.abs(s))), 5),
+        }
+        if s.size > 1:
+            feats["zcr"] = round(float(np.mean(np.abs(np.diff(np.sign(s))) > 0)), 4)
+        return feats
+    except Exception:  # noqa: BLE001 — instrumentation must never break capture
+        logger.warning("audio feats failed (capture unaffected)", exc_info=True)
+        return {}
+
+
 @dataclass
 class DiarWindow:
     """A closed window of continuous audio + the utterances that fall in it.
@@ -98,14 +149,18 @@ class AmbientEngine:
         raise (the pipeline guards it)."""
         self._enroll_collect = collect
 
-    def transcribe(self, samples) -> str:
+    def transcribe(self, samples) -> tuple[str, dict]:
         """Thread-safe STT. The recognizer is shared across connections, so serialize
-        create_stream/decode_stream (avoids concurrent calls into the shared ONNX session)."""
+        create_stream/decode_stream (avoids concurrent calls into the shared ONNX session).
+
+        Returns ``(text, asr_feats)``: ``asr_feats`` is a SHADOW-ONLY quality fingerprint of the
+        decode (see ``_asr_feats``); it is logged to row meta and never affects capture."""
         with self._rec_lock:
             stream = self._recognizer.create_stream()
             stream.accept_waveform(self._cfg.model_sample_rate, samples)
             self._recognizer.decode_stream(stream)
-            return stream.result.text.strip()
+            result = stream.result
+            return result.text.strip(), _asr_feats(result)
 
     def new_pipeline(self, source: str) -> AmbientPipeline:
         return AmbientPipeline(
@@ -283,12 +338,17 @@ class AmbientPipeline:
                     self._collect_enroll(samples, dur)
                 except Exception:  # noqa: BLE001
                     logger.warning("enroll collect failed (capture unaffected)", exc_info=True)
-            text = self._engine.transcribe(samples)
+            text, asr_feats = self._engine.transcribe(samples)
             if not text:
                 continue
+            meta = {"asr": "sherpa-zipformer", "shadow_ver": _SHADOW_VER}
+            if asr_feats:
+                meta["asr_feats"] = asr_feats
+            audio = _audio_feats(samples)
+            if audio:
+                meta["audio"] = audio
             row_id = self._store.insert(
-                text=text, duration_s=round(dur, 2), source=self._source,
-                meta={"asr": "sherpa-zipformer"},
+                text=text, duration_s=round(dur, 2), source=self._source, meta=meta,
             )
             self.utterances += 1
             stored += 1
