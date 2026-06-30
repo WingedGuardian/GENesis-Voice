@@ -62,6 +62,11 @@ class AmbientConfig:
     silero_vad: str = field(default_factory=lambda: _env("AMBIENT_SILERO_VAD", os.path.expanduser("~/models/silero_vad.onnx")))
     zipformer_dir: str = field(default_factory=lambda: _env("AMBIENT_ZIPFORMER_DIR", os.path.expanduser("~/models/sherpa-zip")))
     num_threads: int = field(default_factory=lambda: int(_env("AMBIENT_NUM_THREADS", "4")))
+    # ASR decode: modified_beam_search modestly improves clean-but-hard speech vs greedy at ~1.3x
+    # latency (RTF ~0.08, far below real-time — measured on the edge). greedy_search reachable via env
+    # for instant rollback. max_active_paths applies only to beam search (ignored by greedy).
+    decoding_method: str = field(default_factory=lambda: _env("AMBIENT_DECODING_METHOD", "modified_beam_search"))
+    max_active_paths: int = field(default_factory=lambda: max(1, int(_env("AMBIENT_MAX_ACTIVE_PATHS", "4"))))  # floor 1: a 0/negative beam width is undefined in sherpa
 
     # --- VAD tuning ---
     vad_min_silence_s: float = field(default_factory=lambda: float(_env("AMBIENT_VAD_MIN_SILENCE", "0.4")))
