@@ -116,7 +116,8 @@ class AmbientServer:
         self._reboot_inflight = False
         if cfg.recovery_enabled and cfg.recovery_device_ip:
             try:
-                self._recovery_psk = open(cfg.recovery_psk_path).read().strip()
+                with open(cfg.recovery_psk_path) as f:
+                    self._recovery_psk = f.read().strip()
             except OSError:
                 logger.error("recovery enabled but PSK key unreadable at %s — recovery DISABLED",
                              cfg.recovery_psk_path)
@@ -125,6 +126,11 @@ class AmbientServer:
                     path=cfg.recovery_state_path, cooldown_s=cfg.recovery_reboot_cooldown_s,
                     max_per_window=cfg.recovery_max_reboots_per_window,
                     window_s=cfg.recovery_reboot_window_s)
+                try:
+                    import aioesphomeapi  # noqa: F401 — fail loud NOW, not at the first reboot
+                except Exception:  # noqa: BLE001
+                    logger.error("recovery ARMED but aioesphomeapi is NOT installed — reboots will "
+                                 "no-op; run: pip install aioesphomeapi")
                 logger.warning(
                     "device auto-recovery ARMED: reboot %s:%d (%r) after %.0fs dark "
                     "(cooldown %.0fs, cap %d/%.0fs)", cfg.recovery_device_ip, cfg.recovery_device_port,
@@ -632,10 +638,10 @@ class AmbientServer:
         """Press the device's Restart button. Records the ATTEMPT (so cooldown/cap count failures too),
         logs the outcome, and WARNs loudly if the rolling-window cap is now reached (a human should look).
         Best-effort — reboot_device never raises; the inflight flag is always cleared."""
-        rec = self._recovery
+        rec = self._recovery  # always set: _maybe_recover only schedules this when armed
         cfg = self._cfg
         try:
-            dark = rec.dark_for() if rec else None
+            dark = rec.dark_for()
             rec.record_reboot()
             logger.warning("RECOVERY: device dark %.0fs (> %.0fs) — rebooting %s",
                            dark or 0.0, cfg.recovery_no_conn_threshold_s, cfg.recovery_device_ip)

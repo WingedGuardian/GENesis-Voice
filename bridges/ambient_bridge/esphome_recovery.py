@@ -58,8 +58,9 @@ async def reboot_device(
             return APIClient(ip, port, "", noise_psk=psk)
 
     cli = client_factory()
-    try:
-        await asyncio.wait_for(cli.connect(login=True), timeout=timeout_s)
+
+    async def _press() -> bool:
+        await cli.connect(login=True)
         entities, _services = await cli.list_entities_services()
         # Select by NAME among BUTTON entities (portable — no hard-coded entity key). Duck-typed on
         # the class name so this stays importable/testable without aioesphomeapi present.
@@ -75,15 +76,23 @@ async def reboot_device(
             return False
         cli.button_command(button.key)  # synchronous in aioesphomeapi
         await asyncio.sleep(1.0)         # let the press flush before we disconnect
-        logger.warning("recovery: pressed %r (key=%s) on %s — device reboot requested",
-                       button_name, button.key, ip)
+        logger.warning("recovery: pressed %r (key=%s) on %s — reboot requested "
+                       "(confirmed only once the device reconnects)", button_name, button.key, ip)
         return True
+
+    try:
+        # ONE timeout around the WHOLE exchange: a wedged device can stall connect OR the entity
+        # listing. Without this the caller's _reboot_inflight would stay set forever → recovery dead.
+        return await asyncio.wait_for(_press(), timeout=timeout_s)
+    except TimeoutError:
+        logger.error("recovery: reboot of %s timed out after %.0fs", ip, timeout_s)
+        return False
     except Exception as exc:  # noqa: BLE001 — best-effort; a failed reboot must not crash the bridge
         logger.error("recovery: reboot of %s failed: %r", ip, exc)
         return False
     finally:
         with contextlib.suppress(Exception):
-            await cli.disconnect()
+            await asyncio.wait_for(cli.disconnect(), timeout=5.0)
 
 
 class RecoveryState:
@@ -102,7 +111,9 @@ class RecoveryState:
     ) -> None:
         self._path = os.path.expanduser(path)
         self._cooldown_s = cooldown_s
-        self._max_per_window = max_per_window
+        # Never allow an UNCAPPED reboot loop — the cap is the last defense before a human is alerted.
+        # A misconfigured <1 is clamped to 1 (recovery_enabled is the on/off switch, not this knob).
+        self._max_per_window = max(1, int(max_per_window))
         self._window_s = window_s
         self._clock = clock
         self._last_seen_ts: float | None = None
@@ -129,7 +140,8 @@ class RecoveryState:
     # --- reboot gating --------------------------------------------------------------------------
 
     def _prune(self, now: float) -> None:
-        self._reboot_ts = [t for t in self._reboot_ts if now - t <= self._window_s]
+        # Keep only reboots STRICTLY within the window (exclusive at the boundary).
+        self._reboot_ts = [t for t in self._reboot_ts if now - t < self._window_s]
 
     def can_reboot(self) -> bool:
         """False if within the cooldown of the last reboot, or at the rolling-window cap."""
@@ -137,14 +149,14 @@ class RecoveryState:
         self._prune(now)
         if self._reboot_ts and (now - self._reboot_ts[-1]) < self._cooldown_s:
             return False
-        if self._max_per_window and len(self._reboot_ts) >= self._max_per_window:
+        if len(self._reboot_ts) >= self._max_per_window:  # cap is always >= 1 (clamped in __init__)
             return False
         return True
 
     def at_cap(self) -> bool:
         now = self._clock()
         self._prune(now)
-        return bool(self._max_per_window) and len(self._reboot_ts) >= self._max_per_window
+        return len(self._reboot_ts) >= self._max_per_window
 
     def should_reboot(self, *, active: int, dark_threshold_s: float, seen_window_s: float) -> bool:
         """The full policy. Reboot iff: no device connected, it was seen before (not a fresh
@@ -186,6 +198,7 @@ class RecoveryState:
         except (ValueError, OSError):
             logger.warning("recovery state load failed — starting fresh", exc_info=True)
             return
-        self._last_seen_ts = d.get("last_seen_ts")
+        raw_seen = d.get("last_seen_ts")
+        self._last_seen_ts = float(raw_seen) if isinstance(raw_seen, (int, float)) else None
         rb = d.get("reboot_ts") or []
         self._reboot_ts = [float(t) for t in rb if isinstance(t, (int, float))]

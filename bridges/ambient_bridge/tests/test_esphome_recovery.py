@@ -1,6 +1,9 @@
 """Unit tests for the ambient device auto-recovery (deterministic via an injected clock;
 reboot primitive exercised against a fake ESPHome API client — no aioesphomeapi needed)."""
 import asyncio
+import types
+
+import pytest
 
 from ambient_bridge.esphome_recovery import RecoveryState, reboot_device
 
@@ -185,3 +188,55 @@ def test_reboot_connect_error_returns_false_never_raises(tmp_path):
     ok = asyncio.run(reboot_device("1.2.3.4", 6053, "psk", client_factory=lambda: client))
     assert ok is False
     assert client.disconnected is True       # finally-block cleanup still runs
+
+
+def test_cap_never_uncapped_when_misconfigured_zero(tmp_path):
+    # max_per_window <= 0 must NOT mean "unlimited" — it's clamped to 1 (the cap can't be bypassed).
+    clk = _Clock()
+    s = _state(tmp_path, cooldown_s=0, max_per_window=0, window_s=3600, clock=clk)
+    s.record_reboot()
+    assert s.at_cap() is True
+    assert s.can_reboot() is False
+
+
+def test_prune_boundary_is_exclusive(tmp_path):
+    # A reboot exactly window_s ago is pruned (exclusive boundary), so the cap clears on schedule.
+    clk = _Clock()
+    s = _state(tmp_path, cooldown_s=0, max_per_window=1, window_s=3600, clock=clk)
+    s.record_reboot()
+    assert s.can_reboot() is False           # at the cap of 1
+    clk.advance(3600)                         # exactly window_s later
+    assert s.at_cap() is False
+    assert s.can_reboot() is True
+
+
+def test_load_ignores_corrupt_last_seen(tmp_path):
+    # A non-numeric persisted last_seen_ts must not crash dark_for() (health-loop safety).
+    import json
+    p = tmp_path / "recovery.json"
+    p.write_text(json.dumps({"last_seen_ts": "not-a-number", "reboot_ts": ["bad", 5.0]}))
+    s = RecoveryState(path=str(p), cooldown_s=300, max_per_window=3, window_s=3600, clock=_Clock())
+    assert s.dark_for() is None               # corrupt last_seen → None, no TypeError
+    # only the numeric reboot ts survived the load
+    assert s.should_reboot(active=0, dark_threshold_s=300, seen_window_s=7200) is False
+
+
+def test_do_device_reboot_always_resets_inflight(tmp_path, monkeypatch):
+    """Server glue: the reboot task must clear _reboot_inflight even when the reboot FAILS — else
+    recovery locks up after one attempt. Needs the bridge deps (server imports sherpa) → skipped
+    where they're absent; runs on the edge venv."""
+    pytest.importorskip("sherpa_onnx")
+    from ambient_bridge import server as srv
+    from ambient_bridge.config import AmbientConfig
+
+    async def _fail_reboot(*_a, **_k):
+        return False  # simulate a failed press — no network
+
+    monkeypatch.setattr(srv, "reboot_device", _fail_reboot)
+    rec = _state(tmp_path)
+    rec.mark_seen()
+    fake = types.SimpleNamespace(
+        _recovery=rec, _recovery_psk="psk", _cfg=AmbientConfig(), _reboot_inflight=True)
+    asyncio.run(srv.AmbientServer._do_device_reboot(fake))
+    assert fake._reboot_inflight is False      # cleared in finally, even on failure
+    assert rec.at_cap() is False               # 1 attempt recorded (default cap 3)
