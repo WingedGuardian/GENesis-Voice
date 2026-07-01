@@ -113,6 +113,10 @@ sherpa/onnxruntime thread pool + the diar spawn child (RSS otherwise creeps ~200
 The health JSON carries `rss_parent_mb`, `rss_diar_child_mb` (the diar child), and `rss_total_mb`
 so this stays watchable — a slow climb across restarts means the cap regressed.
 
+> Existing installs that applied `MALLOC_ARENA_MAX=2` as a hand-made systemd drop-in can drop it now
+> that it's baked into the unit: `rm ~/.config/systemd/user/ambient-bridge.service.d/arena.conf &&
+> systemctl --user daemon-reload` (leave any other drop-ins, e.g. an input-SR override, in place).
+
 Diarization: `AMBIENT_DIAR_ENABLED` (1) · `AMBIENT_DIAR_THRESHOLD` (0.7; higher = fewer
 clusters) · `AMBIENT_DIAR_WINDOW_S` (60) · `AMBIENT_DIAR_QUEUE_MAX` (4) ·
 `AMBIENT_DIAR_NUM_THREADS` (2) · `AMBIENT_SEG_MODEL` / `AMBIENT_EMB_MODEL` (auto-detected

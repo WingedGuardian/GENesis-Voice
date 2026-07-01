@@ -105,3 +105,31 @@ def test_memory_snapshot_pool_missing_processes_is_safe():
     snap = server_mod.AmbientServer._memory_snapshot(fake)
     assert snap["rss_diar_child_mb"] is None
     assert snap["rss_parent_mb"] > 0
+
+
+def test_memory_snapshot_pool_processes_none_is_safe():
+    # ProcessPoolExecutor sets _processes = None on shutdown — must not raise (None -> {} guard).
+    fake = types.SimpleNamespace(_diar_pool=types.SimpleNamespace(_processes=None))
+    snap = server_mod.AmbientServer._memory_snapshot(fake)
+    assert snap["rss_diar_child_mb"] is None
+    assert snap["rss_parent_mb"] > 0
+
+
+def test_memory_snapshot_dead_child_pid_is_filtered():
+    # A _processes entry whose pid has exited (transient, before the pool manager reaps it) must
+    # yield rss_child=None via the None-filter, never raise or count it as 0.
+    fake_pool = types.SimpleNamespace(_processes={2**31 - 1: object()})
+    fake = types.SimpleNamespace(_diar_pool=fake_pool)
+    snap = server_mod.AmbientServer._memory_snapshot(fake)
+    assert snap["rss_diar_child_mb"] is None                  # dead pid filtered
+    assert snap["rss_total_mb"] == snap["rss_parent_mb"]      # total falls back to parent-only
+
+
+def test_memory_snapshot_total_preserves_zero_reading(monkeypatch):
+    # A 0.0 RSS reading (a zombie's statm reads all zeros) must NOT be dropped from the total as
+    # if absent — rss_total_mb stays a float, never collapsing to int via a truthiness `x or 0`.
+    monkeypatch.setattr(server_mod, "_rss_mb", lambda pid: 0.0)
+    fake = types.SimpleNamespace(_diar_pool=None)
+    snap = server_mod.AmbientServer._memory_snapshot(fake)
+    assert snap["rss_parent_mb"] == 0.0
+    assert isinstance(snap["rss_total_mb"], float) and snap["rss_total_mb"] == 0.0

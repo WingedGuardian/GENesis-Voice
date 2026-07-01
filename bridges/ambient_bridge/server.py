@@ -63,6 +63,9 @@ def _enable_tcp_keepalive(sock, cfg: AmbientConfig) -> None:
         logger.warning("could not set TCP keep-alive on client socket: %s", exc)
 
 
+_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")  # bytes/page — constant for the process; resolve at import (fail loud), not per health tick
+
+
 def _rss_mb(pid: int) -> float | None:
     """Resident set size (MB) of a process via ``/proc/<pid>/statm`` — Linux, no psutil dep.
     Field 2 is the resident page count; × the page size → bytes. Returns None if the pid is
@@ -70,8 +73,8 @@ def _rss_mb(pid: int) -> float | None:
     try:
         with open(f"/proc/{pid}/statm") as f:
             resident_pages = int(f.read().split()[1])
-        return round(resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024), 1)
-    except (OSError, ValueError, IndexError):
+        return round(resident_pages * _PAGE_SIZE / (1024 * 1024), 1)
+    except (OSError, IndexError, ValueError):
         return None
 
 
@@ -602,7 +605,11 @@ class AmbientServer:
             except Exception:  # noqa: BLE001
                 rss_child = None
         total = (
-            round((rss_parent or 0) + (rss_child or 0), 1)
+            round(
+                (rss_parent if rss_parent is not None else 0)
+                + (rss_child if rss_child is not None else 0),
+                1,
+            )
             if (rss_parent is not None or rss_child is not None)
             else None
         )
@@ -638,9 +645,9 @@ class AmbientServer:
                 "diar_windows_dropped": self._diar_dropped,
                 "speaker_id_enabled": self._speaker_id is not None,
                 "enrolling": self._enroll.name if self._enroll else None,
-                # Parent + diar-child RSS so the MALLOC_ARENA_MAX=2 leak fix stays watchable live.
+                # Parent + diar-child RSS, ALWAYS on, so the MALLOC_ARENA_MAX=2 leak fix stays watchable.
                 **self._memory_snapshot(),
-                # Surfaced only under instrumentation, so the default health JSON is unchanged.
+                # max_loop_lag_s: surfaced ONLY under instrumentation, so the default JSON is unchanged.
                 **({"max_loop_lag_s": round(self._max_loop_lag_s, 3)} if self._cfg.instrument else {}),
                 **self._conn_stats.snapshot(),
                 **stats,
