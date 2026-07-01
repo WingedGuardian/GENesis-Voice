@@ -62,7 +62,7 @@ always re-run the feeder smoke test after deploying.
 ```bash
 # one-time: venv + deps + models (deploy/install.sh ambient does the venv + deps)
 python3 -m venv ~/ambient-venv
-~/ambient-venv/bin/pip install sherpa-onnx onnxruntime soxr soundfile websockets numpy aiohttp speechmatics-rt
+~/ambient-venv/bin/pip install sherpa-onnx onnxruntime soxr soundfile websockets numpy aiohttp speechmatics-rt aioesphomeapi
 wget -P ~/models https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
 # Zipformer STT model dir expected at ~/models/sherpa-zip (encoder/decoder/joiner/tokens)
 # Diarization (Stage-1b) models in ~/models (deploy/install.sh ambient downloads these):
@@ -120,6 +120,28 @@ Speaker-ID: `AMBIENT_SPEAKER_ID_ENABLED` (1) · `AMBIENT_USER_VERIFY_THRESHOLD` 
 Online enroll: `AMBIENT_ENROLL_REQUEST` / `AMBIENT_ENROLL_RESULT` (~/ambient_enroll_*.json) ·
 `AMBIENT_ENROLL_CHECK_S` (2.0) · `AMBIENT_ENROLL_MIN_DUR_S` (1.0) · `AMBIENT_ENROLL_TARGET_S` (30) ·
 `AMBIENT_ENROLL_MAX_WAIT_S` (120).
+
+## Device auto-recovery (the ambient-WS "wedge")
+The Voice PE wedges its ambient WebSocket **half-open** — when the bridge-side socket dies (a
+deploy/restart, or a spontaneous drop) the device can't tell, never reconnects, and stays dark
+until a reboot. The **bridge is the reliable observer** (TCP keep-alive reaping + the
+active-connection count), so with recovery armed it reboots the device via the ESPHome native API
+(a "Restart" button press, `aioesphomeapi`) once the device has been GONE past a threshold and was
+recently present. Keyed off a **persisted** last-seen timestamp, so a deploy-induced wedge (fresh
+bridge process) is caught too. A cooldown + a rolling-window cap make reboot-loops impossible
+(cap reached → stop + WARN for a human).
+
+**Off by default.** To arm it: set `AMBIENT_RECOVERY_ENABLED=1`, `AMBIENT_RECOVERY_DEVICE_IP=<ip>`,
+and put the device's ESPHome API noise PSK (base64) in `~/.ambient-recovery/device_api.key`
+(never commit it). Requires `aioesphomeapi` in the venv.
+
+Knobs: `AMBIENT_RECOVERY_ENABLED` (0) · `AMBIENT_RECOVERY_DEVICE_IP` ("") ·
+`AMBIENT_RECOVERY_DEVICE_PORT` (6053) · `AMBIENT_RECOVERY_PSK_PATH` (~/.ambient-recovery/device_api.key) ·
+`AMBIENT_RECOVERY_BUTTON_NAME` (Restart) · `AMBIENT_RECOVERY_NO_CONN_THRESHOLD_S` (300 — reboot after
+this long dark) · `AMBIENT_RECOVERY_SEEN_WINDOW_S` (7200 — dark longer than this ⇒ treated as
+legitimately absent, not rebooted) · `AMBIENT_RECOVERY_REBOOT_COOLDOWN_S` (300) ·
+`AMBIENT_RECOVERY_MAX_REBOOTS` (3) · `AMBIENT_RECOVERY_REBOOT_WINDOW_S` (3600) ·
+`AMBIENT_RECOVERY_STATE` (~/ambient_recovery_state.json) · `AMBIENT_RECOVERY_REBOOT_TIMEOUT_S` (15).
 
 ## Not yet (tracked in the design)
 The filter / attention / sense-making tiers and the graduation boundary to Genesis memory.

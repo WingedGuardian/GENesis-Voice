@@ -89,6 +89,28 @@ class AmbientConfig:
     # Cap the detailed JSONL event log (cumulative aggregates in conn_stats_path persist forever).
     conn_events_max: int = field(default_factory=lambda: int(_env("AMBIENT_CONN_EVENTS_MAX", "5000")))
 
+    # --- device auto-recovery (reboot a wedged Voice PE via the ESPHome API) ---
+    # The device wedges its ambient WS half-open and never reconnects (see esphome_recovery.py); the
+    # bridge is the reliable observer, so it reboots the device after it's been GONE > no_conn_threshold.
+    # Default OFF; arms only when enabled AND device_ip + a readable PSK key file are present. Keyed off
+    # a PERSISTED last-seen ts so a deploy-induced wedge (fresh process) is caught too. A cooldown + a
+    # rolling-window cap make reboot-loops impossible. NO private data (IP/PSK) in defaults — edge-only.
+    recovery_enabled: bool = field(default_factory=lambda: _env_bool("AMBIENT_RECOVERY_ENABLED", False))
+    recovery_device_ip: str = field(default_factory=lambda: _env("AMBIENT_RECOVERY_DEVICE_IP", ""))
+    recovery_device_port: int = field(default_factory=lambda: int(_env("AMBIENT_RECOVERY_DEVICE_PORT", "6053")))
+    # ESPHome native-API noise PSK (base64) — a key FILE, mirroring active_sm_key_path; OUTSIDE the repo.
+    recovery_psk_path: str = field(default_factory=lambda: _env("AMBIENT_RECOVERY_PSK_PATH", os.path.expanduser("~/.ambient-recovery/device_api.key")))
+    recovery_button_name: str = field(default_factory=lambda: _env("AMBIENT_RECOVERY_BUTTON_NAME", "Restart"))
+    # Reboot after the device has been gone this long (well above a normal reconnect; it never self-recovers).
+    recovery_no_conn_threshold_s: float = field(default_factory=lambda: float(_env("AMBIENT_RECOVERY_NO_CONN_THRESHOLD_S", "300")))
+    # Only treat "no connection" as a wedge if the device was seen within this window; older ⇒ absent, don't reboot.
+    recovery_seen_window_s: float = field(default_factory=lambda: float(_env("AMBIENT_RECOVERY_SEEN_WINDOW_S", "7200")))
+    recovery_reboot_cooldown_s: float = field(default_factory=lambda: float(_env("AMBIENT_RECOVERY_REBOOT_COOLDOWN_S", "300")))
+    recovery_max_reboots_per_window: int = field(default_factory=lambda: int(_env("AMBIENT_RECOVERY_MAX_REBOOTS", "3")))
+    recovery_reboot_window_s: float = field(default_factory=lambda: float(_env("AMBIENT_RECOVERY_REBOOT_WINDOW_S", "3600")))
+    recovery_state_path: str = field(default_factory=lambda: _env("AMBIENT_RECOVERY_STATE", os.path.expanduser("~/ambient_recovery_state.json")))
+    recovery_reboot_timeout_s: float = field(default_factory=lambda: float(_env("AMBIENT_RECOVERY_REBOOT_TIMEOUT_S", "15")))
+
     # --- diarization (Stage-1b, additive) ---
     # Speaker diarization runs DEFERRED on closed windows; if models are missing or
     # init fails, the service runs capture-only with speaker_label NULL.

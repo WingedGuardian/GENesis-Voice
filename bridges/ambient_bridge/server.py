@@ -33,6 +33,7 @@ from . import diar_subprocess
 from .active_session import ActiveSession
 from .config import AmbientConfig, load_config
 from .connection_stats import ConnectionStats
+from .esphome_recovery import RecoveryState, reboot_device
 from .pipeline import AmbientEngine, DiarWindow, _autodetect_embedding
 from .speaker_id import SpeakerIDRegistry
 from .store import AmbientStore
@@ -107,6 +108,37 @@ class AmbientServer:
         self._conn_stats = ConnectionStats(
             events_path=cfg.conn_events_path, stats_path=cfg.conn_stats_path,
             dark_threshold_s=cfg.conn_dark_threshold_s, events_max=cfg.conn_events_max)
+        # --- device auto-recovery (reboot a wedged Voice PE via the ESPHome API; default OFF) ---
+        # Arms only when enabled AND a device IP + a readable PSK key file are present. Keyed off a
+        # PERSISTED last-seen ts (restart-safe). See esphome_recovery.py.
+        self._recovery: RecoveryState | None = None
+        self._recovery_psk = ""
+        self._reboot_inflight = False
+        if cfg.recovery_enabled and cfg.recovery_device_ip:
+            try:
+                with open(cfg.recovery_psk_path) as f:
+                    self._recovery_psk = f.read().strip()
+            except OSError:
+                logger.error("recovery enabled but PSK key unreadable at %s — recovery DISABLED",
+                             cfg.recovery_psk_path)
+            if self._recovery_psk:
+                self._recovery = RecoveryState(
+                    path=cfg.recovery_state_path, cooldown_s=cfg.recovery_reboot_cooldown_s,
+                    max_per_window=cfg.recovery_max_reboots_per_window,
+                    window_s=cfg.recovery_reboot_window_s)
+                try:
+                    import aioesphomeapi  # noqa: F401 — fail loud NOW, not at the first reboot
+                except Exception:  # noqa: BLE001
+                    logger.error("recovery ARMED but aioesphomeapi is NOT installed — reboots will "
+                                 "no-op; run: pip install aioesphomeapi")
+                logger.warning(
+                    "device auto-recovery ARMED: reboot %s:%d (%r) after %.0fs dark "
+                    "(cooldown %.0fs, cap %d/%.0fs)", cfg.recovery_device_ip, cfg.recovery_device_port,
+                    cfg.recovery_button_name, cfg.recovery_no_conn_threshold_s,
+                    cfg.recovery_reboot_cooldown_s, cfg.recovery_max_reboots_per_window,
+                    cfg.recovery_reboot_window_s)
+        elif cfg.recovery_enabled:
+            logger.error("recovery enabled but AMBIENT_RECOVERY_DEVICE_IP unset — recovery DISABLED")
         # --- diarization (deferred, additive; capture works fine without it) ---
         # The diarization ONNX runs in a SEPARATE PROCESS (see diar_subprocess): sherpa's process()
         # holds the GIL for tens of seconds on a busy window, which would freeze the event loop and
@@ -581,6 +613,52 @@ class AmbientServer:
         while True:
             await asyncio.sleep(self._cfg.health_interval_s)
             self._write_health()
+            self._maybe_recover()
+
+    def _maybe_recover(self) -> None:
+        """Device auto-recovery watchdog (runs at the health cadence). While the device is connected,
+        refresh the persisted last-seen ts; once it's been GONE past the threshold (and was recently
+        present), schedule a one-shot reboot. Restart-safe: the wedge signal is the persisted last-seen,
+        NOT conn_stats' in-process dark timer (which is None after a restart)."""
+        rec = self._recovery
+        if rec is None:
+            return
+        if self._active > 0:
+            rec.mark_seen()
+            return
+        if self._reboot_inflight:
+            return
+        if rec.should_reboot(active=self._active,
+                             dark_threshold_s=self._cfg.recovery_no_conn_threshold_s,
+                             seen_window_s=self._cfg.recovery_seen_window_s):
+            self._reboot_inflight = True
+            tracked_task(self._do_device_reboot(), name="ambient-recovery-reboot")
+
+    async def _do_device_reboot(self) -> None:
+        """Press the device's Restart button. Records the ATTEMPT (so cooldown/cap count failures too),
+        logs the outcome, and WARNs loudly if the rolling-window cap is now reached (a human should look).
+        Best-effort — reboot_device never raises; the inflight flag is always cleared."""
+        rec = self._recovery  # always set: _maybe_recover only schedules this when armed
+        cfg = self._cfg
+        try:
+            dark = rec.dark_for()
+            rec.record_reboot()
+            logger.warning("RECOVERY: device dark %.0fs (> %.0fs) — rebooting %s",
+                           dark or 0.0, cfg.recovery_no_conn_threshold_s, cfg.recovery_device_ip)
+            ok = await reboot_device(
+                cfg.recovery_device_ip, cfg.recovery_device_port, self._recovery_psk,
+                button_name=cfg.recovery_button_name, timeout_s=cfg.recovery_reboot_timeout_s)
+            if ok:
+                logger.warning("RECOVERY: reboot press sent to %s — awaiting reconnect",
+                               cfg.recovery_device_ip)
+            else:
+                logger.error("RECOVERY: reboot FAILED for %s (see prior log)", cfg.recovery_device_ip)
+            if rec.at_cap():
+                logger.error("RECOVERY: reboot cap reached (%d in %.0fs) — HALTING auto-reboot until the "
+                             "window rolls; investigate the device", cfg.recovery_max_reboots_per_window,
+                             cfg.recovery_reboot_window_s)
+        finally:
+            self._reboot_inflight = False
 
     async def _purge_loop(self) -> None:
         while True:
