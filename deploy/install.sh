@@ -40,7 +40,9 @@ install_ambient() {
   local venv="$HOME/ambient-venv"
   python3 -m venv "$venv"
   "$venv/bin/pip" install --upgrade pip
-  "$venv/bin/pip" install sherpa-onnx onnxruntime soxr soundfile websockets numpy
+  # aiohttp: HTTP control endpoint (/mode,/marker). aioesphomeapi: device auto-recovery reboots a
+  # wedged Voice PE via the ESPHome native API.
+  "$venv/bin/pip" install sherpa-onnx onnxruntime soxr soundfile websockets numpy aiohttp aioesphomeapi
   cp "$REPO_ROOT/deploy/systemd/ambient-bridge.service" "$SYSTEMD_USER_DIR/"
   echo "   downloading models into ~/models ..."
   mkdir -p "$HOME/models"
