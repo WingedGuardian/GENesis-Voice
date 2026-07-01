@@ -100,13 +100,18 @@ interviews.
 # with the server running:
 ~/ambient-venv/bin/python -m ambient_bridge.feeder --wav ~/sample60.wav
 sqlite3 ~/ambient.db "SELECT ts, duration_s, text FROM ambient_transcripts ORDER BY id DESC LIMIT 5;"
-cat ~/ambient_health.json   # alive, utterances_total, db rows
+cat ~/ambient_health.json   # alive, utterances_total, db rows, rss_parent_mb / rss_diar_child_mb
 ```
 
 ## Config (env, see `config.py`)
 `AMBIENT_WS_PORT` (8765) · `AMBIENT_INPUT_SR` (24000; set 16000 if the ambient firmware
 sends raw 16k) · `AMBIENT_VAD_MIN_SILENCE` (0.4) · `AMBIENT_TTL_HOURS` (48) ·
 `AMBIENT_ROW_CEILING` (200000) · `AMBIENT_*` model paths.
+
+Memory: the systemd unit bakes in `MALLOC_ARENA_MAX=2` to bound glibc arena fragmentation from the
+sherpa/onnxruntime thread pool + the diar spawn child (RSS otherwise creeps ~200 MB/hr for days).
+The health JSON carries `rss_parent_mb`, `rss_diar_child_mb` (the diar child), and `rss_total_mb`
+so this stays watchable — a slow climb across restarts means the cap regressed.
 
 Diarization: `AMBIENT_DIAR_ENABLED` (1) · `AMBIENT_DIAR_THRESHOLD` (0.7; higher = fewer
 clusters) · `AMBIENT_DIAR_WINDOW_S` (60) · `AMBIENT_DIAR_QUEUE_MAX` (4) ·
