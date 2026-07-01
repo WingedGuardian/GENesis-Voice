@@ -76,6 +76,12 @@ class AmbientConfig:
     # --- health / observability ---
     health_path: str = field(default_factory=lambda: _env("AMBIENT_HEALTH", os.path.expanduser("~/ambient_health.json")))
     health_interval_s: int = field(default_factory=lambda: int(_env("AMBIENT_HEALTH_INTERVAL_S", "60")))
+    # --- diagnostic instrumentation (AMBIENT_INSTRUMENT=1; OFF by default; observability-only) ---
+    # Localises the WS pong-timeout churn: an event-loop-lag monitor + per-phase diar-worker timing
+    # reveal whether a >10s loop stall during heavy multi-speaker diarization is delaying the
+    # websockets auto-PONG past the device's 10s pong-timeout. Byte-identical behaviour when off.
+    instrument: bool = field(default_factory=lambda: _env_bool("AMBIENT_INSTRUMENT", False))
+    instrument_lag_warn_s: float = field(default_factory=lambda: float(_env("AMBIENT_INSTRUMENT_LAG_WARN_S", "0.5")))
     # --- connection telemetry (records device connect/disconnect to quantify the ambient WS wedge) ---
     conn_events_path: str = field(default_factory=lambda: _env("AMBIENT_CONN_EVENTS", os.path.expanduser("~/ambient_connection_events.jsonl")))
     conn_stats_path: str = field(default_factory=lambda: _env("AMBIENT_CONN_STATS", os.path.expanduser("~/ambient_connection_stats.json")))

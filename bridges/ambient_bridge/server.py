@@ -14,10 +14,14 @@ import asyncio
 import contextlib
 import json
 import logging
+import multiprocessing as mp
 import os
 import signal
 import socket
 import threading
+import time
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -25,10 +29,11 @@ import numpy as np
 import websockets
 from aiohttp import web
 
+from . import diar_subprocess
 from .active_session import ActiveSession
 from .config import AmbientConfig, load_config
 from .connection_stats import ConnectionStats
-from .pipeline import AmbientEngine, DiarizationEngine, DiarWindow, _autodetect_embedding
+from .pipeline import AmbientEngine, DiarWindow, _autodetect_embedding
 from .speaker_id import SpeakerIDRegistry
 from .store import AmbientStore
 
@@ -96,35 +101,38 @@ class AmbientServer:
         self._active = 0
         self._utterances_total = 0
         self._last_connection_ts: str | None = None  # last client connect (for the health monitor)
+        self._max_loop_lag_s = 0.0  # diagnostic: peak event-loop scheduling lag (AMBIENT_INSTRUMENT)
         # Connection telemetry — records device connect/disconnect + dark gaps (the wedge signal),
         # persists across bridge restarts, surfaces in ambient_health.json.
         self._conn_stats = ConnectionStats(
             events_path=cfg.conn_events_path, stats_path=cfg.conn_stats_path,
             dark_threshold_s=cfg.conn_dark_threshold_s, events_max=cfg.conn_events_max)
         # --- diarization (deferred, additive; capture works fine without it) ---
-        self._diar: DiarizationEngine | None = None
+        # The diarization ONNX runs in a SEPARATE PROCESS (see diar_subprocess): sherpa's process()
+        # holds the GIL for tens of seconds on a busy window, which would freeze the event loop and
+        # trip the device's WS pong-timeout. The pool is created in run() (inside the loop); here we
+        # only record intent + wire the window producer. The PARENT never loads the diar models.
+        self._diar_enabled = False
+        self._diar_pool: ProcessPoolExecutor | None = None
         self._diar_queue: asyncio.Queue[DiarWindow] | None = None
         self._window_counter = 0
         self._diar_dropped = 0
+        self._diar_pool_failures = 0  # consecutive subprocess crashes (cap → disable diar, no loop)
         self._diar_worker_alive = False
         if cfg.diar_enabled:
-            try:
-                self._diar = DiarizationEngine(cfg)
-                self._engine.enable_diarization(
-                    self.submit_window, int(cfg.diar_window_s * cfg.model_sample_rate),
-                )
-                if cfg.diar_num_threads + cfg.num_threads > (os.cpu_count() or 4):
-                    logger.warning("diar_num_threads(%d) + num_threads(%d) > cpu_count(%s) — "
-                                   "STT may contend with diarization under load",
-                                   cfg.diar_num_threads, cfg.num_threads, os.cpu_count())
-            except Exception:
-                logger.warning("Diarization init failed — running capture-only "
-                               "(speaker_label stays NULL)", exc_info=True)
-                self._diar = None
-        # --- speaker identification (Stage-A, additive) — needs the diar worker (cluster
-        # aggregation runs there). No registry / no enrolled voiceprint → is_user stays NULL. ---
+            self._engine.enable_diarization(
+                self.submit_window, int(cfg.diar_window_s * cfg.model_sample_rate),
+            )
+            self._diar_enabled = True
+            if cfg.diar_num_threads + cfg.num_threads > (os.cpu_count() or 4):
+                logger.warning("diar_num_threads(%d) + num_threads(%d) > cpu_count(%s) — diar "
+                               "(separate process) may contend with STT for cores under load",
+                               cfg.diar_num_threads, cfg.num_threads, os.cpu_count())
+        # --- speaker identification (Stage-A, additive) — the PARENT keeps the voiceprint registry
+        # (cheap classify here + active-mode + online-enroll); the heavy per-utterance EMBEDDING runs
+        # in the diar subprocess. No registry / no enrolled voiceprint → is_user stays NULL. ---
         self._speaker_id: SpeakerIDRegistry | None = None
-        if cfg.speaker_id_enabled and self._diar is not None:
+        if cfg.speaker_id_enabled and self._diar_enabled:
             try:
                 model = cfg.speaker_id_model or _autodetect_embedding(cfg.models_dir)
                 # Instantiate the registry even with NO voiceprint yet, so online enrollment
@@ -203,36 +211,31 @@ class AmbientServer:
         logger.info("diar w%d: %d speaker(s), labeled %d/%d utts",
                     window.window_idx, total, labeled, len(window.spans))
 
-    def _verify_speaker_identities(self, window: DiarWindow,
-                                   segs: list[tuple[float, float, int]]) -> None:
-        """Tag each utterance with its speaker identity via speaker-ID. Runs in the diar worker
-        thread (OFF the ingest path). Embeds each utterance from ``window.raw``; a DIRECT verdict
-        for utts >= min_embed_s, and the shorter utts inherit their diar cluster's centroid verdict
-        (recovery). Writes ``speaker_name`` (best-matching enrolled name, NULL if no match) +
-        ``is_user`` (speaker_name == the user). No-op if speaker-id is off or NO voiceprint is
-        enrolled yet (``has_user`` false → verdicts stay NULL; capture is unaffected)."""
+    def _finish_window(self, window: DiarWindow, segs: list[tuple[float, float, int]],
+                       embeddings: list | None) -> None:
+        """Parent-side post-processing for a diarized window (runs in a worker thread; cheap — NO
+        ONNX). Writes the diar ``speaker_label`` (``_assign_labels``), then — if speaker-ID is on and
+        the child computed embeddings — classifies them against the enrolled voiceprints
+        (``classify_window`` is pure cosine, no model) and writes ``speaker_name``/``is_user``. ALL
+        store writes happen here in the parent (single writer); the GIL-heavy diarization + embedding
+        already ran in the subprocess. No-op classify if speaker-id off / no voiceprint / no embeddings."""
+        self._assign_labels(window, segs)
         reg = self._speaker_id
-        if reg is None or not reg.has_user() or not window.spans:
+        if reg is None or not reg.has_user() or embeddings is None or not window.spans:
             return
-        sr = self._cfg.model_sample_rate
-        raw = window.raw
-        embeddings, durations, clusters, row_ids = [], [], [], []
-        for row_id, start_s, end_s in window.spans:
-            embeddings.append(reg.embed(raw[int(start_s * sr):int(end_s * sr)]))
-            durations.append(end_s - start_s)
-            clusters.append(self._overlap_cluster(start_s, end_s, segs))
-            row_ids.append(row_id)
+        durations = [end_s - start_s for (_rid, start_s, end_s) in window.spans]
+        clusters = [self._overlap_cluster(start_s, end_s, segs) for (_rid, start_s, end_s) in window.spans]
         verdicts = reg.classify_window(
             embeddings, durations, clusters,
             threshold=self._cfg.user_verify_threshold, min_embed_s=self._cfg.min_embed_s,
         )
         n_user = 0
-        for row_id, (speaker_name, is_user, method) in zip(row_ids, verdicts):
+        for (row_id, _start, _end), (speaker_name, is_user, method) in zip(window.spans, verdicts):
             if is_user is None:
                 continue
             self._store.set_identity(row_id, speaker_name=speaker_name, is_user=is_user, method=method)
             n_user += int(is_user)
-        logger.info("speaker-id w%d: %d/%d utts → user", window.window_idx, n_user, len(row_ids))
+        logger.info("speaker-id w%d: %d/%d utts → user", window.window_idx, n_user, len(window.spans))
 
     # --- online enrollment (no-teardown) --------------------------------------
 
@@ -341,15 +344,50 @@ class AmbientServer:
 
     async def _diar_worker(self) -> None:
         # Liveness flag is set at task-creation in run() (so the startup health snapshot reads
-        # accurately); the finally-block below clears it on exit.
+        # accurately); the finally-block below clears it on exit. The HEAVY work (diar.process +
+        # per-utterance embedding) runs in a SEPARATE PROCESS so it can't freeze the event loop;
+        # the cheap label/classify/store writes run here in the parent.
+        loop = asyncio.get_running_loop()
         try:
             while True:
                 window = await self._diar_queue.get()
                 try:
-                    segs = await asyncio.to_thread(self._diar.process, window.raw)
-                    await asyncio.to_thread(self._assign_labels, window, segs)
-                    if self._speaker_id is not None:
-                        await asyncio.to_thread(self._verify_speaker_identities, window, segs)
+                    if self._diar_pool is None:
+                        continue  # pool unavailable (init/recreate failed) — labels stay NULL
+                    do_spk = self._speaker_id is not None and self._speaker_id.has_user()
+                    t0 = loop.time()
+                    segs, embeddings = await loop.run_in_executor(
+                        self._diar_pool, diar_subprocess.process_window,
+                        window.raw, window.spans, self._cfg.model_sample_rate, do_spk,
+                    )
+                    t1 = loop.time()
+                    await asyncio.to_thread(self._finish_window, window, segs, embeddings)
+                    t2 = loop.time()
+                    self._diar_pool_failures = 0  # a clean window resets the crash counter
+                    if self._cfg.instrument:
+                        # child = the GIL-heavy work, now OFF the loop's process; parent = cheap
+                        # writes. POST-FIX the loop-lag monitor should stay ~0 even while child is big.
+                        n_spk = len({spk for _, _, spk in segs}) if segs else 0
+                        logger.warning(
+                            "INSTRUMENT diar w%d: child(process+embed)=%.2fs parent(label+store)=%.2fs "
+                            "(%d spk, %d utts, %.1fs audio)",
+                            window.window_idx, t1 - t0, t2 - t1, n_spk, len(window.spans),
+                            len(window.raw) / self._cfg.model_sample_rate)
+                except BrokenProcessPool as exc:
+                    self._diar_pool_failures += 1
+                    if self._diar_pool_failures > 3:
+                        # Persistent child-init failure (e.g. a missing model) — stop the
+                        # recreate-crash loop and degrade to capture-only.
+                        logger.error("diar subprocess failed %d× consecutively — disabling diar "
+                                     "(capture-only); last: %r", self._diar_pool_failures, exc)
+                        old, self._diar_pool, self._diar_enabled = self._diar_pool, None, False
+                        if old is not None:
+                            with contextlib.suppress(Exception):
+                                old.shutdown(wait=False, cancel_futures=True)
+                    else:
+                        logger.error("diar subprocess died for w%d (%r) — recreating pool (#%d); "
+                                     "labels NULL", window.window_idx, exc, self._diar_pool_failures)
+                        self._recreate_diar_pool()
                 except Exception:
                     logger.error("diar failed for window w%d (%d utts) — labels stay NULL",
                                  window.window_idx, len(window.spans), exc_info=True)
@@ -357,6 +395,45 @@ class AmbientServer:
                     self._diar_queue.task_done()
         finally:
             self._diar_worker_alive = False
+
+    def _make_diar_pool(self) -> ProcessPoolExecutor:
+        """A ProcessPoolExecutor (spawn) whose single worker loads the diarization engine + an
+        embedder (diar_subprocess.init_worker). spawn — NOT fork — avoids onnxruntime/sherpa
+        deadlocks from forking a process that already loaded native threads; the child reads config
+        from the inherited environment."""
+        return ProcessPoolExecutor(
+            max_workers=1, mp_context=mp.get_context("spawn"),
+            initializer=diar_subprocess.init_worker,
+        )
+
+    def _recreate_diar_pool(self) -> None:
+        """Replace a broken diar pool (child crashed/OOM) so the next window can be processed.
+        Best-effort: on failure diar goes off (labels stay NULL) but capture is unaffected."""
+        old, self._diar_pool = self._diar_pool, None
+        if old is not None:
+            with contextlib.suppress(Exception):
+                old.shutdown(wait=False, cancel_futures=True)
+        try:
+            self._diar_pool = self._make_diar_pool()
+        except Exception:
+            logger.error("diar pool re-init failed — capture continues, labels NULL", exc_info=True)
+
+    async def _loop_lag_monitor(self) -> None:
+        """Diagnostic (AMBIENT_INSTRUMENT): sample event-loop scheduling lag every 100ms. A spike
+        means a coroutine or a worker-thread C call (holding the GIL) monopolised the loop — which
+        delays the websockets auto-PONG and trips the device's 10s pong-timeout. Each spike >
+        instrument_lag_warn_s is logged with a wall-clock stamp so it can be correlated against the
+        diar-worker phase logs and the 1006 closes. Started only when instrument is on."""
+        loop = asyncio.get_running_loop()
+        interval = 0.1
+        while True:
+            t0 = loop.time()
+            await asyncio.sleep(interval)
+            lag = loop.time() - t0 - interval
+            if lag > self._max_loop_lag_s:
+                self._max_loop_lag_s = lag
+            if lag > self._cfg.instrument_lag_warn_s:
+                logger.warning("INSTRUMENT loop-lag %.2fs (loop stalled — WS PONG delayed)", lag)
 
     # --- connection handling --------------------------------------------------
 
@@ -465,7 +542,16 @@ class AmbientServer:
     def _write_health(self) -> None:
         try:
             self._conn_stats.tick()  # count an ongoing dark period once it crosses the threshold
-            stats = self._store.stats()
+            if self._cfg.instrument:
+                # store.stats() runs a SQLite query ON the event loop — time it to rule the on-loop
+                # DB path in/out as a pong-stall contributor (vs the diar worker).
+                _t = time.monotonic()
+                stats = self._store.stats()
+                _dt = time.monotonic() - _t
+                if _dt > 0.2:
+                    logger.warning("INSTRUMENT store.stats() blocked the loop %.2fs", _dt)
+            else:
+                stats = self._store.stats()
             payload = {
                 "ts": datetime.now(UTC).isoformat(),
                 "alive": True,
@@ -473,12 +559,14 @@ class AmbientServer:
                 "active_connections": self._active,
                 "last_connection_ts": self._last_connection_ts,
                 "utterances_total": self._utterances_total,
-                "diar_enabled": self._diar is not None,
+                "diar_enabled": self._diar_enabled,
                 "diar_worker_alive": self._diar_worker_alive,
                 "diar_queue_depth": self._diar_queue.qsize() if self._diar_queue else 0,
                 "diar_windows_dropped": self._diar_dropped,
                 "speaker_id_enabled": self._speaker_id is not None,
                 "enrolling": self._enroll.name if self._enroll else None,
+                # Surfaced only under instrumentation, so the default health JSON is unchanged.
+                **({"max_loop_lag_s": round(self._max_loop_lag_s, 3)} if self._cfg.instrument else {}),
                 **self._conn_stats.snapshot(),
                 **stats,
             }
@@ -518,7 +606,18 @@ class AmbientServer:
             tracked_task(self._health_loop(), name="ambient-health"),
             tracked_task(self._purge_loop(), name="ambient-purge"),
         ]
-        if self._diar is not None:
+        if self._cfg.instrument:
+            tasks.append(tracked_task(self._loop_lag_monitor(), name="ambient-loop-lag"))
+            logger.warning("INSTRUMENT mode ON — event-loop-lag monitor + diar-phase timing active")
+        if self._diar_enabled:
+            # Spawn the diar subprocess pool inside the loop (its first task incurs spawn + model
+            # load). If it can't be created, degrade to capture-only rather than crash.
+            try:
+                self._diar_pool = self._make_diar_pool()
+            except Exception:
+                logger.warning("diar pool init failed — running capture-only (labels NULL)", exc_info=True)
+                self._diar_enabled = False
+        if self._diar_enabled:
             # Create the queue inside the running loop, before any connection can submit.
             self._diar_queue = asyncio.Queue(maxsize=self._cfg.diar_queue_max)
             # Mark alive at task creation so the startup health snapshot isn't spuriously
@@ -531,7 +630,7 @@ class AmbientServer:
         # First health write AFTER tasks are wired, so the snapshot reflects real state.
         self._write_health()
         logger.info("Ambient bridge listening on ws://%s:%d/ (input_sr=%d → 16k, diar=%s)",
-                    self._cfg.host, self._cfg.port, self._cfg.input_sample_rate, self._diar is not None)
+                    self._cfg.host, self._cfg.port, self._cfg.input_sample_rate, self._diar_enabled)
         # Graceful stop on SIGINT (Ctrl-C) AND SIGTERM (systemd stop/restart).
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -571,15 +670,18 @@ class AmbientServer:
             # window) before tearing down the store + background tasks.
             if self._handler_tasks:
                 await asyncio.wait(self._handler_tasks, timeout=10.0)
-            # Drain queued diar windows so their labels land (the worker is still
-            # running here). Bounded by ~queue_max windows of diar time; the timeout
-            # keeps shutdown well under systemd's default stop window.
+            # Drain queued diar windows so their labels land (the worker is still running here).
+            # Bounded by the timeout — an in-flight SUBPROCESS window that outlasts it is abandoned
+            # (its labels stay NULL; the child finishes independently and exits). Keeps shutdown well
+            # under systemd's default stop window.
             if self._diar_queue is not None:
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self._diar_queue.join(), timeout=30.0)
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if self._diar_pool is not None:
+                self._diar_pool.shutdown(wait=False, cancel_futures=True)
             self._store.close()
             logger.info("Ambient bridge stopped; store closed.")
 

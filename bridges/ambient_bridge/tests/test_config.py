@@ -69,3 +69,21 @@ def test_active_speaker_id_defaults(monkeypatch):
 def test_active_user_display_env_override(monkeypatch):
     monkeypatch.setenv("AMBIENT_ACTIVE_USER_DISPLAY", "Jay")
     assert AmbientConfig().active_user_display_name == "Jay"
+
+
+def test_instrument_defaults_off(monkeypatch):
+    # The diagnostic instrumentation is OFF unless AMBIENT_INSTRUMENT is set, so the default
+    # deploy path is byte-identical (no loop-lag monitor task, no per-phase diar logging).
+    for k in ("AMBIENT_INSTRUMENT", "AMBIENT_INSTRUMENT_LAG_WARN_S"):
+        monkeypatch.delenv(k, raising=False)
+    c = AmbientConfig()
+    assert c.instrument is False
+    assert c.instrument_lag_warn_s == 0.5
+
+
+def test_instrument_env_on(monkeypatch):
+    monkeypatch.setenv("AMBIENT_INSTRUMENT", "1")
+    monkeypatch.setenv("AMBIENT_INSTRUMENT_LAG_WARN_S", "1.5")
+    c = AmbientConfig()
+    assert c.instrument is True
+    assert c.instrument_lag_warn_s == 1.5
