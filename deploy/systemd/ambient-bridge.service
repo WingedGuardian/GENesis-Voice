@@ -13,6 +13,11 @@ ExecStart=%h/ambient-venv/bin/python -m ambient_bridge.server
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+# Cap glibc malloc arenas. sherpa/onnxruntime allocate large, variable per-inference buffers on
+# the to_thread STT pool (and the diar spawn child, which inherits this env); glibc gives each
+# pool thread its own arena and fragmented blocks never return to the OS, so RSS creeps for days.
+# Capping to 2 arenas bounds it (validated on-edge: RSS plateaus vs an unbounded ~200 MB/hr climb).
+Environment=MALLOC_ARENA_MAX=2
 # Override model paths / tuning here if non-default, e.g.:
 # Environment=AMBIENT_INPUT_SR=24000
 # Environment=AMBIENT_VAD_MIN_SILENCE=0.4
