@@ -63,6 +63,21 @@ def _enable_tcp_keepalive(sock, cfg: AmbientConfig) -> None:
         logger.warning("could not set TCP keep-alive on client socket: %s", exc)
 
 
+_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")  # bytes/page — constant for the process; resolve at import (fail loud), not per health tick
+
+
+def _rss_mb(pid: int) -> float | None:
+    """Resident set size (MB) of a process via ``/proc/<pid>/statm`` — Linux, no psutil dep.
+    Field 2 is the resident page count; × the page size → bytes. Returns None if the pid is
+    gone or /proc is unreadable (best-effort: the health writer must never fail on this)."""
+    try:
+        with open(f"/proc/{pid}/statm") as f:
+            resident_pages = int(f.read().split()[1])
+        return round(resident_pages * _PAGE_SIZE / (1024 * 1024), 1)
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 @dataclass
 class _EnrollSession:
     """In-flight online-enrollment state. `samples` is appended by the pipeline worker
@@ -571,6 +586,39 @@ class AmbientServer:
 
     # --- health + purge -------------------------------------------------------
 
+    def _memory_snapshot(self) -> dict:
+        """Parent + diar-child RSS (MB) for the health JSON, so the ``MALLOC_ARENA_MAX=2`` leak
+        fix stays watchable in production. Post subprocess-isolation the diar work runs in a
+        separate spawn CHILD, so its footprint is invisible to the parent's own RSS — read both.
+        The child pid(s) come from the executor's private ``_processes`` map (a ``{pid: Process}``
+        dict) which — unlike a /proc ppid scan — naturally excludes the spawn resource_tracker
+        sibling. Best-effort: any failure leaves a key None and never breaks the health write."""
+        rss_parent = _rss_mb(os.getpid())
+        rss_child: float | None = None
+        pool = self._diar_pool
+        if pool is not None:
+            try:
+                # The executor's manager thread can mutate _processes; snapshot keys under guard.
+                pids = list(getattr(pool, "_processes", {}) or {})
+                vals = [v for v in (_rss_mb(p) for p in pids) if v is not None]
+                rss_child = round(sum(vals), 1) if vals else None
+            except Exception:  # noqa: BLE001
+                rss_child = None
+        total = (
+            round(
+                (rss_parent if rss_parent is not None else 0)
+                + (rss_child if rss_child is not None else 0),
+                1,
+            )
+            if (rss_parent is not None or rss_child is not None)
+            else None
+        )
+        return {
+            "rss_parent_mb": rss_parent,
+            "rss_diar_child_mb": rss_child,
+            "rss_total_mb": total,
+        }
+
     def _write_health(self) -> None:
         try:
             self._conn_stats.tick()  # count an ongoing dark period once it crosses the threshold
@@ -597,7 +645,9 @@ class AmbientServer:
                 "diar_windows_dropped": self._diar_dropped,
                 "speaker_id_enabled": self._speaker_id is not None,
                 "enrolling": self._enroll.name if self._enroll else None,
-                # Surfaced only under instrumentation, so the default health JSON is unchanged.
+                # Parent + diar-child RSS, ALWAYS on, so the MALLOC_ARENA_MAX=2 leak fix stays watchable.
+                **self._memory_snapshot(),
+                # max_loop_lag_s: surfaced ONLY under instrumentation, so the default JSON is unchanged.
                 **({"max_loop_lag_s": round(self._max_loop_lag_s, 3)} if self._cfg.instrument else {}),
                 **self._conn_stats.snapshot(),
                 **stats,
