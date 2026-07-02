@@ -117,11 +117,15 @@ class NoiseGate(FrameProcessor):
             else:
                 if self._streak_started is None:
                     self._streak_started = now
-                if (now - self._streak_started >= self._bot_sustain_s
-                        or now < self._open_until):
-                    # Sustained crossing (or the gate is already open from one):
-                    # a real interruption — open/extend the hangover window.
+                if now - self._streak_started >= self._bot_sustain_s:
+                    # Sustained crossing — a real interruption: open/extend the window.
                     self._open_until = now + self._hangover_s
+                    passed = True
+                elif now < self._open_until:
+                    # The gate is already open from earlier SUSTAINED speech: an
+                    # unproven transient may ride the window but must NOT extend it —
+                    # otherwise isolated echo spikes arriving every <hangover keep the
+                    # gate open forever, recreating the failure this feature fixes.
                     passed = True
                 else:
                     # Unproven transient during bot speech — hold the gate closed.
@@ -221,13 +225,16 @@ class NoiseGate(FrameProcessor):
         self._max_peak_gated = 0
 
     def reset_instrumentation(self) -> None:
-        """Reset all diagnostic state for a fresh session.
+        """Reset per-session state — diagnostics AND the gating regime.
 
         Called on client reconnect: the NoiseGate instance is reused across
         connections, so without this the next session's first summary window
         would span the disconnect gap and its first barge-in could be throttled
-        by the previous session's log. Gating state (``_bot_speaking``,
-        ``_open_until``) is intentionally NOT touched here.
+        by the previous session's log. The gating REGIME must reset too: a
+        pipeline teardown mid-response means ``BotStoppedSpeakingFrame`` never
+        arrives, so ``_bot_speaking`` (and a live streak/hangover) would leak
+        into the new session — applying the higher threshold and sustain
+        requirement to a session where no bot audio is playing.
         """
         self._stats_window_start = None
         self._frames_passed = 0
@@ -235,6 +242,9 @@ class NoiseGate(FrameProcessor):
         self._max_peak_passed = 0
         self._max_peak_gated = 0
         self._last_bot_pass_log = 0.0
+        self._bot_speaking = False
+        self._streak_started = None
+        self._open_until = 0.0
 
     @staticmethod
     def _peak_amplitude(audio: bytes) -> int:

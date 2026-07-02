@@ -334,14 +334,18 @@ def test_hangover_pass_during_bot_speech_not_flagged(monkeypatch, caplog):
 def test_reset_instrumentation_starts_a_clean_window(monkeypatch, caplog):
     """``reset_instrumentation()`` (called on client reconnect) clears the
     throttle + counters so a fresh session's first barge-in always logs, even if
-    the previous session logged one moments earlier."""
+    the previous session logged one moments earlier. The reset also clears the
+    gating regime, so the new session's bot-speaking state is re-established by
+    its own BotStartedSpeakingFrame (sustain disabled: logging contract only)."""
     gate, _pushed, clock = _make_gate(
-        monkeypatch, open_threshold=500, bot_speaking_threshold=1500, log_interval_s=2.0
+        monkeypatch, open_threshold=500, bot_speaking_threshold=1500, log_interval_s=2.0,
+        bot_sustain_ms=0,
     )
     _run(gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM))
     _run(gate.process_frame(_audio_frame(peak=5000), FrameDirection.DOWNSTREAM))  # logs, sets throttle
 
     gate.reset_instrumentation()
+    _run(gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM))  # new session's bot
 
     with caplog.at_level(logging.INFO, logger="app.noise_gate"):
         clock["t"] = 1000.1  # only +0.1s — would be throttled WITHOUT the reset
@@ -475,3 +479,38 @@ def test_bot_transition_resets_streak(monkeypatch):
     _run(gate.process_frame(_audio_frame(peak=2000), FrameDirection.DOWNSTREAM))
 
     assert all(out.audio == b"\x00" * len(out.audio) for out, _d in pushed)
+
+
+def test_bot_speech_transients_do_not_extend_open_window(monkeypatch):
+    """Once sustained speech opened the gate, an isolated transient may RIDE the open
+    window but must not EXTEND it — else echo spikes every <hangover keep the gate open
+    forever, recreating the failure this feature fixes. Window expiry is measured from
+    the last SUSTAINED frame."""
+    gate, pushed, clock = _bot_speaking_gate(monkeypatch, bot_sustain_ms=100, hangover_ms=250)
+
+    for i in range(6):                                  # sustained speech 0..100ms
+        clock["t"] = 1000.0 + i * 0.02
+        _run(gate.process_frame(_audio_frame(peak=2000), FrameDirection.DOWNSTREAM))
+    # last sustained frame at 1000.10 → window open until 1000.35
+    clock["t"] = 1000.15                                # quiet: breaks the streak, rides
+    _run(gate.process_frame(_audio_frame(peak=100), FrameDirection.DOWNSTREAM))
+    clock["t"] = 1000.20                                # isolated transient: rides, NO extend
+    _run(gate.process_frame(_audio_frame(peak=2000), FrameDirection.DOWNSTREAM))
+    assert pushed[-1][0].audio != b"\x00" * len(pushed[-1][0].audio)
+    clock["t"] = 1000.40                                # past 1000.35 → closed again
+    _run(gate.process_frame(_audio_frame(peak=100), FrameDirection.DOWNSTREAM))
+    assert pushed[-1][0].audio == b"\x00" * len(pushed[-1][0].audio)
+
+
+def test_reset_instrumentation_resets_gating_regime(monkeypatch):
+    """A pipeline teardown mid-response never delivers BotStoppedSpeakingFrame — the
+    reconnect reset must clear _bot_speaking (and streak/hangover), or the new session
+    wrongly starts at the bot-speech threshold."""
+    gate, pushed, clock = _bot_speaking_gate(monkeypatch)   # bot speaking, from prior session
+    gate.reset_instrumentation()
+    pushed.clear()
+    clock["t"] = 1005.0
+    mid = _audio_frame(peak=1000)                       # above idle 500, below bot 1500
+    expected = mid.audio
+    _run(gate.process_frame(mid, FrameDirection.DOWNSTREAM))
+    assert pushed[0][0].audio == expected               # idle threshold applies → passes

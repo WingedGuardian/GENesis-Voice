@@ -249,17 +249,30 @@ class Application:
         self.instructions = fresh
         svc = self.openai_service
         if svc is not None:
-            try:
-                svc._settings.session_properties.instructions = fresh
-                svc._settings.system_instruction = fresh
-                logger.info("📜 Genesis prompt refreshed (%d chars) — live session updated", len(fresh))
-            except AttributeError:
-                # pipecat internals moved (upgrade?) — the new prompt still applies to
-                # any future service; say so loudly rather than silently serving stale.
-                logger.warning(
-                    "⚠️ Could not update the live session properties (pipecat internals "
-                    "changed?) — fresh prompt cached for the next service", exc_info=True,
-                )
+            # Mutate under the pipeline lock so the writes can't interleave with an
+            # in-flight reset_conversation (the 55-min rotation loop holds this lock
+            # for its whole reset).
+            if self._pipeline_lock is None:
+                self._pipeline_lock = asyncio.Lock()
+            async with self._pipeline_lock:
+                try:
+                    svc._settings.session_properties.instructions = fresh
+                    svc._settings.system_instruction = fresh
+                    # pipecat also tracks a _base_system_instruction for composing
+                    # addon instructions; left stale it would clobber the refresh if
+                    # an update-settings frame ever recomposes. None sent today —
+                    # this keeps the latent path consistent too.
+                    if hasattr(svc, "_base_system_instruction"):
+                        svc._base_system_instruction = fresh
+                    logger.info("📜 Genesis prompt refreshed (%d chars) — live session updated",
+                                len(fresh))
+                except AttributeError:
+                    # pipecat internals moved (upgrade?) — the new prompt still applies
+                    # to any future service; be loud rather than silently serving stale.
+                    logger.warning(
+                        "⚠️ Could not update the live session properties (pipecat internals "
+                        "changed?) — fresh prompt cached for the next service", exc_info=True,
+                    )
 
     async def _persist_transcript(self, messages: list) -> None:
         """Persist a voice transcript out-of-band so it never blocks teardown.
