@@ -87,3 +87,28 @@ def test_instrument_env_on(monkeypatch):
     c = AmbientConfig()
     assert c.instrument is True
     assert c.instrument_lag_warn_s == 1.5
+
+
+def test_decode_method_defaults(monkeypatch):
+    # clean env → modified_beam_search with max_active_paths=4 (new default)
+    for k in ("AMBIENT_DECODING_METHOD", "AMBIENT_MAX_ACTIVE_PATHS"):
+        monkeypatch.delenv(k, raising=False)
+    c = AmbientConfig()
+    assert c.decoding_method == "modified_beam_search"
+    assert c.max_active_paths == 4
+
+
+def test_decode_method_env_override(monkeypatch):
+    monkeypatch.setenv("AMBIENT_DECODING_METHOD", "greedy_search")
+    monkeypatch.setenv("AMBIENT_MAX_ACTIVE_PATHS", "8")
+    c = AmbientConfig()
+    assert c.decoding_method == "greedy_search"
+    assert c.max_active_paths == 8
+
+
+def test_max_active_paths_floored_to_one(monkeypatch):
+    # a 0/negative beam width is undefined in sherpa → clamp to a valid minimum (never break capture)
+    monkeypatch.setenv("AMBIENT_MAX_ACTIVE_PATHS", "0")
+    assert AmbientConfig().max_active_paths == 1
+    monkeypatch.setenv("AMBIENT_MAX_ACTIVE_PATHS", "-3")
+    assert AmbientConfig().max_active_paths == 1

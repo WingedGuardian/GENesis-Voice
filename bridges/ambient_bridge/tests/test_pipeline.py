@@ -8,6 +8,7 @@ conftest, so this imports and runs off-edge / in CI.
 import numpy as np
 
 from ambient_bridge import pipeline
+from ambient_bridge.config import AmbientConfig
 
 
 class _FakeResult:
@@ -72,3 +73,38 @@ def test_audio_feats_single_sample_omits_zcr():
 def test_audio_feats_guard_never_raises_on_bad_input():
     # A non-numeric input forces np.asarray(..., float32) to raise → guard returns {}.
     assert pipeline._audio_feats("not an array") == {}
+
+
+def _patch_recognizer(monkeypatch):
+    """Capture kwargs handed to the (stubbed) sherpa recognizer factory; avoid real model files."""
+    captured = {}
+
+    class _FakeRecognizer:
+        @staticmethod
+        def from_transducer(**kwargs):
+            captured.update(kwargs)
+            return object()
+
+    monkeypatch.setattr(pipeline.sherpa_onnx, "OfflineRecognizer", _FakeRecognizer, raising=False)
+    monkeypatch.setattr(pipeline, "_pick", lambda d, kind: f"{d}/{kind}.onnx")
+    return captured
+
+
+def test_engine_passes_decode_config_to_recognizer(monkeypatch):
+    # default → modified_beam_search with max_active_paths=4 flows into from_transducer
+    for k in ("AMBIENT_DECODING_METHOD", "AMBIENT_MAX_ACTIVE_PATHS"):
+        monkeypatch.delenv(k, raising=False)
+    captured = _patch_recognizer(monkeypatch)
+    pipeline.AmbientEngine(AmbientConfig(), store=object())
+    assert captured["decoding_method"] == "modified_beam_search"
+    assert captured["max_active_paths"] == 4
+
+
+def test_engine_decode_method_env_override(monkeypatch):
+    # env can pin greedy_search (instant rollback) without a code change
+    monkeypatch.setenv("AMBIENT_DECODING_METHOD", "greedy_search")
+    monkeypatch.setenv("AMBIENT_MAX_ACTIVE_PATHS", "8")
+    captured = _patch_recognizer(monkeypatch)
+    pipeline.AmbientEngine(AmbientConfig(), store=object())
+    assert captured["decoding_method"] == "greedy_search"
+    assert captured["max_active_paths"] == 8

@@ -108,6 +108,10 @@ cat ~/ambient_health.json   # alive, utterances_total, db rows, rss_parent_mb / 
 sends raw 16k) · `AMBIENT_VAD_MIN_SILENCE` (0.4) · `AMBIENT_TTL_HOURS` (48) ·
 `AMBIENT_ROW_CEILING` (200000) · `AMBIENT_*` model paths.
 
+ASR decode: `AMBIENT_DECODING_METHOD` (`modified_beam_search`; set `greedy_search` to roll back —
+beam modestly improves clean-but-hard speech at ~1.3x latency, RTF ~0.08) · `AMBIENT_MAX_ACTIVE_PATHS`
+(4; beam width, floored to ≥1; ignored by greedy).
+
 Memory: the systemd unit bakes in `MALLOC_ARENA_MAX=2` to bound glibc arena fragmentation from the
 sherpa/onnxruntime thread pool + the diar spawn child (RSS otherwise creeps ~200 MB/hr for days).
 The health JSON carries `rss_parent_mb`, `rss_diar_child_mb` (the diar child), and `rss_total_mb`
