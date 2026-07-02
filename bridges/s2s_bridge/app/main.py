@@ -37,6 +37,11 @@ logging.getLogger("__main__").setLevel(logging.INFO)
 
 dotenv.load_dotenv()
 
+# Bound on the per-session Genesis prompt re-fetch: a hung Genesis must not add dead
+# air to voice session start. Normal fetches are ~100ms (LAN); on timeout/failure the
+# session proceeds with the cached prompt (a stale date beats a delayed answer).
+_PROMPT_REFRESH_TIMEOUT_S = 3.0
+
 
 class Application:
     """Main application class using Pipecat."""
@@ -103,6 +108,13 @@ class Application:
             os.environ.get("NOISE_GATE_BOT_SPEAKING_THRESHOLD", "1500")
         )
         noise_gate_hangover_ms = float(os.environ.get("NOISE_GATE_HANGOVER_MS", "250"))
+        # Onset guard: mute ALL mic input for this long after the bot starts speaking.
+        # The bot's own onset echo used to trip OpenAI's VAD and cut the bot off ~0.5s
+        # in (observed live; the cutoffs cascade). Echo and real barge-in overlap in
+        # amplitude, so only a time-based guard separates them. 0 disables the guard.
+        noise_gate_bot_onset_guard_ms = float(
+            os.environ.get("NOISE_GATE_BOT_ONSET_GUARD_MS", "1500")
+        )
         # Diagnostic logging cadence for the noise gate (sampled). 0 = off
         # (post-calibration quiet switch).
         noise_gate_log_interval_s = float(
@@ -115,11 +127,12 @@ class Application:
             os.environ.get("MAX_PENDING_ACTIVE_SECONDS", "180")
         )
         logger.info(
-            "Noise gate: open=%d, bot_speaking=%d, hangover=%.0fms, "
+            "Noise gate: open=%d, bot_speaking=%d, hangover=%.0fms, onset_guard=%.0fms, "
             "log_interval=%.1fs; idle_timeout=%.0fs; max_pending_active=%.0fs",
             noise_gate_open_threshold,
             noise_gate_bot_speaking_threshold,
             noise_gate_hangover_ms,
+            noise_gate_bot_onset_guard_ms,
             noise_gate_log_interval_s,
             idle_timeout_seconds,
             max_pending_active_seconds,
@@ -172,6 +185,7 @@ class Application:
             noise_gate_open_threshold=noise_gate_open_threshold,
             noise_gate_bot_speaking_threshold=noise_gate_bot_speaking_threshold,
             noise_gate_hangover_ms=noise_gate_hangover_ms,
+            noise_gate_bot_onset_guard_ms=noise_gate_bot_onset_guard_ms,
             noise_gate_log_interval_s=noise_gate_log_interval_s,
             idle_timeout_seconds=idle_timeout_seconds,
             max_pending_active_seconds=max_pending_active_seconds,
@@ -207,6 +221,60 @@ class Application:
     def _update_session_activity(self):
         """Update session activity timestamp (called by SessionActivityTracker)."""
         pass
+
+    async def _refresh_instructions(self) -> None:
+        """Re-fetch the Genesis system prompt at SESSION START (bounded, best-effort).
+
+        The prompt was previously fetched ONCE at process init and cached for the life
+        of the bridge — a 6-day-old process greeted callers with "Today is Thursday,
+        June 25, 2026" (its start date; Genesis renders the date per request, the bridge
+        froze it). The pipeline holds the OpenAI service object forever, so a fresh
+        prompt must be pushed into the LIVE service's settings: ``_send_session_update``
+        reads BOTH ``_settings.session_properties`` and ``_settings.system_instruction``
+        (pipecat 1.3.0), so both are updated. Any failure keeps the cached prompt —
+        session start must never block on Genesis.
+        """
+        if not self.genesis_tool_service:
+            return
+        try:
+            fresh = await asyncio.wait_for(
+                self.genesis_tool_service.get_system_prompt(), _PROMPT_REFRESH_TIMEOUT_S
+            )
+        except Exception as e:
+            logger.warning(
+                "⚠️ System-prompt re-fetch failed — keeping cached instructions: %s: %s",
+                type(e).__name__, e,
+            )
+            return
+        if not fresh or fresh == self.instructions:
+            return  # empty prompt (misconfig) must not blank the persona; same = no-op
+        self.instructions = fresh
+        svc = self.openai_service
+        if svc is not None:
+            # Mutate under the pipeline lock so the writes can't interleave with an
+            # in-flight reset_conversation (the 55-min rotation loop holds this lock
+            # for its whole reset).
+            if self._pipeline_lock is None:
+                self._pipeline_lock = asyncio.Lock()
+            async with self._pipeline_lock:
+                try:
+                    svc._settings.session_properties.instructions = fresh
+                    svc._settings.system_instruction = fresh
+                    # pipecat also tracks a _base_system_instruction for composing
+                    # addon instructions; left stale it would clobber the refresh if
+                    # an update-settings frame ever recomposes. None sent today —
+                    # this keeps the latent path consistent too.
+                    if hasattr(svc, "_base_system_instruction"):
+                        svc._base_system_instruction = fresh
+                    logger.info("📜 Genesis prompt refreshed (%d chars) — live session updated",
+                                len(fresh))
+                except AttributeError:
+                    # pipecat internals moved (upgrade?) — the new prompt still applies
+                    # to any future service; be loud rather than silently serving stale.
+                    logger.warning(
+                        "⚠️ Could not update the live session properties (pipecat internals "
+                        "changed?) — fresh prompt cached for the next service", exc_info=True,
+                    )
 
     async def _persist_transcript(self, messages: list) -> None:
         """Persist a voice transcript out-of-band so it never blocks teardown.
@@ -454,6 +522,9 @@ class Application:
             """Handle new client connection."""
             # A newer connection invalidates any in-flight stale teardown.
             self._conn_seq += 1
+            # Fresh Genesis prompt (today's date, prompt updates) BEFORE the session
+            # (re)connects, so the connect/reset below replays current instructions.
+            await self._refresh_instructions()
             await self._ensure_openai_service(client_id=client_id)
             if self.audio_recording_service:
                 self.audio_recording_service.start_new_session(client_id)

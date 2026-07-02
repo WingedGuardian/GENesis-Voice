@@ -131,7 +131,8 @@ def test_bot_speaking_raises_threshold(monkeypatch):
     threshold change is what's under test, not residual hysteresis.
     """
     gate, pushed, clock = _make_gate(
-        monkeypatch, open_threshold=500, bot_speaking_threshold=1500, hangover_ms=250
+        monkeypatch, open_threshold=500, bot_speaking_threshold=1500, hangover_ms=250,
+        bot_onset_guard_ms=0,  # isolate the threshold behavior from the onset guard
     )
 
     # Idle: a peak=1000 frame is above open_threshold (500) → passes.
@@ -257,8 +258,11 @@ def test_passed_during_bot_speech_logged(monkeypatch, caplog):
     """When audio slips through the gate WHILE the bot is speaking — the prime
     false-interrupt suspect — an immediate line is logged with peak + threshold
     so it can be correlated with the interrupt timestamps."""
+    # bot_onset_guard_ms=0: this test pins the LOGGING contract for a frame that passes
+    # during bot speech, independent of the onset-guard gating policy.
     gate, _pushed, _clock = _make_gate(
-        monkeypatch, open_threshold=500, bot_speaking_threshold=1500, log_interval_s=2.0
+        monkeypatch, open_threshold=500, bot_speaking_threshold=1500, log_interval_s=2.0,
+        bot_onset_guard_ms=0,
     )
     with caplog.at_level(logging.INFO, logger="app.noise_gate"):
         _run(gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM))
@@ -272,8 +276,10 @@ def test_passed_during_bot_speech_logged(monkeypatch, caplog):
 def test_passed_during_bot_speech_throttled(monkeypatch, caplog):
     """Repeated pass-through during a single bot turn logs at most once per
     interval — a real barge-in must not flood the log."""
+    # bot_onset_guard_ms=0: pins the log THROTTLE for passed frames, not the gating policy.
     gate, _pushed, clock = _make_gate(
-        monkeypatch, open_threshold=500, bot_speaking_threshold=1500, log_interval_s=2.0
+        monkeypatch, open_threshold=500, bot_speaking_threshold=1500, log_interval_s=2.0,
+        bot_onset_guard_ms=0,
     )
     with caplog.at_level(logging.INFO, logger="app.noise_gate"):
         _run(gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM))
@@ -309,6 +315,7 @@ def test_hangover_pass_during_bot_speech_not_flagged(monkeypatch, caplog):
         open_threshold=500,
         bot_speaking_threshold=1500,
         hangover_ms=5000,  # long hangover so the quiet frame still passes
+        bot_onset_guard_ms=0,  # guard off: this pins the instrumentation guard, not gating
         log_interval_s=0.1,  # short throttle so it's NOT what suppresses the log
     )
     with caplog.at_level(logging.INFO, logger="app.noise_gate"):
@@ -328,14 +335,18 @@ def test_hangover_pass_during_bot_speech_not_flagged(monkeypatch, caplog):
 def test_reset_instrumentation_starts_a_clean_window(monkeypatch, caplog):
     """``reset_instrumentation()`` (called on client reconnect) clears the
     throttle + counters so a fresh session's first barge-in always logs, even if
-    the previous session logged one moments earlier."""
+    the previous session logged one moments earlier. The reset also clears the
+    gating regime, so the new session's bot-speaking state is re-established by
+    its own BotStartedSpeakingFrame (onset guard disabled: logging contract only)."""
     gate, _pushed, clock = _make_gate(
-        monkeypatch, open_threshold=500, bot_speaking_threshold=1500, log_interval_s=2.0
+        monkeypatch, open_threshold=500, bot_speaking_threshold=1500, log_interval_s=2.0,
+        bot_onset_guard_ms=0,
     )
     _run(gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM))
     _run(gate.process_frame(_audio_frame(peak=5000), FrameDirection.DOWNSTREAM))  # logs, sets throttle
 
     gate.reset_instrumentation()
+    _run(gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM))  # new session's bot
 
     with caplog.at_level(logging.INFO, logger="app.noise_gate"):
         clock["t"] = 1000.1  # only +0.1s — would be throttled WITHOUT the reset
@@ -366,3 +377,119 @@ def test_flush_on_bot_speaking_transition(monkeypatch, caplog):
     assert "bot_speaking=False" in summaries[0]  # the flushed window is the idle one
     assert "passed=1/2" in summaries[0]
     assert "max_peak_passed=30000" in summaries[0]
+
+
+# --- onset guard: mute the bot's start-of-speech echo window (self-cutoff fix) -----------
+# Observed live: the bot cut ITSELF off 0.4–0.8s after starting to speak — its own first
+# syllables bleed into the mic and OpenAI's semantic VAD reads them as a user turn,
+# interrupting the response it just began. The cutoffs CASCADE (each restart re-triggers on
+# its own onset). Echo and real barge-in overlap in amplitude, so no threshold separates
+# them; instead ALL mic input is muted for the first ``bot_onset_guard_ms`` after the bot
+# starts. Barge-in resumes after the window; idle onsets are unaffected; 0 disables it.
+
+def _guarded_gate(monkeypatch, **kwargs):
+    """A gate with the bot already speaking and the onset guard armed at t=1000.0."""
+    defaults = {"bot_onset_guard_ms": 1500}
+    defaults.update(kwargs)
+    gate, pushed, clock = _make_gate(monkeypatch, **defaults)
+    _run(gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM))
+    pushed.clear()
+    return gate, pushed, clock
+
+
+def test_onset_guard_mutes_loud_input_within_window(monkeypatch):
+    """Within the guard window, even a very loud frame (well above the bot-speaking
+    threshold) is muted — echo and real speech are indistinguishable by amplitude here, so
+    the guard is unconditional."""
+    gate, pushed, clock = _guarded_gate(monkeypatch, bot_onset_guard_ms=1500)
+    clock["t"] = 1000.5                                  # +0.5s, inside the 1.5s window
+    _run(gate.process_frame(_audio_frame(peak=30000), FrameDirection.DOWNSTREAM))
+    assert pushed[-1][0].audio == b"\x00" * len(pushed[-1][0].audio)
+
+
+def test_onset_guard_expires_then_barge_in_passes(monkeypatch):
+    """After the guard window lapses, a loud frame opens the gate again — barge-in is
+    restored for the rest of the bot's turn."""
+    gate, pushed, clock = _guarded_gate(monkeypatch, bot_onset_guard_ms=1500)
+    clock["t"] = 1001.6                                  # +1.6s, past the 1.5s window
+    frame = _audio_frame(peak=30000)
+    expected = frame.audio
+    _run(gate.process_frame(frame, FrameDirection.DOWNSTREAM))
+    assert pushed[-1][0].audio == expected
+
+
+def test_onset_guard_boundary_is_exclusive(monkeypatch):
+    """At exactly guard_ms the window is over (``now - start < guard`` is False), so the
+    frame is gated on amplitude rather than force-muted — a loud frame passes."""
+    gate, pushed, clock = _guarded_gate(monkeypatch, bot_onset_guard_ms=1500)
+    clock["t"] = 1001.5                                  # exactly +1.5s
+    frame = _audio_frame(peak=30000)
+    expected = frame.audio
+    _run(gate.process_frame(frame, FrameDirection.DOWNSTREAM))
+    assert pushed[-1][0].audio == expected
+
+
+def test_onset_guard_rearms_on_each_bot_start(monkeypatch):
+    """Every BotStartedSpeaking re-arms the guard, so a later bot turn in the same session
+    is protected too (each potential cascade is broken)."""
+    gate, pushed, clock = _guarded_gate(monkeypatch, bot_onset_guard_ms=1500)
+    clock["t"] = 1002.0                                  # past the first window
+    _run(gate.process_frame(BotStoppedSpeakingFrame(), FrameDirection.UPSTREAM))
+    _run(gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM))  # re-arm
+    pushed.clear()
+    clock["t"] = 1002.5                                  # +0.5s into the NEW window
+    _run(gate.process_frame(_audio_frame(peak=30000), FrameDirection.DOWNSTREAM))
+    assert pushed[-1][0].audio == b"\x00" * len(pushed[-1][0].audio)
+
+
+def test_onset_guard_zero_disables_instant_barge_in(monkeypatch):
+    """bot_onset_guard_ms=0 is the rollback knob: a loud frame right after bot start opens
+    the gate immediately (the pre-guard behavior)."""
+    gate, pushed, clock = _guarded_gate(monkeypatch, bot_onset_guard_ms=0)
+    frame = _audio_frame(peak=30000)
+    expected = frame.audio
+    _run(gate.process_frame(frame, FrameDirection.DOWNSTREAM))
+    assert pushed[-1][0].audio == expected
+
+
+def test_onset_guard_does_not_apply_when_idle(monkeypatch):
+    """The guard is bot-speech-scoped: a normal speech onset while idle passes instantly
+    (no added latency on the user's own turn)."""
+    gate, pushed, clock = _make_gate(monkeypatch, bot_onset_guard_ms=1500)
+    frame = _audio_frame(peak=5000)
+    expected = frame.audio
+    _run(gate.process_frame(frame, FrameDirection.DOWNSTREAM))
+    assert pushed[0][0].audio == expected
+
+
+def test_onset_guard_drops_open_hangover_at_bot_start(monkeypatch):
+    """A hangover open from just before the bot started must NOT survive into bot speech
+    and carry onset echo through once the guard expires. BotStartedSpeaking drops
+    _open_until, so a quiet frame after the guard window is gated, not riding the old
+    hangover."""
+    gate, pushed, clock = _make_gate(
+        monkeypatch, bot_onset_guard_ms=100, hangover_ms=5000, bot_speaking_threshold=1500
+    )
+    _run(gate.process_frame(_audio_frame(peak=5000), FrameDirection.DOWNSTREAM))  # hangover→1005.0
+    clock["t"] = 1000.1
+    _run(gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM))  # drops hangover
+    pushed.clear()
+    clock["t"] = 1000.5   # past the 100ms guard (exp 1000.2), but < the old 5s hangover
+    _run(gate.process_frame(_audio_frame(peak=50), FrameDirection.DOWNSTREAM))
+    # Muted: the stale hangover was dropped, so this quiet frame has nothing to ride.
+    assert pushed[-1][0].audio == b"\x00" * len(pushed[-1][0].audio)
+
+
+def test_reset_clears_onset_guard_and_regime(monkeypatch):
+    """A pipeline teardown mid-response never delivers BotStoppedSpeaking — the reconnect
+    reset must clear BOTH _bot_speaking and the guard stamp, or the new session wrongly
+    starts muted / at the bot-speech threshold."""
+    gate, pushed, clock = _guarded_gate(monkeypatch)    # bot speaking + guard armed, prior session
+    gate.reset_instrumentation()
+    pushed.clear()
+    clock["t"] = 1005.0
+    mid = _audio_frame(peak=1000)                       # above idle 500, below bot 1500
+    expected = mid.audio
+    _run(gate.process_frame(mid, FrameDirection.DOWNSTREAM))
+    # Passes: idle threshold applies (regime reset) AND no guard mutes it (stamp cleared).
+    assert pushed[0][0].audio == expected
