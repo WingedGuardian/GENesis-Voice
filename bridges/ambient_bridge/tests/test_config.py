@@ -112,3 +112,28 @@ def test_max_active_paths_floored_to_one(monkeypatch):
     assert AmbientConfig().max_active_paths == 1
     monkeypatch.setenv("AMBIENT_MAX_ACTIVE_PATHS", "-3")
     assert AmbientConfig().max_active_paths == 1
+
+
+def test_ort_arena_and_recycle_defaults(monkeypatch):
+    # Repo defaults are conservative: arena stays ON, recycle ceiling OFF (0). Both are
+    # enabled per-install via env (edge drop-in), flipped only after the soak proves them.
+    for k in ("AMBIENT_ORT_ARENA_OFF", "AMBIENT_ORT_CONF_PATH",
+              "AMBIENT_DIAR_RSS_CEILING_MB", "AMBIENT_DIAR_RECYCLE_COOLDOWN_S"):
+        monkeypatch.delenv(k, raising=False)
+    c = AmbientConfig()
+    assert c.ort_arena_off is False
+    assert c.ort_conf_path.endswith("ambient_ort_cpu.conf")
+    assert c.diar_rss_ceiling_mb == 0
+    assert c.diar_recycle_cooldown_s == 1800.0
+
+
+def test_ort_arena_and_recycle_env_overrides(monkeypatch):
+    monkeypatch.setenv("AMBIENT_ORT_ARENA_OFF", "1")
+    monkeypatch.setenv("AMBIENT_ORT_CONF_PATH", "/tmp/x/ort.conf")
+    monkeypatch.setenv("AMBIENT_DIAR_RSS_CEILING_MB", "1400")
+    monkeypatch.setenv("AMBIENT_DIAR_RECYCLE_COOLDOWN_S", "600")
+    c = AmbientConfig()
+    assert c.ort_arena_off is True
+    assert c.ort_conf_path == "/tmp/x/ort.conf"
+    assert c.diar_rss_ceiling_mb == 1400
+    assert c.diar_recycle_cooldown_s == 600.0

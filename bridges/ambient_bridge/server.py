@@ -34,6 +34,7 @@ from .active_session import ActiveSession
 from .config import AmbientConfig, load_config
 from .connection_stats import ConnectionStats
 from .esphome_recovery import RecoveryState, reboot_device
+from .ort_session import ort_provider
 from .pipeline import AmbientEngine, DiarWindow, _autodetect_embedding
 from .speaker_id import SpeakerIDRegistry
 from .store import AmbientStore
@@ -76,6 +77,13 @@ def _rss_mb(pid: int) -> float | None:
         return round(resident_pages * _PAGE_SIZE / (1024 * 1024), 1)
     except (OSError, IndexError, ValueError):
         return None
+
+
+def _libc_malloc_trim() -> None:
+    """glibc ``malloc_trim(0)`` via ctypes — releases whole free pages (madvise, all arenas)
+    back to the OS. Raises on a non-glibc libc / missing symbol; callers guard."""
+    import ctypes
+    ctypes.CDLL(None).malloc_trim(0)
 
 
 @dataclass
@@ -166,6 +174,11 @@ class AmbientServer:
         self._diar_dropped = 0
         self._diar_pool_failures = 0  # consecutive subprocess crashes (cap → disable diar, no loop)
         self._diar_worker_alive = False
+        # RSS-ceiling recycle (containment for the child's allocator ratchet; 0 = off).
+        # None sentinel = never recycled — NOT 0.0, which would wrongly block the first recycle
+        # while time.monotonic() < cooldown right after a VM boot.
+        self._diar_pool_recycles = 0
+        self._diar_last_recycle_t: float | None = None
         if cfg.diar_enabled:
             self._engine.enable_diarization(
                 self.submit_window, int(cfg.diar_window_s * cfg.model_sample_rate),
@@ -188,6 +201,7 @@ class AmbientServer:
                 self._speaker_id = SpeakerIDRegistry(
                     model, persist_path=cfg.speaker_registry_path,
                     num_threads=cfg.diar_num_threads, user_name=cfg.user_speaker_name,
+                    provider=ort_provider(cfg),  # arena opt-out (see ort_session.py)
                 )
                 if self._speaker_id.has_user():
                     logger.info("Speaker-ID enabled (user=%r voiceprint loaded)", cfg.user_speaker_name)
@@ -411,6 +425,8 @@ class AmbientServer:
                     await asyncio.to_thread(self._finish_window, window, segs, embeddings)
                     t2 = loop.time()
                     self._diar_pool_failures = 0  # a clean window resets the crash counter
+                    # Between windows (never mid-task) is the one safe recycle point.
+                    self._maybe_recycle_diar_pool()
                     if self._cfg.instrument:
                         # child = the GIL-heavy work, now OFF the loop's process; parent = cheap
                         # writes. POST-FIX the loop-lag monitor should stay ~0 even while child is big.
@@ -464,6 +480,51 @@ class AmbientServer:
             self._diar_pool = self._make_diar_pool()
         except Exception:
             logger.error("diar pool re-init failed — capture continues, labels NULL", exc_info=True)
+
+    def _maybe_recycle_diar_pool(self) -> None:
+        """RSS-ceiling containment for the diar child (``AMBIENT_DIAR_RSS_CEILING_MB``; 0 = off).
+
+        Called from the diar worker BETWEEN windows — never mid-task — so the old pool's
+        shutdown is clean (max_workers=1; nothing in flight). Bounds the child's allocator
+        ratchet regardless of its cause; the next window pays a one-off model reload
+        (~10-20 s), absorbed by the bounded queue. The cooldown prevents thrash if the
+        baseline itself sits above the ceiling. Deliberately does NOT touch
+        ``_diar_pool_failures`` — a policy recycle is not a crash. Uses the same best-effort
+        RSS source as the health JSON, so a null reading (child not spawned yet, or exited
+        mid-read) is a clean no-op."""
+        ceiling = self._cfg.diar_rss_ceiling_mb
+        if ceiling <= 0 or self._diar_pool is None:
+            return
+        rss = self._memory_snapshot().get("rss_diar_child_mb")
+        if rss is None or rss <= ceiling:
+            return
+        now = time.monotonic()
+        if (self._diar_last_recycle_t is not None
+                and now - self._diar_last_recycle_t < self._cfg.diar_recycle_cooldown_s):
+            return
+        self._diar_last_recycle_t = now
+        self._diar_pool_recycles += 1
+        logger.warning("diar child RSS %.1f MB > ceiling %d MB — recycling the pool (#%d; "
+                       "next window pays a model reload)", rss, ceiling, self._diar_pool_recycles)
+        self._recreate_diar_pool()
+
+    def _malloc_trim_tick(self) -> None:
+        """Best-effort glibc ``malloc_trim(0)`` each health tick (parent process).
+
+        Returns whole free pages to the OS. CANNOT touch ORT-arena-held memory (live from
+        glibc's view) — so with the arena ON its measured delta is precisely the glibc-layer
+        share of any RSS growth (a diagnostic), and with the arena OFF it releases freed
+        inference tensors instead of coasting at the high-water mark. Sub-ms typical cost;
+        never raises (a broken trim must not take down the health loop)."""
+        try:
+            before = _rss_mb(os.getpid())
+            _libc_malloc_trim()
+            after = _rss_mb(os.getpid())
+            if before is not None and after is not None and before - after >= 5.0:
+                logger.info("malloc_trim reclaimed %.1f MB (rss %.1f -> %.1f)",
+                            before - after, before, after)
+        except Exception:  # noqa: BLE001 — hygiene, never worth failing the tick for
+            pass
 
     async def _loop_lag_monitor(self) -> None:
         """Diagnostic (AMBIENT_INSTRUMENT): sample event-loop scheduling lag every 100ms. A spike
@@ -643,6 +704,7 @@ class AmbientServer:
                 "diar_worker_alive": self._diar_worker_alive,
                 "diar_queue_depth": self._diar_queue.qsize() if self._diar_queue else 0,
                 "diar_windows_dropped": self._diar_dropped,
+                "diar_pool_recycles": self._diar_pool_recycles,
                 "speaker_id_enabled": self._speaker_id is not None,
                 "enrolling": self._enroll.name if self._enroll else None,
                 # Parent + diar-child RSS, ALWAYS on, so the MALLOC_ARENA_MAX=2 leak fix stays watchable.
@@ -662,6 +724,7 @@ class AmbientServer:
     async def _health_loop(self) -> None:
         while True:
             await asyncio.sleep(self._cfg.health_interval_s)
+            self._malloc_trim_tick()   # before the write, so the health JSON reports post-trim RSS
             self._write_health()
             self._maybe_recover()
 

@@ -40,6 +40,8 @@ def init_worker() -> None:
     from .pipeline import DiarizationEngine, _autodetect_embedding
     from .speaker_id import SpeakerIDRegistry
 
+    from .ort_session import ort_provider
+
     cfg = load_config()
     _ENGINE = DiarizationEngine(cfg)
     # Embed-only registry: embed() needs just the ONNX model. Classification + voiceprints stay in
@@ -54,6 +56,7 @@ def init_worker() -> None:
             persist_path=cfg.speaker_registry_path,
             num_threads=cfg.diar_num_threads,
             user_name=cfg.user_speaker_name,
+            provider=ort_provider(cfg),  # arena opt-out reaches the child's embed session too
         )
     logger.info("diar subprocess ready (engine loaded, embedder=%s)", _EMBEDDER is not None)
 
@@ -75,4 +78,17 @@ def process_window(raw, spans, sr, do_speaker_id):
     embeddings = None
     if do_speaker_id and _EMBEDDER is not None:
         embeddings = [_EMBEDDER.embed(raw[int(s * sr):int(e * sr)]) for (_rid, s, e) in spans]
+    _malloc_trim()  # between-window allocator hygiene (≤ ~1/min; see the docstring below)
     return segs, embeddings
+
+
+def _malloc_trim() -> None:
+    """Return whole free glibc pages to the OS after each window. With the ORT arena off,
+    freed inference tensors land in glibc's free lists — this releases them instead of
+    letting the child's RSS coast at its high-water mark. Best-effort: a non-glibc libc
+    (or any ctypes failure) is a silent no-op; this must never break a window."""
+    try:
+        import ctypes
+        ctypes.CDLL(None).malloc_trim(0)
+    except Exception:  # noqa: BLE001 — hygiene, never worth crashing diarization for
+        pass

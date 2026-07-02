@@ -133,3 +133,103 @@ def test_memory_snapshot_total_preserves_zero_reading(monkeypatch):
     snap = server_mod.AmbientServer._memory_snapshot(fake)
     assert snap["rss_parent_mb"] == 0.0
     assert isinstance(snap["rss_total_mb"], float) and snap["rss_total_mb"] == 0.0
+
+
+# --- diar-pool RSS-ceiling recycle (containment for the child's allocator ratchet) --------------
+# Runs in the diar worker BETWEEN windows; bounded by a cooldown; 0 = off. Uses the same
+# best-effort RSS source as the health JSON, so a null reading (no child yet) is a clean no-op.
+
+def _recycle_fake(*, ceiling=1000, cooldown=1800.0, rss=1500.0, pool=object(),
+                  last_recycle=None):
+    calls = []
+    fake = types.SimpleNamespace(
+        _cfg=types.SimpleNamespace(diar_rss_ceiling_mb=ceiling,
+                                   diar_recycle_cooldown_s=cooldown),
+        _diar_pool=pool,
+        _diar_pool_recycles=0,
+        _diar_last_recycle_t=last_recycle,
+        _memory_snapshot=lambda: {"rss_diar_child_mb": rss},
+        _recreate_diar_pool=lambda: calls.append(1),
+    )
+    return fake, calls
+
+
+def test_recycle_fires_above_ceiling():
+    fake, calls = _recycle_fake(ceiling=1000, rss=1500.0)
+    server_mod.AmbientServer._maybe_recycle_diar_pool(fake)
+    assert calls == [1]
+    assert fake._diar_pool_recycles == 1
+    assert fake._diar_last_recycle_t is not None
+
+
+def test_recycle_off_when_ceiling_zero():
+    fake, calls = _recycle_fake(ceiling=0, rss=99999.0)
+    server_mod.AmbientServer._maybe_recycle_diar_pool(fake)
+    assert calls == []
+
+
+def test_recycle_noop_below_ceiling():
+    fake, calls = _recycle_fake(ceiling=1000, rss=999.9)
+    server_mod.AmbientServer._maybe_recycle_diar_pool(fake)
+    assert calls == []
+
+
+def test_recycle_noop_when_rss_unknown():
+    # child not spawned yet (lazy pool) → rss key is None → clean no-op, no crash
+    fake, calls = _recycle_fake(rss=None)
+    server_mod.AmbientServer._maybe_recycle_diar_pool(fake)
+    assert calls == []
+
+
+def test_recycle_noop_when_pool_absent():
+    fake, calls = _recycle_fake(pool=None)
+    server_mod.AmbientServer._maybe_recycle_diar_pool(fake)
+    assert calls == []
+
+
+def test_recycle_respects_cooldown(monkeypatch):
+    fake, calls = _recycle_fake()
+    server_mod.AmbientServer._maybe_recycle_diar_pool(fake)   # fires, stamps the clock
+    server_mod.AmbientServer._maybe_recycle_diar_pool(fake)   # inside cooldown → blocked
+    assert calls == [1]
+
+
+def test_recycle_first_fire_works_on_fresh_boot(monkeypatch):
+    # time.monotonic() can be SMALL (< cooldown) right after a VM boot; a 0.0 "never recycled"
+    # sentinel would wrongly block the first recycle. The sentinel must be None, not 0.0.
+    monkeypatch.setattr(server_mod.time, "monotonic", lambda: 10.0)
+    fake, calls = _recycle_fake(cooldown=1800.0, last_recycle=None)
+    server_mod.AmbientServer._maybe_recycle_diar_pool(fake)
+    assert calls == [1]
+
+
+# --- parent malloc_trim on the health tick ------------------------------------------------------
+# Returns whole free glibc pages to the OS; CANNOT touch ORT-arena-held memory (live from
+# glibc's view) — so its measured delta is precisely the glibc-layer share of any growth.
+
+def test_malloc_trim_tick_logs_meaningful_reclaim(monkeypatch, caplog):
+    rss_seq = iter([700.0, 660.0])                       # 40 MB reclaimed
+    monkeypatch.setattr(server_mod, "_rss_mb", lambda pid: next(rss_seq))
+    trims = []
+    monkeypatch.setattr(server_mod, "_libc_malloc_trim", lambda: trims.append(1))
+    fake = types.SimpleNamespace()
+    with caplog.at_level("INFO", logger="ambient.server"):
+        server_mod.AmbientServer._malloc_trim_tick(fake)
+    assert trims == [1]
+    assert any("malloc_trim reclaimed" in r.message for r in caplog.records)
+
+
+def test_malloc_trim_tick_quiet_on_tiny_reclaim(monkeypatch, caplog):
+    rss_seq = iter([700.0, 699.8])                       # noise-level delta → no log spam
+    monkeypatch.setattr(server_mod, "_rss_mb", lambda pid: next(rss_seq))
+    monkeypatch.setattr(server_mod, "_libc_malloc_trim", lambda: None)
+    with caplog.at_level("INFO", logger="ambient.server"):
+        server_mod.AmbientServer._malloc_trim_tick(types.SimpleNamespace())
+    assert not any("malloc_trim" in r.message for r in caplog.records)
+
+
+def test_malloc_trim_tick_never_raises(monkeypatch):
+    def _boom():
+        raise OSError("no libc")
+    monkeypatch.setattr(server_mod, "_libc_malloc_trim", _boom)
+    server_mod.AmbientServer._malloc_trim_tick(types.SimpleNamespace())  # must not raise

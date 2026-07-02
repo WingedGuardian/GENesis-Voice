@@ -108,3 +108,86 @@ def test_engine_decode_method_env_override(monkeypatch):
     pipeline.AmbientEngine(AmbientConfig(), store=object())
     assert captured["decoding_method"] == "greedy_search"
     assert captured["max_active_paths"] == 8
+
+
+# --- ORT arena opt-out: provider plumbing (see ort_session.py) ------------------------------
+# The recognizer + diar/embedding sessions are the variable-shape allocators whose BFC arena
+# ratchets RSS; each must receive the provider string. VAD is deliberately EXCLUDED (fixed
+# 512-sample inputs — nothing to fix, and it sits on the hot capture path).
+
+def test_engine_passes_provider_default_cpu(monkeypatch):
+    monkeypatch.delenv("AMBIENT_ORT_ARENA_OFF", raising=False)
+    captured = _patch_recognizer(monkeypatch)
+    pipeline.AmbientEngine(AmbientConfig(), store=object())
+    assert captured["provider"] == "cpu"
+
+
+def test_engine_passes_conf_provider_when_arena_off(monkeypatch, tmp_path):
+    conf = tmp_path / "ort.conf"
+    monkeypatch.setenv("AMBIENT_ORT_ARENA_OFF", "1")
+    monkeypatch.setenv("AMBIENT_ORT_CONF_PATH", str(conf))
+    captured = _patch_recognizer(monkeypatch)
+    pipeline.AmbientEngine(AmbientConfig(), store=object())
+    assert captured["provider"] == f"cpu:{conf}"
+    assert "EnableCpuMemArena=0" in conf.read_text()
+
+
+def _patch_diar_sherpa(monkeypatch):
+    """Fake the sherpa diarization config classes; capture the provider each session gets."""
+    captured = {}
+
+    class _SegPyannote:
+        def __init__(self, model):
+            captured["seg_model"] = model
+
+    class _SegModelCfg:
+        def __init__(self, pyannote=None, num_threads=1, provider="cpu"):
+            captured["seg_provider"] = provider
+
+    class _EmbCfg:
+        def __init__(self, model, num_threads=1, provider="cpu"):
+            captured["emb_provider"] = provider
+
+    class _ClustCfg:
+        def __init__(self, num_clusters=-1, threshold=0.5):
+            pass
+
+    class _SdCfg:
+        def __init__(self, segmentation=None, embedding=None, clustering=None,
+                     min_duration_on=0.0, min_duration_off=0.0):
+            pass
+
+        def validate(self):
+            return True
+
+    class _Sd:
+        def __init__(self, cfg):
+            self.sample_rate = 16000
+
+    for name, cls in (("OfflineSpeakerSegmentationPyannoteModelConfig", _SegPyannote),
+                      ("OfflineSpeakerSegmentationModelConfig", _SegModelCfg),
+                      ("SpeakerEmbeddingExtractorConfig", _EmbCfg),
+                      ("FastClusteringConfig", _ClustCfg),
+                      ("OfflineSpeakerDiarizationConfig", _SdCfg),
+                      ("OfflineSpeakerDiarization", _Sd)):
+        monkeypatch.setattr(pipeline.sherpa_onnx, name, cls, raising=False)
+    monkeypatch.setattr(pipeline, "_autodetect_embedding", lambda d: "emb.onnx")
+    return captured
+
+
+def test_diar_engine_passes_provider_to_both_sessions(monkeypatch, tmp_path):
+    conf = tmp_path / "ort.conf"
+    monkeypatch.setenv("AMBIENT_ORT_ARENA_OFF", "1")
+    monkeypatch.setenv("AMBIENT_ORT_CONF_PATH", str(conf))
+    captured = _patch_diar_sherpa(monkeypatch)
+    pipeline.DiarizationEngine(AmbientConfig())
+    assert captured["seg_provider"] == f"cpu:{conf}"
+    assert captured["emb_provider"] == f"cpu:{conf}"
+
+
+def test_diar_engine_provider_default_cpu(monkeypatch):
+    monkeypatch.delenv("AMBIENT_ORT_ARENA_OFF", raising=False)
+    captured = _patch_diar_sherpa(monkeypatch)
+    pipeline.DiarizationEngine(AmbientConfig())
+    assert captured["seg_provider"] == "cpu"
+    assert captured["emb_provider"] == "cpu"

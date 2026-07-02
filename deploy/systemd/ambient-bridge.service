@@ -21,6 +21,12 @@ Environment=MALLOC_ARENA_MAX=2
 # Override model paths / tuning here if non-default, e.g.:
 # Environment=AMBIENT_INPUT_SR=24000
 # Environment=AMBIENT_VAD_MIN_SILENCE=0.4
+# The RESIDUAL RSS ratchet (survives MALLOC_ARENA_MAX=2) is onnxruntime's BFC arena growing
+# under variable-length utterances. Opt out for the variable-shape sessions (README "Memory";
+# ~4.5% RTF cost, flat RSS — measured on-edge) and/or cap the diar child's RSS (recycles the
+# subprocess between windows above the ceiling):
+# Environment=AMBIENT_ORT_ARENA_OFF=1
+# Environment=AMBIENT_DIAR_RSS_CEILING_MB=1400
 
 [Install]
 WantedBy=default.target
