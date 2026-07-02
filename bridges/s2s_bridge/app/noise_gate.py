@@ -14,14 +14,15 @@ interruption should be higher, since the device speaker bleed and room echo
 raise the ambient floor). A short hangover keeps the gate open across mid-word
 dips so speech is not clipped.
 
-While the bot is speaking, crossing the threshold alone is NOT enough: the gate
-opens only after ``bot_sustain_ms`` of CONSECUTIVE above-threshold frames.
-Observed live: a single ~20ms echo/transient frame peaking just over the
-bot-speech threshold opened the gate (+hangover), OpenAI's semantic VAD saw the
-burst, and the bot was cut off mid-sentence repeatedly. Real barge-in speech
-sustains for hundreds of ms; transients don't. Idle onsets are unaffected
-(instant open — no added latency), and ``bot_sustain_ms=0`` restores the old
-instant behavior (rollback knob).
+For the first ``bot_onset_guard_ms`` after the bot starts speaking, ALL mic
+input is muted regardless of amplitude. Observed live: the bot cut ITSELF off
+0.4–0.8s after starting — its own first syllables bleed into the mic and
+OpenAI's semantic VAD reads them as a user turn, interrupting the response it
+just began (and the cutoffs cascade: each restart re-triggers on its own onset).
+Echo and real barge-in overlap in amplitude, so no threshold separates them — a
+time-based guard is the only thing that reliably suppresses the onset echo.
+Barge-in resumes after the window; idle onsets are unaffected (instant open — no
+added latency); ``bot_onset_guard_ms=0`` disables the guard (rollback knob).
 """
 import logging
 import time
@@ -50,7 +51,7 @@ class NoiseGate(FrameProcessor):
         open_threshold: int,
         bot_speaking_threshold: int,
         hangover_ms: float = 250,
-        bot_sustain_ms: float = 100,
+        bot_onset_guard_ms: float = 1500,
         log_interval_s: float = 2.0,
         **kwargs,
     ):
@@ -58,15 +59,15 @@ class NoiseGate(FrameProcessor):
         self._open_threshold = open_threshold
         self._bot_speaking_threshold = bot_speaking_threshold
         self._hangover_s = hangover_ms / 1000.0
-        self._bot_sustain_s = bot_sustain_ms / 1000.0
+        self._onset_guard_s = bot_onset_guard_ms / 1000.0
         self._bot_speaking = False
         # Monotonic deadline until which the gate stays "open" after the last
         # above-threshold frame. 0.0 means closed (no recent loud frame).
         self._open_until = 0.0
-        # Monotonic start of the current consecutive above-threshold streak
-        # during bot speech; None = no streak. Reset by any sub-threshold frame
-        # and by bot start/stop transitions (a streak must not straddle regimes).
-        self._streak_started: float | None = None
+        # Monotonic time the bot most recently started speaking; None when idle.
+        # Drives the onset guard window (mute everything for _onset_guard_s after
+        # this). Set on BotStartedSpeaking, cleared on stop and on reconnect.
+        self._bot_speech_started: float | None = None
         # --- diagnostic instrumentation (sampled; for on-device calibration) ---
         self._log_interval_s = log_interval_s
         self._stats_window_start: float | None = None
@@ -85,57 +86,56 @@ class NoiseGate(FrameProcessor):
         if isinstance(frame, BotStartedSpeakingFrame):
             # Close the idle window before the regime changes so it never
             # straddles the transition, then switch.
-            self._flush_stats(time.monotonic())
+            now = time.monotonic()
+            self._flush_stats(now)
             self._bot_speaking = True
-            self._streak_started = None
+            # Arm the onset guard, and drop any open hangover so the bot's
+            # start-of-speech echo can't ride a stale window into OpenAI's VAD.
+            self._bot_speech_started = now
+            self._open_until = 0.0
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self._flush_stats(time.monotonic())
             self._bot_speaking = False
-            self._streak_started = None
+            self._bot_speech_started = None
         elif isinstance(frame, InputAudioRawFrame):
             self._gate(frame)
 
         await self.push_frame(frame, direction)
 
     def _gate(self, frame: InputAudioRawFrame) -> None:
-        """Zero out ``frame.audio`` in place if it is below threshold and the
-        hangover window has lapsed. Leaves loud frames untouched — except during
-        bot speech, where a loud frame passes only once its streak has sustained
-        ``bot_sustain_ms`` (echo transients cross the threshold; barge-in sustains)."""
+        """Zero out ``frame.audio`` in place if it should not reach OpenAI's VAD.
+
+        Two suppression mechanisms:
+        - Onset guard: for the first ``bot_onset_guard_ms`` after the bot starts
+          speaking, mute ALL mic input regardless of amplitude — the bot's own
+          onset echo overlaps real speech in amplitude, so only a time-based
+          guard reliably stops the self-interrupt cascade.
+        - Amplitude gate: otherwise, sub-threshold audio is muted (with a
+          hangover so mid-word dips are not clipped); a higher threshold applies
+          while the bot speaks.
+        """
         peak = self._peak_amplitude(frame.audio)
         threshold = (
             self._bot_speaking_threshold if self._bot_speaking else self._open_threshold
         )
         now = time.monotonic()
 
-        if peak >= threshold:
-            if not self._bot_speaking or self._bot_sustain_s <= 0:
-                # Idle (or sustain disabled): instant open + hangover, so a
-                # following mid-word dip is not clipped.
-                self._open_until = now + self._hangover_s
-                passed = True
-            else:
-                if self._streak_started is None:
-                    self._streak_started = now
-                if now - self._streak_started >= self._bot_sustain_s:
-                    # Sustained crossing — a real interruption: open/extend the window.
-                    self._open_until = now + self._hangover_s
-                    passed = True
-                elif now < self._open_until:
-                    # The gate is already open from earlier SUSTAINED speech: an
-                    # unproven transient may ride the window but must NOT extend it —
-                    # otherwise isolated echo spikes arriving every <hangover keep the
-                    # gate open forever, recreating the failure this feature fixes.
-                    passed = True
-                else:
-                    # Unproven transient during bot speech — hold the gate closed.
-                    passed = False
+        if (
+            self._bot_speaking
+            and self._onset_guard_s > 0
+            and self._bot_speech_started is not None
+            and now - self._bot_speech_started < self._onset_guard_s
+        ):
+            # Onset guard: hard-mute the bot's start-of-speech echo window.
+            passed = False
+        elif peak >= threshold:
+            # Instant open + hangover, so a following mid-word dip is not clipped.
+            self._open_until = now + self._hangover_s
+            passed = True
         elif now < self._open_until:
             # Below threshold but still inside the hangover window — pass.
-            self._streak_started = None
             passed = True
         else:
-            self._streak_started = None
             passed = False
 
         if not passed:
@@ -232,9 +232,9 @@ class NoiseGate(FrameProcessor):
         would span the disconnect gap and its first barge-in could be throttled
         by the previous session's log. The gating REGIME must reset too: a
         pipeline teardown mid-response means ``BotStoppedSpeakingFrame`` never
-        arrives, so ``_bot_speaking`` (and a live streak/hangover) would leak
-        into the new session — applying the higher threshold and sustain
-        requirement to a session where no bot audio is playing.
+        arrives, so ``_bot_speaking`` (and a live onset guard / hangover) would
+        leak into the new session — applying the higher threshold and muting the
+        onset of a session where no bot audio is playing.
         """
         self._stats_window_start = None
         self._frames_passed = 0
@@ -243,7 +243,7 @@ class NoiseGate(FrameProcessor):
         self._max_peak_gated = 0
         self._last_bot_pass_log = 0.0
         self._bot_speaking = False
-        self._streak_started = None
+        self._bot_speech_started = None
         self._open_until = 0.0
 
     @staticmethod

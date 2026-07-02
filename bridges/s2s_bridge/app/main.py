@@ -108,11 +108,13 @@ class Application:
             os.environ.get("NOISE_GATE_BOT_SPEAKING_THRESHOLD", "1500")
         )
         noise_gate_hangover_ms = float(os.environ.get("NOISE_GATE_HANGOVER_MS", "250"))
-        # Sustained-crossing requirement during bot speech: a single ~20ms echo/transient
-        # frame just over the bot-speech threshold used to open the gate and cut the bot
-        # off mid-sentence (observed live). Real barge-in sustains; transients don't.
-        # 0 restores the instant-open behavior.
-        noise_gate_bot_sustain_ms = float(os.environ.get("NOISE_GATE_BOT_SUSTAIN_MS", "100"))
+        # Onset guard: mute ALL mic input for this long after the bot starts speaking.
+        # The bot's own onset echo used to trip OpenAI's VAD and cut the bot off ~0.5s
+        # in (observed live; the cutoffs cascade). Echo and real barge-in overlap in
+        # amplitude, so only a time-based guard separates them. 0 disables the guard.
+        noise_gate_bot_onset_guard_ms = float(
+            os.environ.get("NOISE_GATE_BOT_ONSET_GUARD_MS", "1500")
+        )
         # Diagnostic logging cadence for the noise gate (sampled). 0 = off
         # (post-calibration quiet switch).
         noise_gate_log_interval_s = float(
@@ -125,12 +127,12 @@ class Application:
             os.environ.get("MAX_PENDING_ACTIVE_SECONDS", "180")
         )
         logger.info(
-            "Noise gate: open=%d, bot_speaking=%d, hangover=%.0fms, bot_sustain=%.0fms, "
+            "Noise gate: open=%d, bot_speaking=%d, hangover=%.0fms, onset_guard=%.0fms, "
             "log_interval=%.1fs; idle_timeout=%.0fs; max_pending_active=%.0fs",
             noise_gate_open_threshold,
             noise_gate_bot_speaking_threshold,
             noise_gate_hangover_ms,
-            noise_gate_bot_sustain_ms,
+            noise_gate_bot_onset_guard_ms,
             noise_gate_log_interval_s,
             idle_timeout_seconds,
             max_pending_active_seconds,
@@ -183,7 +185,7 @@ class Application:
             noise_gate_open_threshold=noise_gate_open_threshold,
             noise_gate_bot_speaking_threshold=noise_gate_bot_speaking_threshold,
             noise_gate_hangover_ms=noise_gate_hangover_ms,
-            noise_gate_bot_sustain_ms=noise_gate_bot_sustain_ms,
+            noise_gate_bot_onset_guard_ms=noise_gate_bot_onset_guard_ms,
             noise_gate_log_interval_s=noise_gate_log_interval_s,
             idle_timeout_seconds=idle_timeout_seconds,
             max_pending_active_seconds=max_pending_active_seconds,
