@@ -129,20 +129,23 @@ class AmbientEngine:
         self._cfg = cfg
         self._store = store
         d = cfg.zipformer_dir
+        # Variable-length utterances make the ORT arena ratchet; see ort_session.py. Logged
+        # below so a fail-open (arena-off requested but conf unwritable → plain "cpu") is
+        # visible in the service journal, not just a startup WARNING.
+        provider = ort_provider(cfg)
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
             encoder=_pick(d, "encoder"), decoder=_pick(d, "decoder"),
             joiner=_pick(d, "joiner"), tokens=f"{d}/tokens.txt",
             num_threads=cfg.num_threads, decoding_method=cfg.decoding_method,
             max_active_paths=cfg.max_active_paths,
-            # Variable-length utterances make the ORT arena ratchet; see ort_session.py.
-            provider=ort_provider(cfg),
+            provider=provider,
         )
         self._rec_lock = threading.Lock()
         self._diar_submit: Callable[[DiarWindow], Awaitable[None]] | None = None
         self._diar_window_samples = 0
         self._enroll_collect: Callable[[np.ndarray, float], None] | None = None
-        logger.info("Zipformer recognizer loaded from %s (decoding=%s max_active_paths=%d)",
-                    d, cfg.decoding_method, cfg.max_active_paths)
+        logger.info("Zipformer recognizer loaded from %s (decoding=%s max_active_paths=%d provider=%s)",
+                    d, cfg.decoding_method, cfg.max_active_paths, provider)
 
     def enable_diarization(self, submit: Callable[[DiarWindow], Awaitable[None]], window_samples: int) -> None:
         self._diar_submit = submit

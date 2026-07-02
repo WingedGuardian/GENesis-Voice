@@ -122,6 +122,10 @@ class AmbientServer:
         self._cfg = cfg
         self._store = AmbientStore(cfg.db_path)
         self._engine = AmbientEngine(cfg, self._store)
+        # Whether the ORT arena opt-out is ACTUALLY active (ort_provider fails open to "cpu"
+        # when the conf is unwritable) — surfaced in the health JSON so a silent fail-open is
+        # visible to the soak, not just a startup WARNING in the journal. Idempotent re-call.
+        self._ort_arena_off_active = ort_provider(cfg) != "cpu"
         self._active = 0
         self._utterances_total = 0
         self._last_connection_ts: str | None = None  # last client connect (for the health monitor)
@@ -425,8 +429,12 @@ class AmbientServer:
                     await asyncio.to_thread(self._finish_window, window, segs, embeddings)
                     t2 = loop.time()
                     self._diar_pool_failures = 0  # a clean window resets the crash counter
-                    # Between windows (never mid-task) is the one safe recycle point.
-                    self._maybe_recycle_diar_pool()
+                    # Between windows (never mid-task) is the one safe recycle point. Off the
+                    # event loop: the RSS read hits /proc and the pool swap starts an executor
+                    # manager thread — cheap, but not loop work. Mutation is safe off-loop:
+                    # the pool ref swap is atomic, this worker is the only submitter, and the
+                    # health tick's reader guards for None/missing attrs.
+                    await asyncio.to_thread(self._maybe_recycle_diar_pool)
                     if self._cfg.instrument:
                         # child = the GIL-heavy work, now OFF the loop's process; parent = cheap
                         # writes. POST-FIX the loop-lag monitor should stay ~0 even while child is big.
@@ -502,11 +510,18 @@ class AmbientServer:
         if (self._diar_last_recycle_t is not None
                 and now - self._diar_last_recycle_t < self._cfg.diar_recycle_cooldown_s):
             return
+        # Stamp the cooldown BEFORE recycling so a persistently-failing re-init can't retry
+        # every window; count only SUCCESSFUL recycles so the health counter can't mask a
+        # recycle that actually took diar down.
         self._diar_last_recycle_t = now
-        self._diar_pool_recycles += 1
-        logger.warning("diar child RSS %.1f MB > ceiling %d MB — recycling the pool (#%d; "
-                       "next window pays a model reload)", rss, ceiling, self._diar_pool_recycles)
+        logger.warning("diar child RSS %.1f MB > ceiling %d MB — recycling the pool "
+                       "(next window pays a model reload)", rss, ceiling)
         self._recreate_diar_pool()
+        if self._diar_pool is not None:
+            self._diar_pool_recycles += 1
+        else:
+            logger.error("RSS-ceiling recycle FAILED to re-init the diar pool — diar is DOWN "
+                         "(labels NULL) until a successful recreate or a restart")
 
     def _malloc_trim_tick(self) -> None:
         """Best-effort glibc ``malloc_trim(0)`` each health tick (parent process).
@@ -705,6 +720,7 @@ class AmbientServer:
                 "diar_queue_depth": self._diar_queue.qsize() if self._diar_queue else 0,
                 "diar_windows_dropped": self._diar_dropped,
                 "diar_pool_recycles": self._diar_pool_recycles,
+                "ort_arena_off": self._ort_arena_off_active,
                 "speaker_id_enabled": self._speaker_id is not None,
                 "enrolling": self._enroll.name if self._enroll else None,
                 # Parent + diar-child RSS, ALWAYS on, so the MALLOC_ARENA_MAX=2 leak fix stays watchable.
@@ -724,7 +740,10 @@ class AmbientServer:
     async def _health_loop(self) -> None:
         while True:
             await asyncio.sleep(self._cfg.health_interval_s)
-            self._malloc_trim_tick()   # before the write, so the health JSON reports post-trim RSS
+            # Off the event loop: trim walks the arenas + issues madvise syscalls, which on a
+            # big fragmented heap can take tens of ms. Before the write, so the health JSON
+            # reports post-trim RSS.
+            await asyncio.to_thread(self._malloc_trim_tick)
             self._write_health()
             self._maybe_recover()
 

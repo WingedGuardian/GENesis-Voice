@@ -203,6 +203,19 @@ def test_recycle_first_fire_works_on_fresh_boot(monkeypatch):
     assert calls == [1]
 
 
+def test_recycle_failure_not_counted_and_logs_error(caplog):
+    # A recycle whose re-init FAILS (pool left None) must not inflate the health counter —
+    # and must say loudly that diar is down. The cooldown still stamps (no per-window retry).
+    fake, calls = _recycle_fake()
+    fake._recreate_diar_pool = lambda: (calls.append(1), setattr(fake, "_diar_pool", None))
+    with caplog.at_level("ERROR", logger="ambient.server"):
+        server_mod.AmbientServer._maybe_recycle_diar_pool(fake)
+    assert calls == [1]
+    assert fake._diar_pool_recycles == 0                      # attempts ≠ successes
+    assert fake._diar_last_recycle_t is not None              # cooldown still stamped
+    assert any("FAILED" in r.message for r in caplog.records)
+
+
 # --- parent malloc_trim on the health tick ------------------------------------------------------
 # Returns whole free glibc pages to the OS; CANNOT touch ORT-arena-held memory (live from
 # glibc's view) — so its measured delta is precisely the glibc-layer share of any growth.
