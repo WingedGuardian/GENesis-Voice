@@ -13,6 +13,15 @@ Two thresholds: a lower ``open_threshold`` while idle, and a higher
 interruption should be higher, since the device speaker bleed and room echo
 raise the ambient floor). A short hangover keeps the gate open across mid-word
 dips so speech is not clipped.
+
+While the bot is speaking, crossing the threshold alone is NOT enough: the gate
+opens only after ``bot_sustain_ms`` of CONSECUTIVE above-threshold frames.
+Observed live: a single ~20ms echo/transient frame peaking just over the
+bot-speech threshold opened the gate (+hangover), OpenAI's semantic VAD saw the
+burst, and the bot was cut off mid-sentence repeatedly. Real barge-in speech
+sustains for hundreds of ms; transients don't. Idle onsets are unaffected
+(instant open — no added latency), and ``bot_sustain_ms=0`` restores the old
+instant behavior (rollback knob).
 """
 import logging
 import time
@@ -41,6 +50,7 @@ class NoiseGate(FrameProcessor):
         open_threshold: int,
         bot_speaking_threshold: int,
         hangover_ms: float = 250,
+        bot_sustain_ms: float = 100,
         log_interval_s: float = 2.0,
         **kwargs,
     ):
@@ -48,10 +58,15 @@ class NoiseGate(FrameProcessor):
         self._open_threshold = open_threshold
         self._bot_speaking_threshold = bot_speaking_threshold
         self._hangover_s = hangover_ms / 1000.0
+        self._bot_sustain_s = bot_sustain_ms / 1000.0
         self._bot_speaking = False
         # Monotonic deadline until which the gate stays "open" after the last
         # above-threshold frame. 0.0 means closed (no recent loud frame).
         self._open_until = 0.0
+        # Monotonic start of the current consecutive above-threshold streak
+        # during bot speech; None = no streak. Reset by any sub-threshold frame
+        # and by bot start/stop transitions (a streak must not straddle regimes).
+        self._streak_started: float | None = None
         # --- diagnostic instrumentation (sampled; for on-device calibration) ---
         self._log_interval_s = log_interval_s
         self._stats_window_start: float | None = None
@@ -72,9 +87,11 @@ class NoiseGate(FrameProcessor):
             # straddles the transition, then switch.
             self._flush_stats(time.monotonic())
             self._bot_speaking = True
+            self._streak_started = None
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self._flush_stats(time.monotonic())
             self._bot_speaking = False
+            self._streak_started = None
         elif isinstance(frame, InputAudioRawFrame):
             self._gate(frame)
 
@@ -82,7 +99,9 @@ class NoiseGate(FrameProcessor):
 
     def _gate(self, frame: InputAudioRawFrame) -> None:
         """Zero out ``frame.audio`` in place if it is below threshold and the
-        hangover window has lapsed. Leaves loud frames untouched."""
+        hangover window has lapsed. Leaves loud frames untouched — except during
+        bot speech, where a loud frame passes only once its streak has sustained
+        ``bot_sustain_ms`` (echo transients cross the threshold; barge-in sustains)."""
         peak = self._peak_amplitude(frame.audio)
         threshold = (
             self._bot_speaking_threshold if self._bot_speaking else self._open_threshold
@@ -90,17 +109,34 @@ class NoiseGate(FrameProcessor):
         now = time.monotonic()
 
         if peak >= threshold:
-            # Above threshold: keep the gate open for the hangover window so a
-            # following mid-word dip is not clipped.
-            self._open_until = now + self._hangover_s
-            passed = True
+            if not self._bot_speaking or self._bot_sustain_s <= 0:
+                # Idle (or sustain disabled): instant open + hangover, so a
+                # following mid-word dip is not clipped.
+                self._open_until = now + self._hangover_s
+                passed = True
+            else:
+                if self._streak_started is None:
+                    self._streak_started = now
+                if (now - self._streak_started >= self._bot_sustain_s
+                        or now < self._open_until):
+                    # Sustained crossing (or the gate is already open from one):
+                    # a real interruption — open/extend the hangover window.
+                    self._open_until = now + self._hangover_s
+                    passed = True
+                else:
+                    # Unproven transient during bot speech — hold the gate closed.
+                    passed = False
         elif now < self._open_until:
             # Below threshold but still inside the hangover window — pass.
+            self._streak_started = None
             passed = True
         else:
+            self._streak_started = None
+            passed = False
+
+        if not passed:
             # Gated: replace with equal-length silence, preserving format.
             frame.audio = b"\x00" * len(frame.audio)
-            passed = False
 
         self._instrument(peak, threshold, passed, now)
 

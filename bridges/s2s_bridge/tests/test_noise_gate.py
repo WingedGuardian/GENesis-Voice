@@ -257,8 +257,11 @@ def test_passed_during_bot_speech_logged(monkeypatch, caplog):
     """When audio slips through the gate WHILE the bot is speaking — the prime
     false-interrupt suspect — an immediate line is logged with peak + threshold
     so it can be correlated with the interrupt timestamps."""
+    # bot_sustain_ms=0: this test pins the LOGGING contract for a frame that passes
+    # during bot speech, independent of the sustained-crossing gating policy.
     gate, _pushed, _clock = _make_gate(
-        monkeypatch, open_threshold=500, bot_speaking_threshold=1500, log_interval_s=2.0
+        monkeypatch, open_threshold=500, bot_speaking_threshold=1500, log_interval_s=2.0,
+        bot_sustain_ms=0,
     )
     with caplog.at_level(logging.INFO, logger="app.noise_gate"):
         _run(gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM))
@@ -272,8 +275,10 @@ def test_passed_during_bot_speech_logged(monkeypatch, caplog):
 def test_passed_during_bot_speech_throttled(monkeypatch, caplog):
     """Repeated pass-through during a single bot turn logs at most once per
     interval — a real barge-in must not flood the log."""
+    # bot_sustain_ms=0: pins the log THROTTLE for passed frames, not the gating policy.
     gate, _pushed, clock = _make_gate(
-        monkeypatch, open_threshold=500, bot_speaking_threshold=1500, log_interval_s=2.0
+        monkeypatch, open_threshold=500, bot_speaking_threshold=1500, log_interval_s=2.0,
+        bot_sustain_ms=0,
     )
     with caplog.at_level(logging.INFO, logger="app.noise_gate"):
         _run(gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.UPSTREAM))
@@ -309,6 +314,7 @@ def test_hangover_pass_during_bot_speech_not_flagged(monkeypatch, caplog):
         open_threshold=500,
         bot_speaking_threshold=1500,
         hangover_ms=5000,  # long hangover so the quiet frame still passes
+        bot_sustain_ms=0,  # instant open: this pins the instrumentation guard, not gating
         log_interval_s=0.1,  # short throttle so it's NOT what suppresses the log
     )
     with caplog.at_level(logging.INFO, logger="app.noise_gate"):
@@ -366,3 +372,106 @@ def test_flush_on_bot_speaking_transition(monkeypatch, caplog):
     assert "bot_speaking=False" in summaries[0]  # the flushed window is the idle one
     assert "passed=1/2" in summaries[0]
     assert "max_peak_passed=30000" in summaries[0]
+
+
+# --- sustained-crossing requirement during bot speech (false barge-in fix) ---------------
+# Observed live: a SINGLE ~20ms echo/transient frame peaking just over
+# bot_speaking_threshold instantly opened the gate (+ hangover), OpenAI's semantic VAD saw
+# the burst, and the bot was cut off mid-sentence repeatedly. Real barge-in speech sustains
+# for hundreds of ms; transients don't — so while the bot speaks, the gate opens only after
+# ``bot_sustain_ms`` of CONSECUTIVE above-threshold frames. Idle behavior is unchanged.
+
+def _bot_speaking_gate(monkeypatch, **kwargs):
+    defaults = {"bot_sustain_ms": 100}
+    defaults.update(kwargs)
+    gate, pushed, clock = _make_gate(monkeypatch, **defaults)
+    _run(gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM))
+    pushed.clear()
+    return gate, pushed, clock
+
+
+def test_bot_speech_single_transient_stays_gated(monkeypatch):
+    """One loud 20ms frame during bot speech (the observed echo-spike failure) must NOT
+    open the gate — it is silenced, and so is the quiet frame after it."""
+    gate, pushed, clock = _bot_speaking_gate(monkeypatch)
+
+    _run(gate.process_frame(_audio_frame(peak=2000), FrameDirection.DOWNSTREAM))  # > 1500
+    clock["t"] = 1000.02
+    _run(gate.process_frame(_audio_frame(peak=100), FrameDirection.DOWNSTREAM))
+
+    assert all(out.audio == b"\x00" * len(out.audio) for out, _d in pushed)
+
+
+def test_bot_speech_sustained_crossing_opens_gate(monkeypatch):
+    """~100ms of consecutive above-threshold frames = real barge-in → the gate opens,
+    later frames pass, and the hangover then covers a mid-word dip."""
+    gate, pushed, clock = _bot_speaking_gate(monkeypatch, bot_sustain_ms=100, hangover_ms=250)
+
+    for i in range(6):                      # t = 0..100ms in 20ms frames, all loud
+        clock["t"] = 1000.0 + i * 0.02
+        _run(gate.process_frame(_audio_frame(peak=2000), FrameDirection.DOWNSTREAM))
+
+    # The frame at +100ms (6th) reaches the sustain requirement and passes.
+    assert pushed[-1][0].audio != b"\x00" * len(pushed[-1][0].audio)
+    # A quiet mid-word dip right after still rides the hangover.
+    clock["t"] = 1000.15
+    quiet = _audio_frame(peak=50)
+    quiet_audio = quiet.audio
+    _run(gate.process_frame(quiet, FrameDirection.DOWNSTREAM))
+    assert pushed[-1][0].audio == quiet_audio
+
+
+def test_bot_speech_streak_resets_on_subthreshold_frame(monkeypatch):
+    """A sub-threshold frame breaks the streak: two 60ms bursts separated by a quiet
+    frame never open the gate (neither burst alone sustains 100ms)."""
+    gate, pushed, clock = _bot_speaking_gate(monkeypatch, bot_sustain_ms=100)
+
+    for i in range(4):                      # 0..60ms loud (not enough)
+        clock["t"] = 1000.0 + i * 0.02
+        _run(gate.process_frame(_audio_frame(peak=2000), FrameDirection.DOWNSTREAM))
+    clock["t"] = 1000.08
+    _run(gate.process_frame(_audio_frame(peak=100), FrameDirection.DOWNSTREAM))   # break
+    for i in range(4):                      # a new 60ms burst — new streak, still short
+        clock["t"] = 1000.10 + i * 0.02
+        _run(gate.process_frame(_audio_frame(peak=2000), FrameDirection.DOWNSTREAM))
+
+    assert all(out.audio == b"\x00" * len(out.audio) for out, _d in pushed)
+
+
+def test_idle_regime_unchanged_instant_open(monkeypatch):
+    """The sustain requirement applies ONLY while the bot speaks — idle keeps the
+    instant open (no added latency on normal speech onsets)."""
+    gate, pushed, clock = _make_gate(monkeypatch, bot_sustain_ms=100)
+    frame = _audio_frame(peak=5000)
+    expected = frame.audio
+    _run(gate.process_frame(frame, FrameDirection.DOWNSTREAM))
+    assert pushed[0][0].audio == expected
+
+
+def test_bot_sustain_zero_restores_instant_barge_in(monkeypatch):
+    """bot_sustain_ms=0 is the rollback knob: a single loud frame during bot speech
+    opens the gate immediately (the pre-fix behavior)."""
+    gate, pushed, clock = _bot_speaking_gate(monkeypatch, bot_sustain_ms=0)
+    frame = _audio_frame(peak=2000)
+    expected = frame.audio
+    _run(gate.process_frame(frame, FrameDirection.DOWNSTREAM))
+    assert pushed[0][0].audio == expected
+
+
+def test_bot_transition_resets_streak(monkeypatch):
+    """A bot stop/start transition resets the streak — loud frames straddling the
+    transition must not be summed into one sustained crossing."""
+    gate, pushed, clock = _bot_speaking_gate(monkeypatch, bot_sustain_ms=100)
+
+    for i in range(4):                      # 60ms loud while bot speaks
+        clock["t"] = 1000.0 + i * 0.02
+        _run(gate.process_frame(_audio_frame(peak=2000), FrameDirection.DOWNSTREAM))
+    _run(gate.process_frame(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM))
+    _run(gate.process_frame(BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM))
+    pushed.clear()
+    clock["t"] = 1000.10                    # 40ms more loud — would cross 100ms if summed
+    _run(gate.process_frame(_audio_frame(peak=2000), FrameDirection.DOWNSTREAM))
+    clock["t"] = 1000.12
+    _run(gate.process_frame(_audio_frame(peak=2000), FrameDirection.DOWNSTREAM))
+
+    assert all(out.audio == b"\x00" * len(out.audio) for out, _d in pushed)
