@@ -1,5 +1,6 @@
 """WebSocket handler for managing WebSocket connections and pipelines."""
 import asyncio
+import functools
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
@@ -26,6 +27,43 @@ from app.session_idle_manager import SessionIdleManager
 from app.session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
+
+
+def _disable_ws_pings() -> None:
+    """Force pipecat's WebSocket server to run with pings OFF (idempotent).
+
+    The Voice PE's minimal WebSocket stack rejects server PING control frames — it closes
+    the connection with a ``1002 (protocol error) invalid opcode`` and no clean close,
+    which kills the conversation (observed live: a long session died this way ~60s in; the
+    sibling ambient bridge documents and disables the same on the same device). pipecat
+    1.3.0's ``WebsocketServerParams`` exposes no ping control and calls
+    ``websocket_serve(handler, host, port)`` (transports/websocket/server.py) with the
+    ``websockets`` default ``ping_interval=20``, so we wrap that module-level callable to
+    FORCE the pings off. The device fundamentally cannot handle pings, so this is a hard
+    override (not a default), and the s2s process has exactly one WS server, so patching
+    the module attribute is fully contained. Must run before the transport starts serving.
+
+    Trade-off: with pings off, the ``websockets`` lib no longer proactively detects a
+    half-open socket. That falls to the bridge's 45s ``SessionIdleManager`` (a silently
+    dead device sends no frames → idle-close within 45s) plus the bot-audio write path,
+    which raises a broken-pipe error on a dead socket — so re-enabling pings is NOT the
+    way to add liveness here (it kills the device); the idle manager owns that.
+    """
+    import pipecat.transports.websocket.server as pcws
+
+    if getattr(pcws.websocket_serve, "_pings_disabled", False):
+        return  # already patched — keep idempotent
+    _orig_serve = pcws.websocket_serve
+
+    @functools.wraps(_orig_serve)
+    def _serve_no_ping(*args, **kwargs):
+        kwargs["ping_interval"] = None
+        kwargs["ping_timeout"] = None
+        return _orig_serve(*args, **kwargs)
+
+    _serve_no_ping._pings_disabled = True
+    pcws.websocket_serve = _serve_no_ping
+    logger.info("🚫 WS server pings disabled (Voice PE rejects PING → 1002 invalid-opcode)")
 
 
 class SessionActivityTracker(FrameProcessor):
@@ -138,6 +176,10 @@ class WebSocketHandler:
 
         # Use RawAudioSerializer for binary PCM audio
         serializer = RawAudioSerializer()
+
+        # The Voice PE rejects WS PING frames (-> 1002 invalid-opcode close ~60s in,
+        # killing the session). Disable server pings before the transport starts serving.
+        _disable_ws_pings()
 
         # Create WebsocketServerTransport with WebsocketServerParams
         # The transport will start its own server automatically
