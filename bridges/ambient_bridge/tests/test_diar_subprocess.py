@@ -55,6 +55,40 @@ def test_process_window_embeds_each_span(monkeypatch):
     assert emb.calls == [32000, 32000]   # each 2.0s span sliced at 16k → embedded
 
 
+def test_process_window_trims_malloc_after_each_window(monkeypatch):
+    # With the ORT arena off, freed inference tensors land in glibc's free lists — the child
+    # returns whole free pages to the OS after every window (cheap: ≤ ~1/min). Best-effort.
+    calls = []
+    monkeypatch.setattr(diar_subprocess, "_malloc_trim", lambda: calls.append(1))
+    monkeypatch.setattr(diar_subprocess, "_ENGINE", _FakeEngine([(0.0, 1.0, 0)]))
+    monkeypatch.setattr(diar_subprocess, "_EMBEDDER", None)
+    diar_subprocess.process_window(np.zeros(16000, dtype=np.float32), [(1, 0.0, 1.0)], 16000, False)
+    assert calls == [1]
+
+
+def test_init_worker_passes_provider_to_embedder(monkeypatch, tmp_path):
+    # The child builds its OWN engines from the inherited env; the arena opt-out must reach
+    # its embedding session too (the child is the worst RSS grower).
+    captured = {}
+
+    class _FakeRegistry:
+        def __init__(self, model, *, persist_path, num_threads, user_name, provider="cpu"):
+            captured["provider"] = provider
+
+    monkeypatch.setattr("ambient_bridge.speaker_id.SpeakerIDRegistry", _FakeRegistry)
+    monkeypatch.setattr("ambient_bridge.pipeline.DiarizationEngine", lambda cfg: object())
+    monkeypatch.setattr("ambient_bridge.pipeline._autodetect_embedding", lambda d: "emb.onnx")
+    monkeypatch.setenv("AMBIENT_SPEAKER_ID_ENABLED", "1")
+    monkeypatch.setenv("AMBIENT_ORT_ARENA_OFF", "1")
+    monkeypatch.setenv("AMBIENT_ORT_CONF_PATH", str(tmp_path / "ort.conf"))
+    try:
+        diar_subprocess.init_worker()
+        assert captured["provider"] == f"cpu:{tmp_path / 'ort.conf'}"
+    finally:
+        diar_subprocess._ENGINE = None
+        diar_subprocess._EMBEDDER = None
+
+
 def test_process_window_no_embedder_loaded_returns_none(monkeypatch):
     # Defensive: speaker-ID disabled at init (embed model absent) → _EMBEDDER is None. Even if the
     # parent asks for it, the child must not crash — it returns segs + None embeddings.

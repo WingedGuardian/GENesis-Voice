@@ -126,3 +126,29 @@ def test_classify_none_cluster_long_is_direct():
     r = _reg({"user": _unit([1, 0, 0])})
     v = r.classify_window([_unit([0.9, 0.1, 0])], [4.0], [None], threshold=0.35, min_embed_s=3.0)
     assert v == [("user", True, "direct")]
+
+
+def test_registry_passes_provider_to_extractor_config(monkeypatch, tmp_path):
+    # The ORT arena opt-out must reach the registry's embedding session (both the parent's
+    # active-ID registry and the diar child's embed-only registry construct through here).
+    import speaker_id as sid_mod
+    captured = {}
+
+    class _Cfg:
+        def __init__(self, model, num_threads=1, provider="cpu"):
+            captured["provider"] = provider
+
+        def validate(self):
+            return True
+
+    class _Ext:
+        dim = 4
+
+        def __init__(self, cfg):
+            pass
+
+    monkeypatch.setattr(sid_mod.sherpa_onnx, "SpeakerEmbeddingExtractorConfig", _Cfg, raising=False)
+    monkeypatch.setattr(sid_mod.sherpa_onnx, "SpeakerEmbeddingExtractor", _Ext, raising=False)
+    SpeakerIDRegistry("m.onnx", persist_path=str(tmp_path / "reg.json"),
+                      provider="cpu:/x/ort.conf")
+    assert captured["provider"] == "cpu:/x/ort.conf"

@@ -42,8 +42,12 @@ class SpeakerIDRegistry:
         num_threads: int = 1,
         user_name: str = "user",
         sample_rate: int = TARGET_SR,
+        provider: str = "cpu",
     ) -> None:
-        cfg = sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=model_path, num_threads=num_threads)
+        # provider carries the ORT arena opt-out ("cpu:<conf>"; see ort_session.py) — this
+        # extractor embeds variable-length utterances, the exact arena-ratchet trigger.
+        cfg = sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+            model=model_path, num_threads=num_threads, provider=provider)
         if not cfg.validate():
             raise RuntimeError(f"invalid SpeakerEmbeddingExtractorConfig (model={model_path})")
         self._extractor = sherpa_onnx.SpeakerEmbeddingExtractor(cfg)

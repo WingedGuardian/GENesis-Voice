@@ -34,6 +34,7 @@ import sherpa_onnx
 import soxr
 
 from .config import AmbientConfig
+from .ort_session import ort_provider
 from .store import AmbientStore
 
 logger = logging.getLogger("ambient.pipeline")
@@ -128,18 +129,23 @@ class AmbientEngine:
         self._cfg = cfg
         self._store = store
         d = cfg.zipformer_dir
+        # Variable-length utterances make the ORT arena ratchet; see ort_session.py. Logged
+        # below so a fail-open (arena-off requested but conf unwritable → plain "cpu") is
+        # visible in the service journal, not just a startup WARNING.
+        provider = ort_provider(cfg)
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
             encoder=_pick(d, "encoder"), decoder=_pick(d, "decoder"),
             joiner=_pick(d, "joiner"), tokens=f"{d}/tokens.txt",
             num_threads=cfg.num_threads, decoding_method=cfg.decoding_method,
             max_active_paths=cfg.max_active_paths,
+            provider=provider,
         )
         self._rec_lock = threading.Lock()
         self._diar_submit: Callable[[DiarWindow], Awaitable[None]] | None = None
         self._diar_window_samples = 0
         self._enroll_collect: Callable[[np.ndarray, float], None] | None = None
-        logger.info("Zipformer recognizer loaded from %s (decoding=%s max_active_paths=%d)",
-                    d, cfg.decoding_method, cfg.max_active_paths)
+        logger.info("Zipformer recognizer loaded from %s (decoding=%s max_active_paths=%d provider=%s)",
+                    d, cfg.decoding_method, cfg.max_active_paths, provider)
 
     def enable_diarization(self, submit: Callable[[DiarWindow], Awaitable[None]], window_samples: int) -> None:
         self._diar_submit = submit
@@ -180,12 +186,17 @@ class DiarizationEngine:
 
     def __init__(self, cfg: AmbientConfig) -> None:
         emb = cfg.emb_model or _autodetect_embedding(cfg.models_dir)
+        # Both sessions get the arena opt-out: the EMBEDDER is the worst ratchet (per-utterance
+        # variable-length inputs — E3: 158→545 MB over 400 utts with the arena on), and the seg
+        # model rides along (this engine lives in the latency-tolerant diar child).
+        provider = ort_provider(cfg)
         sd_cfg = sherpa_onnx.OfflineSpeakerDiarizationConfig(
             segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
                 pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(model=cfg.seg_model),
-                num_threads=cfg.diar_num_threads,
+                num_threads=cfg.diar_num_threads, provider=provider,
             ),
-            embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=emb, num_threads=cfg.diar_num_threads),
+            embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+                model=emb, num_threads=cfg.diar_num_threads, provider=provider),
             clustering=sherpa_onnx.FastClusteringConfig(num_clusters=-1, threshold=cfg.diar_threshold),
             min_duration_on=0.3, min_duration_off=0.5,
         )

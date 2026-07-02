@@ -67,6 +67,11 @@ class AmbientConfig:
     # for instant rollback. max_active_paths applies only to beam search (ignored by greedy).
     decoding_method: str = field(default_factory=lambda: _env("AMBIENT_DECODING_METHOD", "modified_beam_search"))
     max_active_paths: int = field(default_factory=lambda: max(1, int(_env("AMBIENT_MAX_ACTIVE_PATHS", "4"))))  # floor 1: a 0/negative beam width is undefined in sherpa
+    # --- ORT memory-arena opt-out (the residual activity-driven RSS ratchet; see ort_session.py) ---
+    # OFF by default (conservative rollout — enable per-install via env, flip the default once the
+    # multi-day live soak confirms the E3 bench: arena-off = flat RSS at ~4.5% RTF cost).
+    ort_arena_off: bool = field(default_factory=lambda: _env_bool("AMBIENT_ORT_ARENA_OFF", False))
+    ort_conf_path: str = field(default_factory=lambda: _env("AMBIENT_ORT_CONF_PATH", os.path.expanduser("~/ambient_ort_cpu.conf")))
 
     # --- VAD tuning ---
     vad_min_silence_s: float = field(default_factory=lambda: float(_env("AMBIENT_VAD_MIN_SILENCE", "0.4")))
@@ -130,6 +135,12 @@ class AmbientConfig:
     diar_queue_max: int = field(default_factory=lambda: int(_env("AMBIENT_DIAR_QUEUE_MAX", "4")))
     # Diar shares the CPU with STT; keep below (cores - stt threads) on small boxes.
     diar_num_threads: int = field(default_factory=lambda: int(_env("AMBIENT_DIAR_NUM_THREADS", "2")))
+    # RSS-ceiling containment for the diar CHILD (the worst allocator grower): recycle its
+    # ProcessPoolExecutor between windows once rss_diar_child_mb exceeds this. 0 = OFF (repo
+    # default). Bounds the ratchet regardless of cause; next window pays a one-off model reload,
+    # absorbed by the bounded queue. Cooldown prevents thrash if the baseline exceeds the ceiling.
+    diar_rss_ceiling_mb: int = field(default_factory=lambda: int(_env("AMBIENT_DIAR_RSS_CEILING_MB", "0")))
+    diar_recycle_cooldown_s: float = field(default_factory=lambda: float(_env("AMBIENT_DIAR_RECYCLE_COOLDOWN_S", "1800")))
 
     # --- speaker identification (Stage-A: per-utterance is_user tagging) ---
     # Tags each row is_user (1=user / 0=other / NULL=no verdict) via a speaker-embedding

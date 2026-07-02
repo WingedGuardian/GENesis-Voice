@@ -121,6 +121,21 @@ so this stays watchable — a slow climb across restarts means the cap regressed
 > that it's baked into the unit: `rm ~/.config/systemd/user/ambient-bridge.service.d/arena.conf &&
 > systemctl --user daemon-reload` (leave any other drop-ins, e.g. an input-SR override, in place).
 
+ORT memory arena: the RESIDUAL RSS ratchet that survives the glibc cap (activity-driven, never
+reclaimed, ~13 MB/hr per process) is onnxruntime's BFC arena growing under variable-length
+utterances. `AMBIENT_ORT_ARENA_OFF=1` disables that arena for the variable-shape sessions —
+offline recognizer, diarization, speaker embedding; VAD keeps its arena (fixed-shape inputs,
+hot capture path) — via a generated one-line session conf (`AMBIENT_ORT_CONF_PATH`, default
+`~/ambient_ort_cpu.conf`; see `ort_session.py`). Measured on-edge (E3, real models + the real
+utterance-length distribution): flat/reclaiming RSS vs a 158→545 MB embedder ratchet over 400
+utterances, at ~4.5% RTF cost. OFF by default until the multi-day live soak confirms the bench.
+Containment, independent of the arena knob: `AMBIENT_DIAR_RSS_CEILING_MB` (0 = off) recycles the
+diar child between windows once its RSS crosses the ceiling (cooldown
+`AMBIENT_DIAR_RECYCLE_COOLDOWN_S`, 1800 s; the next window pays a one-off model reload); recycles
+are counted in the health key `diar_pool_recycles`. The parent also runs a best-effort glibc
+`malloc_trim(0)` each health tick — with the arena on, its logged delta measures the glibc-layer
+share of any growth; with it off, it releases freed inference tensors back to the OS.
+
 Diarization: `AMBIENT_DIAR_ENABLED` (1) · `AMBIENT_DIAR_THRESHOLD` (0.7; higher = fewer
 clusters) · `AMBIENT_DIAR_WINDOW_S` (60) · `AMBIENT_DIAR_QUEUE_MAX` (4) ·
 `AMBIENT_DIAR_NUM_THREADS` (2) · `AMBIENT_SEG_MODEL` / `AMBIENT_EMB_MODEL` (auto-detected
