@@ -1004,6 +1004,26 @@ power_supply:
     pin: GPIO45
 
 sensor:
+  # --- Device health telemetry (added 2026-06-25; pure observability, no behavior change) ---
+  # Watch thermals/load under always-on ambient streaming + monitor the ambient-WS-churn from the device side.
+  - platform: internal_temperature
+    name: "Internal temperature"
+    id: sys_internal_temp
+    update_interval: 30s
+  - platform: wifi_signal
+    name: "WiFi signal"
+    id: sys_wifi_signal
+    update_interval: 30s
+  - platform: uptime
+    name: "Uptime"
+    id: sys_uptime
+    update_interval: 30s
+  - platform: debug
+    free:
+      name: "Heap free"
+    loop_time:
+      name: "Loop time"
+
   # The dial. Used to control volume and hue of the LED ring.
   - platform: rotary_encoder
     id: dial
@@ -1698,6 +1718,10 @@ voice_kit:
 
 # Text sensor for debugging
 text_sensor:
+  # Reset reason → HA history: directly distinguishes a real reboot from WS churn (no more inferring).
+  - platform: debug
+    reset_reason:
+      name: "Reset reason"
   - platform: template
     name: "Voice Assistant Status"
     id: voice_assistant_status
