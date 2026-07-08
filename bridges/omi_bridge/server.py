@@ -89,12 +89,18 @@ class OmiServer:
         uid = request.query.get("uid")
         if not self._authenticate(token, uid):
             return web.json_response({"error": "forbidden"}, status=403)
+        # read() enforces client_max_size -> raises HTTPRequestEntityTooLarge (413), an
+        # HTTPException we deliberately let propagate so aiohttp renders the 413. We then decode
+        # DEFENSIVELY (fixed utf-8 + errors='replace') rather than using request.json(): a non-UTF8
+        # body or a bogus declared charset would otherwise raise UnicodeDecodeError / LookupError
+        # (siblings of JSONDecodeError, not subclasses) straight past us into a 500 — puncturing
+        # the never-5xx-after-auth contract. This way any encoding problem degrades to a
+        # JSONDecodeError -> 400.
+        raw = await request.read()
         try:
-            data = await request.json()
+            data = json.loads(raw.decode("utf-8", errors="replace"))
         except json.JSONDecodeError:
             return web.json_response({"error": "invalid json"}, status=400)
-        # NB: an oversize body raises HTTPRequestEntityTooLarge (413) inside request.json()
-        # above — an HTTPException, NOT caught here, so aiohttp renders the 413 cleanly.
         try:
             accepted, duplicates = await self._ingest(uid, data, request.headers.get("Idempotency-Key"))
         except Exception:
@@ -105,43 +111,52 @@ class OmiServer:
         return web.json_response({"accepted": accepted, "duplicates": duplicates}, status=200)
 
     async def _ingest(self, uid: str | None, data, idem_key: str | None) -> tuple[int, int]:
+        # The lock serializes the single OmiState connection + the anchor read-modify-write. The
+        # blocking sqlite work runs in a thread (per AmbientStore's documented convention) so a
+        # cross-process write-lock wait — the ambient bridge writes the same db — can't stall the
+        # event loop and delay OMI's HTTP response into a timeout/retry.
         async with self._lock:
-            now = time.time()
-            self._received += 1
-            # Idempotency-Key (bonus layer; absent in prod) — skips a whole re-delivered batch.
-            if self._state.is_duplicate_delivery(idem_key, now=now):
-                return 0, 0
-            session_id, segments = parse_payload(data)
-            if session_id and uid and session_id != uid:
-                logger.debug("omi session_id != query uid (using query uid for source)")
-            if not segments:
-                return 0, 0
-            seen = self._state.seen_segment_ids([s.get("id") for s in segments], now=now)
-            fresh = [s for s in segments if not (s.get("id") and s.get("id") in seen)]
-            dup_count = len(segments) - len(fresh)
-            if not fresh:
-                return 0, dup_count
-            batch_max_end = max((_as_float(s.get("end")) for s in fresh), default=0.0)
-            cur = self._state.get_anchor(uid)
-            epoch0 = decide_anchor(cur[0] if cur else None, batch_max_end, now, self._cfg.anchor_tolerance_s)
-            self._state.set_anchor(uid, epoch0, batch_max_end, now=now)
-            rows = normalize_segments(fresh, uid=uid, epoch0=epoch0)
-            inserted = 0
-            for r in rows:
-                row_id = self._store.insert(
-                    text=r.text, duration_s=r.duration_s, source=r.source, meta=r.meta, ts=r.ts
+            return await asyncio.to_thread(self._ingest_sync, uid, data, idem_key)
+
+    def _ingest_sync(self, uid: str | None, data, idem_key: str | None) -> tuple[int, int]:
+        """Synchronous dedup -> anchor -> normalize -> insert. Runs in a worker thread under the
+        caller's async lock (serialized), so touching the single OmiState connection is safe."""
+        now = time.time()
+        self._received += 1
+        # Idempotency-Key (bonus layer; absent in prod) — skips a whole re-delivered batch.
+        if self._state.is_duplicate_delivery(idem_key, now=now):
+            return 0, 0
+        session_id, segments = parse_payload(data)
+        if session_id and uid and session_id != uid:
+            logger.debug("omi session_id != query uid (using query uid for source)")
+        if not segments:
+            return 0, 0
+        seen = self._state.seen_segment_ids([s.get("id") for s in segments], now=now)
+        fresh = [s for s in segments if not (s.get("id") and s.get("id") in seen)]
+        dup_count = len(segments) - len(fresh)
+        if not fresh:
+            return 0, dup_count
+        batch_max_end = max((_as_float(s.get("end")) for s in fresh), default=0.0)
+        cur = self._state.get_anchor(uid)
+        epoch0 = decide_anchor(cur[0] if cur else None, batch_max_end, now, self._cfg.anchor_tolerance_s)
+        self._state.set_anchor(uid, epoch0, batch_max_end, now=now)
+        rows = normalize_segments(fresh, uid=uid, epoch0=epoch0)
+        inserted = 0
+        for r in rows:
+            row_id = self._store.insert(
+                text=r.text, duration_s=r.duration_s, source=r.source, meta=r.meta, ts=r.ts
+            )
+            if r.is_user is not None:
+                self._store.set_identity(
+                    row_id, speaker_name=r.speaker_name, is_user=bool(r.is_user), method="omi_webhook"
                 )
-                if r.is_user is not None:
-                    self._store.set_identity(
-                        row_id, speaker_name=r.speaker_name, is_user=bool(r.is_user), method="omi_webhook"
-                    )
-                inserted += 1
-            # Mark segments seen only AFTER a successful insert, so a mid-batch failure re-processes.
-            self._state.record_segment_ids([s.get("id") for s in fresh], now=now)
-            self._inserted += inserted
-            self._duplicates += dup_count
-            self._last_ingest_ts = now
-            return inserted, dup_count
+            inserted += 1
+        # Mark segments seen only AFTER a successful insert, so a mid-batch failure re-processes.
+        self._state.record_segment_ids([s.get("id") for s in fresh], now=now)
+        self._inserted += inserted
+        self._duplicates += dup_count
+        self._last_ingest_ts = now
+        return inserted, dup_count
 
     # ── health + purge ─────────────────────────────────────────────────────
     def _write_health(self) -> None:

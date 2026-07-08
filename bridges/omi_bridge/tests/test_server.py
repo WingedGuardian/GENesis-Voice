@@ -149,6 +149,24 @@ async def test_non_json_body_400(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_non_utf8_body_400_not_500(tmp_path):
+    # Invalid UTF-8 with a JSON content-type must degrade to 400, NEVER 500 — UnicodeDecodeError
+    # is a sibling of JSONDecodeError, not a subclass. Regression for the never-5xx-after-auth
+    # contract (a 5xx would trip OMI's retry/circuit-breaker/auto-disable).
+    cfg = _cfg(tmp_path)
+    server = OmiServer(cfg)
+    try:
+        async with await _client(server) as c:
+            resp = await c.post(
+                f"/omi/{TOKEN}/ingest", params={"uid": UID},
+                data=b"\xff\xfe{bad}", headers={"Content-Type": "application/json"},
+            )
+            assert resp.status == 400
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
 async def test_dedup_by_segment_id(tmp_path):
     cfg = _cfg(tmp_path)
     server = OmiServer(cfg)
