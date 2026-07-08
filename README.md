@@ -5,7 +5,7 @@ Genesis install ears and a spoken voice through a [Home Assistant Voice
 PE](https://www.home-assistant.io/voice-pe/) device — running entirely on hardware you
 control, with the cloud touched only for the conversational model you opt into.
 
-Two capabilities ship here, independent of each other:
+Three capabilities ship here, independent of each other:
 
 - **Conversational** (`bridges/s2s_bridge`): wake-word, full-duplex spoken conversation
   backed by OpenAI's Realtime speech-to-speech model. Production-ready.
@@ -14,6 +14,10 @@ Two capabilities ship here, independent of each other:
   short-lived database and never contacts Genesis. The path from ambient transcripts to
   Genesis memory is deliberately not built yet (see the design notes); this is the
   sensory substrate, not a finished feature.
+- **OMI wearable** (`bridges/omi_bridge`): a mic-only ambient wearable — a portable peer
+  of the Voice PE. Receives OMI's real-time transcript webhook and writes into the *same*
+  isolated `ambient.db` (`source=omi-<uid>`). **Stage 1 — capture only**, never contacts
+  Genesis. Two ambient devices, one substrate.
 
 ## Topology — three boxes
 
@@ -25,7 +29,8 @@ stays isolated from the cognitive core. Each box can be a VM or a container.
 1. **Home Assistant + Voice PE** (required hardware). HA runs the device and the ESPHome
    add-on that builds and flashes the firmware in `firmware/`.
 2. **Voice Edge** (a dedicated VM or container — not HAOS, not the Genesis box). Runs
-   both bridges. This is where audio is handled.
+   the bridges. This is where audio is handled — and where the OMI webhook receiver
+   accepts OMI's cloud transcript push (the one authenticated public ingress).
 3. **Genesis** (the cognitive core). Receives only the conversational tool/prompt traffic
    today; ambient stays on the edge.
 
@@ -39,6 +44,7 @@ firmware/         ESPHome custom component + device config + wake word ("hey gen
 bridges/
   s2s_bridge/     conversational bridge (OpenAI Realtime); edge/ holds the VM deploy
   ambient_bridge/ ambient capture service (VAD -> local STT -> isolated ambient.db)
+  omi_bridge/     OMI wearable webhook receiver (real-time transcript -> shared ambient.db)
 deploy/           install scaffold + systemd units
 docs/             setup guide + architecture diagram
 CONTRACTS.md      device->edge WS protocol, edge->Genesis surfaces
@@ -57,6 +63,9 @@ secrets files — the code is generic.
 - `ambient_bridge` — Stage 1 (local capture verified end-to-end). Diarization, the
   filtering/attention tiers, and any graduation of signal into Genesis are future work
   and intentionally absent here.
+- `omi_bridge` — Stage 1 (capture only). Real-time transcript webhook → shared
+  `ambient.db`. The attention engine and any graduation of signal into Genesis are future
+  work; the same firehose-quarantine and graduation boundary apply.
 
 ## License
 

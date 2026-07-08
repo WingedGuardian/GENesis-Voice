@@ -6,7 +6,7 @@
 # installs deps, and stages the systemd user units. It does NOT flash firmware
 # and does NOT write your secrets — see docs/SETUP.md for those steps.
 #
-# Usage:  deploy/install.sh [s2s|ambient|both]   (default: both)
+# Usage:  deploy/install.sh [s2s|ambient|omi|both]   (default: both = s2s+ambient)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -62,6 +62,21 @@ install_ambient() {
   echo "         AMBIENT_DIAR_ENABLED=0 if you only want capture+STT."
 }
 
+install_omi() {
+  echo ">> omi bridge"
+  local venv="$HOME/omi-venv"
+  python3 -m venv "$venv"
+  "$venv/bin/pip" install --upgrade pip
+  # Lean: the OMI receiver needs only aiohttp + stdlib (it imports the ambient bridge's
+  # stdlib-only AmbientStore from the sibling package; no sherpa/ML stack here).
+  "$venv/bin/pip" install aiohttp
+  cp "$REPO_ROOT/deploy/systemd/omi-bridge.service" "$SYSTEMD_USER_DIR/"
+  echo "   venv: $venv"
+  echo "   next: mkdir -p ~/.omi && cp deploy/omi.env.example ~/.omi/omi.env  (then fill in the token + uid)"
+  echo "   then: expose it with Tailscale Funnel and set the OMI app's Real-Time Transcript Webhook to"
+  echo "         https://<your-funnel-host>/omi/<token>/ingest   (see docs/SETUP.md / CONTRACTS.md)"
+}
+
 require_python
 mkdir -p "$SYSTEMD_USER_DIR"
 echo "Installing into a link-friendly layout: this repo at \$HOME/genesis-voice is assumed by the units."
@@ -69,8 +84,10 @@ echo "Installing into a link-friendly layout: this repo at \$HOME/genesis-voice 
 case "$TARGET" in
   s2s)     install_s2s ;;
   ambient) install_ambient ;;
+  omi)     install_omi ;;
   both)    install_s2s; install_ambient ;;
-  *) echo "usage: $0 [s2s|ambient|both]" >&2; exit 2 ;;
+  all)     install_s2s; install_ambient; install_omi ;;
+  *) echo "usage: $0 [s2s|ambient|omi|both|all]" >&2; exit 2 ;;
 esac
 
 cat <<EOF
