@@ -1,0 +1,27 @@
+[Unit]
+Description=GENesis-Voice OMI bridge (OMI wearable real-time webhook -> ambient.db)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Point WorkingDirectory at the parent of the deployed omi_bridge/ package so
+# `python -m omi_bridge.server` resolves — AND so it can import ambient_bridge.store
+# (the shared AmbientStore) from the sibling package.
+WorkingDirectory=%h/genesis-voice/bridges
+# Lean venv — the receiver needs only aiohttp + stdlib (no sherpa/ML stack).
+ExecStart=%h/omi-venv/bin/python -m omi_bridge.server
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+# The secret token + uid allowlist are install-specific and MUST NOT live in the repo.
+# Put them in an env file OUTSIDE the checkout (see deploy/omi.env.example):
+EnvironmentFile=-%h/.omi/omi.env
+# ...or set them inline here (again: never commit real values):
+# Environment=OMI_INGEST_SECRET_TOKEN=your-long-random-token
+# Environment=OMI_UID_ALLOWLIST=your-omi-account-uid
+# Optional: the OMI receiver shares ambient.db by default (~/ambient.db); override paths if needed.
+# Environment=OMI_HTTP_PORT=8788
+
+[Install]
+WantedBy=default.target

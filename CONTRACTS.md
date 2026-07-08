@@ -27,6 +27,32 @@ speak the same wire contract. The firmware maintains up to two such sockets:
   Do not expose a bridge port to the public internet.
 - Keepalive is standard WebSocket ping/pong.
 
+## 1b. Device (via OMI cloud) to edge — OMI transcript webhook
+
+An [OMI](https://www.omi.me/) wearable is a second, mic-only ambient device. Unlike the Voice
+PE (raw audio over a LAN WebSocket), OMI transcribes in its own cloud and **POSTs text segments
+to an HTTP webhook over the public internet**. So this is the one place the edge accepts an
+inbound public connection — the deliberate, authenticated exception to §1's "do not expose a
+bridge port to the public internet". It is terminated by **Tailscale Funnel** on the edge and
+forwarded to `omi_bridge` on loopback; there is no LAN alternative (OMI's cloud is the sender).
+
+- **Endpoint** — `POST /omi/<token>/ingest?uid=<uid>`. Body is a JSON object
+  `{"segments": [ ... ], "session_id": "<uid>"}` where `session_id` **equals** the account
+  `uid` (also on the query). Each segment: `id` (stable UUID — the dedup key), `text`,
+  `speaker` (e.g. `"SPEAKER_1"`), `speaker_id`, `is_user`, `person_id`, `start`/`end`
+  (**conversation-relative seconds**), plus `translations` / `speech_profile_processed` /
+  `stt_provider`.
+- **Auth** — a secret token carried in the **URL path** (`<token>`), optionally gated by a uid
+  allowlist. OMI's dev webhook cannot send custom headers, so the secret cannot ride a header.
+  A `…_PREVIOUS` token is honored during rotation.
+- **Response discipline** — after auth the receiver returns **only 2xx** (a drop returns 200):
+  a non-2xx makes OMI retry (1s/5s/30s), trip a circuit breaker, and eventually auto-disable the
+  webhook. The receiver also **never returns a JSON `message` field** — OMI turns one longer than
+  5 chars into a phone push notification. (Bad token → 403, malformed body → 400, oversize → 413;
+  the real device never triggers these.)
+- Rows land in the **shared** `ambient.db` as `source=omi-<uid>`, `provenance=ambient_overheard`
+  (same as the PE — so a future engine scans both). The §3 graduation boundary applies unchanged.
+
 ## 2. Edge (conversational) to Genesis — `/v1/voice/*`
 
 The `s2s_bridge` calls Genesis over HTTP for tool execution, the system prompt, and
@@ -45,5 +71,5 @@ The ambient bridge is **silent** by design. Nothing it captures reaches Genesis.
 ambient pipeline matures, a narrow one-way "graduation" boundary will be the *only* place
 ambient-derived signal can enter Genesis, carrying explicit provenance (overheard,
 low-confidence, possibly misattributed). That boundary is deliberately undefined here
-until its design discussion concludes. Until then: ambient data lives and dies in
-`ambient.db` on the edge.
+until its design discussion concludes. Until then: ambient data — from the Voice PE (§1) or the
+OMI wearable (§1b) — lives and dies in `ambient.db` on the edge.
