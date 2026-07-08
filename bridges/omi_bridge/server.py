@@ -190,7 +190,10 @@ class OmiServer:
         except Exception:
             logger.warning("startup purge failed", exc_info=True)
 
-        runner = web.AppRunner(self.build_app())
+        # access_log=None: the secret token rides the URL PATH (OMI can't send auth headers),
+        # so aiohttp's default access log would write the token to disk on every request. Disable
+        # request logging entirely — observability comes from our own counters + the health JSON.
+        runner = web.AppRunner(self.build_app(), access_log=None)
         await runner.setup()
         site = web.TCPSite(runner, self._cfg.host, self._cfg.port)
         await site.start()
