@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Capture the mic. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Stream to the bridge over the tailnet. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Foreground service with a microphone type: the ONLY sanctioned way to keep the
+         mic open while the screen is locked / app backgrounded (Android 14+ enforces the type). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- Post the persistent capture notification (runtime-granted on Android 13+). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Partial wake lock so the CPU keeps streaming while the screen is off. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Ask to be exempted from battery optimization. REQUIRED on Samsung/aggressive OEMs,
+         which otherwise "sleep" the service mid-meeting despite the foreground notification. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.GenesisMeetingMic">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".MicStreamService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+    </application>
+</manifest>
