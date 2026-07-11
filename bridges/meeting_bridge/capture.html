@@ -131,29 +131,35 @@ async function start() {
     return;
   }
 
-  ctx = new (window.AudioContext || window.webkitAudioContext)();
-  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET_SRC], { type: "application/javascript" })));
+  // From here the mic is LIVE. Any failure (worklet blocked, unsupported WebView, ws refused)
+  // must release the mic + reset the UI, or the mic stays open with no button to stop it.
+  try {
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET_SRC], { type: "application/javascript" })));
 
-  ws = new WebSocket(WS_URL);
-  ws.binaryType = "arraybuffer";
-  ws.onopen = () => {
-    setStatus("connected — capturing", true);
-    startedAt = Date.now(); bytesSent = 0;
-    metaTimer = setInterval(updateMeta, 1000); updateMeta();
-    stopBtn.disabled = false; markerBtn.disabled = false;
-  };
-  ws.onclose = () => { if (ctx) stop("connection closed"); };
-  ws.onerror = () => setStatus("connection error");
+    ws = new WebSocket(WS_URL);
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => {
+      setStatus("connected — capturing", true);
+      startedAt = Date.now(); bytesSent = 0;
+      metaTimer = setInterval(updateMeta, 1000); updateMeta();
+      stopBtn.disabled = false; markerBtn.disabled = false;
+    };
+    ws.onclose = () => { if (ctx) stop("connection closed"); };
+    ws.onerror = () => setStatus("connection error");
 
-  const src = ctx.createMediaStreamSource(stream);
-  node = new AudioWorkletNode(ctx, "pcm-downsampler", { processorOptions: { targetRate: TARGET_RATE } });
-  node.port.onmessage = (e) => {
-    if (ws && ws.readyState === WebSocket.OPEN) { ws.send(e.data); bytesSent += e.data.byteLength; }
-  };
-  src.connect(node);
-  // Do NOT connect node -> destination (would echo the mic to the speaker). The worklet still
-  // runs as long as it's fed by a live source node.
-  await acquireWakeLock();
+    const src = ctx.createMediaStreamSource(stream);
+    node = new AudioWorkletNode(ctx, "pcm-downsampler", { processorOptions: { targetRate: TARGET_RATE } });
+    node.port.onmessage = (e) => {
+      if (ws && ws.readyState === WebSocket.OPEN) { ws.send(e.data); bytesSent += e.data.byteLength; }
+    };
+    src.connect(node);
+    // Do NOT connect node -> destination (would echo the mic to the speaker). The worklet still
+    // runs as long as it's fed by a live source node.
+    await acquireWakeLock();
+  } catch (e) {
+    stop("setup failed: " + (e && e.message ? e.message : e));  // releases the mic + re-enables Start
+  }
 }
 
 function stop(reason) {

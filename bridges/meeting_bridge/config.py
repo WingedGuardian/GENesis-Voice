@@ -34,6 +34,12 @@ class MeetingConfig:
     # Reject a single binary audio frame larger than this. Phone frames are a few KB of PCM;
     # 256 KiB is already absurdly generous and caps a malformed/hostile frame.
     max_frame_bytes: int = field(default_factory=lambda: int(_env("MEETING_MAX_FRAME_BYTES", str(1 << 18))))
+    # WS heartbeat: aiohttp pings the phone every N seconds and force-closes on a missed pong, so a
+    # silently-vanished peer (screen lock, tab kill, wifi handoff mid-capture) is detected in seconds
+    # and the cloud session is finalized/closed — instead of leaking an open, billed Speechmatics
+    # session with a stuck active-count. The phone browser honors WS ping/pong (unlike the Voice PE,
+    # for which the ambient bridge disables pings). 0 disables (not recommended).
+    ws_heartbeat_s: float = field(default_factory=lambda: float(_env("MEETING_WS_HEARTBEAT_S", "20")))
 
     # --- auth ---
     # Secret path token: the browser opens the wss with the token in the URL path

@@ -101,6 +101,8 @@ case "$TARGET" in
   ambient) install_ambient ;;
   omi)     install_omi ;;
   meeting) install_meeting ;;
+  # `both` keeps its original meaning (s2s + ambient, the home Voice PE stack). The meeting bridge
+  # is a distinct, phone-driven use case with its own cloud dep — install it explicitly with `meeting`.
   both)    install_s2s; install_ambient ;;
   all)     install_s2s; install_ambient; install_omi; install_meeting ;;
   *) echo "usage: $0 [s2s|ambient|omi|meeting|both|all]" >&2; exit 2 ;;

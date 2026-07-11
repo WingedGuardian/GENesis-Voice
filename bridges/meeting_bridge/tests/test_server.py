@@ -10,6 +10,7 @@ import asyncio
 import json
 
 import pytest
+from aiohttp import WSMsgType
 from aiohttp.test_utils import TestClient, TestServer
 
 from meeting_bridge.config import MeetingConfig
@@ -162,5 +163,42 @@ async def test_health_file_written(tmp_path):
         server._write_health()
         data = json.loads((tmp_path / "meeting_health.json").read_text())
         assert "sessions_total" in data and "active_sessions" in data
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_ws_heartbeat_finalizes_silent_peer(tmp_path):
+    # A phone that vanishes without a WS close frame (screen lock / tab kill / wifi handoff) must
+    # still get finalized — the heartbeat pings it and force-closes on a missed pong. The client
+    # goes silent (autoping=False, never closes); the session must finalize regardless.
+    cfg = _cfg(tmp_path, ws_heartbeat_s=0.2)
+    server, box, done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            await c.ws_connect(f"/meeting/{TOKEN}", autoping=False)
+            await asyncio.wait_for(done.wait(), timeout=3)  # heartbeat-driven finalize
+        assert box["session"].finalized is True
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_factory_failure_is_contained(tmp_path):
+    # If the session factory raises (e.g. ActiveSession's makedirs hits a bad path), the handler
+    # must contain it — no active-count leak, no wedge — and the server stays healthy for the next
+    # connection.
+    cfg = _cfg(tmp_path)
+
+    def bad_factory(_cfg, _source):
+        raise RuntimeError("boom")
+
+    server = MeetingServer(cfg, session_factory=bad_factory)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            msg = await asyncio.wait_for(ws.receive(), timeout=3)  # clean close, not a hang
+            assert msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED)
+        assert server._active == 0  # incremented + decremented cleanly, no leak
     finally:
         server.close()

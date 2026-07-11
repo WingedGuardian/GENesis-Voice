@@ -101,16 +101,22 @@ class MeetingServer:
         if not self._authenticate(token):
             # Reject BEFORE the WS upgrade so the client sees a clean 403 handshake failure.
             return web.Response(status=403, text="forbidden")
-        # max_msg_size enforces the per-frame cap: an oversize frame trips a WS ERROR + close
-        # instead of being relayed to the cloud session.
-        ws = web.WebSocketResponse(max_msg_size=self._cfg.max_frame_bytes)
+        # max_msg_size enforces the per-frame cap (an oversize frame trips a WS ERROR + close
+        # instead of being relayed). heartbeat pings the phone and force-closes on a missed pong,
+        # so a silently-vanished peer is finalized in seconds instead of leaking an open, billed
+        # cloud session with a stuck active-count.
+        hb = self._cfg.ws_heartbeat_s if self._cfg.ws_heartbeat_s > 0 else None
+        ws = web.WebSocketResponse(max_msg_size=self._cfg.max_frame_bytes, heartbeat=hb)
         await ws.prepare(request)
         source = f"meeting-{request.remote or '?'}-{int(time.time())}"
-        session = self._session_factory(self._cfg, source)
+        session = None
         self._active += 1
         self._sessions_total += 1
         logger.info("meeting session opening: %s (active=%d)", source, self._active)
         try:
+            # Inside the try so a factory/start failure is CONTAINED (logged, not propagated to
+            # aiohttp's error logger) and still runs the finally cleanup below.
+            session = self._session_factory(self._cfg, source)
             await session.start()
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
@@ -125,10 +131,11 @@ class MeetingServer:
         except Exception:
             logger.warning("meeting ws handler error for %s", source, exc_info=True)
         finally:
-            try:
-                await session.finalize()
-            except Exception:
-                logger.warning("meeting session finalize failed for %s", source, exc_info=True)
+            if session is not None:
+                try:
+                    await session.finalize()
+                except Exception:
+                    logger.warning("meeting session finalize failed for %s", source, exc_info=True)
             self._active -= 1
             logger.info("meeting session closed: %s (active=%d)", source, self._active)
             if not ws.closed:
