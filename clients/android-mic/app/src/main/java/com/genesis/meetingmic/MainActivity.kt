@@ -29,13 +29,20 @@ class MainActivity : AppCompatActivity() {
 
     private val permLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
-    ) { grants ->
-        if (grants[Manifest.permission.RECORD_AUDIO] == true) {
+    ) { _ ->
+        // Check the ACTUAL mic-permission state, not the grants map — when RECORD_AUDIO was already
+        // granted and only POST_NOTIFICATIONS was (re)requested, the map has no RECORD_AUDIO key, so
+        // keying off it would wrongly read "denied" and refuse to start. Notifications are optional.
+        if (hasMicPermission()) {
             startCapture()
         } else {
             b.status.text = getString(R.string.status_mic_denied)
         }
     }
+
+    private fun hasMicPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -62,14 +69,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun requestThenStart() {
         val needed = buildList {
-            if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO)
-                != android.content.pm.PackageManager.PERMISSION_GRANTED
-            ) add(Manifest.permission.RECORD_AUDIO)
+            if (!hasMicPermission()) add(Manifest.permission.RECORD_AUDIO)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                 ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS)
                 != android.content.pm.PackageManager.PERMISSION_GRANTED
             ) add(Manifest.permission.POST_NOTIFICATIONS)
         }
+        // The launcher callback re-checks actual mic state, so a notif-only request still starts
+        // capture (notifications are optional; the mic is not).
         if (needed.isEmpty()) startCapture() else permLauncher.launch(needed.toTypedArray())
     }
 

@@ -19,6 +19,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
@@ -63,6 +64,12 @@ class MicStreamService : LifecycleService() {
         private const val CHANNEL_ID = "capture"
         private const val NOTIF_ID = 1
 
+        // Persisted so a START_STICKY restart (OS kills the process mid-meeting, redelivers a null
+        // intent) can resume with the same endpoint instead of erroring out. App-private storage.
+        private const val PREFS = "capture_creds"
+        private const val KEY_URL = "ws_url"
+        private const val KEY_TOKEN = "token"
+
         // 16 kHz mono PCM16 — the bridge's native ambient/meeting rate, sent without resampling.
         const val SAMPLE_RATE = 16000
         private const val CHANNEL = AudioFormat.CHANNEL_IN_MONO
@@ -91,7 +98,8 @@ class MicStreamService : LifecycleService() {
     @Volatile private var wsConnected = false
     @Volatile private var bytesSent = 0L
     @Volatile private var startedAtMs = 0L
-    private var captureJob: Job? = null
+    // @Volatile: read from OkHttp callback threads (onSocketDown) as well as the main thread.
+    @Volatile private var captureJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
     private val http: OkHttpClient by lazy {
@@ -110,12 +118,22 @@ class MicStreamService : LifecycleService() {
             ACTION_STOP -> { stopCapture("stopped"); return START_NOT_STICKY }
             ACTION_MARK -> { sendMarker(); return START_STICKY }
             ACTION_START, null -> {
-                val base = intent?.getStringExtra(EXTRA_WS_URL).orEmpty()
-                val token = intent?.getStringExtra(EXTRA_TOKEN).orEmpty()
+                var base = intent?.getStringExtra(EXTRA_WS_URL).orEmpty()
+                var token = intent?.getStringExtra(EXTRA_TOKEN).orEmpty()
+                if (base.isEmpty() || token.isEmpty()) {
+                    // Null/empty intent == a START_STICKY restart after an OS kill. Restore the last
+                    // creds so capture actually resumes instead of erroring out. (Whether Android
+                    // permits re-opening a mic FGS from this background restart is device-dependent;
+                    // if it's blocked, startCapture surfaces an error rather than failing silently.)
+                    val p = getSharedPreferences(PREFS, MODE_PRIVATE)
+                    base = p.getString(KEY_URL, "").orEmpty()
+                    token = p.getString(KEY_TOKEN, "").orEmpty()
+                }
                 startCapture(base, token)
             }
         }
-        // START_STICKY: if the OS kills us for memory, try to restart (best-effort persistence).
+        // START_STICKY: if the OS kills us for memory, Android restarts the service (null intent);
+        // the restore above gives it the creds to resume.
         return START_STICKY
     }
 
@@ -137,6 +155,10 @@ class MicStreamService : LifecycleService() {
             stopSelf()
             return
         }
+
+        // Persist creds so a sticky restart after an OS kill can resume (cleared on explicit stop).
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putString(KEY_URL, base).putString(KEY_TOKEN, token).apply()
 
         startForegroundNotif()
         acquireWakeLock()
@@ -200,6 +222,8 @@ class MicStreamService : LifecycleService() {
                     // else: connected socket not yet open (CONNECTING) → drop this frame, keep reading.
                 }
             }
+        } catch (e: CancellationException) {
+            throw e  // a normal stop (job cancelled) — don't clobber the STOPPED status with ERROR
         } catch (e: Exception) {
             publish(Phase.ERROR, e.message ?: "capture error")
         } finally {
@@ -248,6 +272,8 @@ class MicStreamService : LifecycleService() {
     }
 
     private fun stopCapture(reason: String) {
+        // Explicit stop → forget creds so a later sticky restart doesn't silently resume capture.
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().clear().apply()
         captureJob?.cancel()
         captureJob = null
         wsConnected = false
