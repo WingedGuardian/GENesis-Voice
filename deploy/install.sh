@@ -6,7 +6,7 @@
 # installs deps, and stages the systemd user units. It does NOT flash firmware
 # and does NOT write your secrets — see docs/SETUP.md for those steps.
 #
-# Usage:  deploy/install.sh [s2s|ambient|omi|both]   (default: both = s2s+ambient)
+# Usage:  deploy/install.sh [s2s|ambient|omi|meeting|both|all]   (default: both = s2s+ambient)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -77,6 +77,21 @@ install_omi() {
   echo "         https://<your-funnel-host>/omi/<token>/ingest   (see docs/SETUP.md / CONTRACTS.md)"
 }
 
+install_meeting() {
+  echo ">> meeting bridge"
+  local venv="$HOME/meeting-venv"
+  python3 -m venv "$venv"
+  "$venv/bin/pip" install --upgrade pip
+  # Lean: aiohttp (audio WS + capture page), speechmatics-rt (real-time streaming diarization,
+  # reused via the ambient bridge's ActiveSession), numpy (ActiveSession's PCM ring). No sherpa/ONNX.
+  "$venv/bin/pip" install aiohttp speechmatics-rt numpy
+  cp "$REPO_ROOT/deploy/systemd/meeting-bridge.service" "$SYSTEMD_USER_DIR/"
+  echo "   venv: $venv"
+  echo "   next: mkdir -p ~/.meeting && cp deploy/meeting.env.example ~/.meeting/meeting.env"
+  echo "         chmod 600 ~/.meeting/meeting.env   (then set a long random MEETING_INGEST_TOKEN)"
+  echo "   NOTE: reuses the ambient bridge's Speechmatics key (~/.ambient-active/speechmatics.key)."
+}
+
 require_python
 mkdir -p "$SYSTEMD_USER_DIR"
 echo "Installing into a link-friendly layout: this repo at \$HOME/genesis-voice is assumed by the units."
@@ -85,18 +100,19 @@ case "$TARGET" in
   s2s)     install_s2s ;;
   ambient) install_ambient ;;
   omi)     install_omi ;;
+  meeting) install_meeting ;;
   both)    install_s2s; install_ambient ;;
-  all)     install_s2s; install_ambient; install_omi ;;
-  *) echo "usage: $0 [s2s|ambient|omi|both|all]" >&2; exit 2 ;;
+  all)     install_s2s; install_ambient; install_omi; install_meeting ;;
+  *) echo "usage: $0 [s2s|ambient|omi|meeting|both|all]" >&2; exit 2 ;;
 esac
 
 cat <<EOF
 
 Done (deps + units staged). To start a bridge:
   systemctl --user daemon-reload
-  systemctl --user enable --now s2s-bridge      # or ambient-bridge
+  systemctl --user enable --now s2s-bridge      # or ambient-bridge / meeting-bridge
 
 The systemd units assume this checkout lives at \$HOME/genesis-voice and each
-bridge has its venv at \$HOME/s2s-venv / \$HOME/ambient-venv. Adjust the unit
-files if your paths differ. See docs/SETUP.md.
+bridge has its venv at \$HOME/s2s-venv / \$HOME/ambient-venv / \$HOME/meeting-venv.
+Adjust the unit files if your paths differ. See docs/SETUP.md.
 EOF

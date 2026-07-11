@@ -1,0 +1,20 @@
+[Unit]
+Description=GENesis-Voice meeting bridge (phone mic -> WS -> Speechmatics streaming diarization -> live .md)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Parent of the deployed meeting_bridge/ package so `python -m meeting_bridge.server` resolves.
+# ambient_bridge/ must be a sibling here — the meeting bridge reuses its ActiveSession.
+WorkingDirectory=%h/genesis-voice/bridges
+ExecStart=%h/meeting-venv/bin/python -m meeting_bridge.server
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+# Secrets + overrides (MEETING_INGEST_TOKEN, optional MEETING_* tuning). Keep chmod 600.
+# The `-` prefix makes a missing file non-fatal at boot (the token is then unset -> fail-closed auth).
+EnvironmentFile=-%h/.meeting/meeting.env
+
+[Install]
+WantedBy=default.target
