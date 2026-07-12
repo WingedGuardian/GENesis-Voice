@@ -2,9 +2,11 @@
 
 One app, one port. ``GET /capture/<token>`` serves the phone PWA; ``GET /meeting/<token>`` is the
 audio WebSocket (raw 16-bit PCM binary frames + JSON control frames). Both gate on a constant-time
-path-token compare (the browser can't set custom WS headers, so the token rides the URL). Each WS
-connection opens ONE cloud session (dependency-injected — default = Speechmatics via
-``ActiveSession``), relays PCM to it, and finalizes on disconnect.
+path-token compare (the browser can't set custom WS headers, so the token rides the URL). A WS
+connection drives a VAD-gated session lifecycle (dependency-injected — default = Speechmatics via
+``ActiveSession``): a cloud session opens on speech and finalizes after a sustained silence, so one
+connection can span several sessions — one transcript per meeting. ``MEETING_VAD_THRESHOLD=0``
+(default) disables gating → a single session spans the whole connection (the legacy behavior).
 
 Runs behind the Tailscale Funnel (the one authenticated public door); binds loopback by default.
 No ``genesis.*`` imports. The cloud SDK is imported lazily by the default factory, so the server
@@ -174,7 +176,13 @@ class MeetingServer:
                     else:
                         self._frames_gated += 1
                         if close and session is not None:
-                            await session.finalize()
+                            # Mirror the teardown finalize's containment: a pluggable backend whose
+                            # finalize() can raise must not kill the connection (and session=None
+                            # below prevents a double-finalize in the finally block).
+                            try:
+                                await session.finalize()
+                            except Exception:
+                                logger.warning("meeting session silence-finalize failed for %s", source, exc_info=True)
                             session = None
                             gate.reset()
                             logger.info("meeting cloud session CLOSE (silence): %s", source)

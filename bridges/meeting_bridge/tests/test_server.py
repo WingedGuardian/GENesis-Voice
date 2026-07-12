@@ -384,7 +384,8 @@ async def test_vad_segments_two_sessions_across_silence(tmp_path):
             await ws.close()
             await asyncio.wait_for(done.wait(), timeout=2)
         assert len(box["sessions"]) == 2  # two meetings → two cloud sessions / two files
-        assert box["sessions"][0].finalized is True
+        assert box["sessions"][0].finalized is True  # first meeting closed on silence
+        assert box["sessions"][1].finalized is True  # second meeting closed on teardown
         assert box["sessions"][0].frames == [_pcm(8000)]
         assert box["sessions"][1].frames == [_pcm(8000)]
     finally:
