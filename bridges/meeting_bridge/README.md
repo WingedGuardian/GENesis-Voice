@@ -32,9 +32,14 @@ phone capture.html ──wss(16k PCM)──▶ meeting_bridge (aiohttp) ──�
   client-side) → binary frames over a **same-origin** `wss` to `/meeting/<token>`. Screen Wake Lock
   keeps the screen on. **Foreground-only** — a phone browser can't capture in the background; that's
   what the Step-2 dedicated device is for.
-- **`GET /meeting/<token>`** — the audio WebSocket. Each connection opens one `ActiveSession`;
-  binary frames are relayed as PCM, a `{"type":"marker"}` text frame drops a bookmark in the
-  transcript, and the session finalizes on disconnect.
+- **`GET /meeting/<token>`** — the audio WebSocket. A per-frame energy VAD drives the session
+  lifecycle: a cloud `ActiveSession` opens on speech, silent frames are dropped (never billed), and
+  the session finalizes after `MEETING_SILENCE_CLOSE_S` of silence — so one connection can span
+  several sessions and **each meeting lands in its own transcript** (speaker labels reset across the
+  gaps). A `{"type":"marker"}` text frame drops a bookmark (opening a session if none is active).
+  `MEETING_VAD_THRESHOLD=0` (default) disables gating → one session for the whole connection.
+- **`GET /health`** — unauthenticated liveness only (`{alive, ts}`); **`GET /health/<token>`**
+  returns full operational metrics (session/frame counts incl. `frames_gated`) behind the token.
 - **Auth** — a constant-time path-token compare (`+ _PREVIOUS` for rotation). The browser can't set
   custom WS headers, so the token rides the URL path. This is the one authenticated public door
   (behind the Tailscale Funnel); `access_log=None` keeps the token out of the logs.
@@ -50,6 +55,15 @@ phone capture.html ──wss(16k PCM)──▶ meeting_bridge (aiohttp) ──�
 | `MEETING_MAX_SPEAKERS` | auto | Blank ⇒ Speechmatics auto-detects. |
 | `MEETING_OUTPUT_DIR` | `~/meeting-sessions` | Live `.md` transcripts land here. |
 | `MEETING_SESSION_FACTORY` | `meeting_bridge.session:default_session_factory` | Pluggable cloud backend (swap without a code change). |
+| `MEETING_VAD_THRESHOLD` | `0` (off) | Peak int16 energy for "speech". `0` ⇒ gating off (one session per connection). `>0` ⇒ session-per-meeting; calibrate from the peak-log (below). |
+| `MEETING_SILENCE_CLOSE_S` | `45` | Finalize a session after this much silence. Keep **below** Speechmatics' idle timeout. |
+| `MEETING_VAD_HANGOVER_S` | `0.4` | Keep forwarding this long after speech so word-tails aren't clipped. |
+| `MEETING_VAD_LOG_INTERVAL_S` | `30` | Peak/pass/gate summary interval (for calibration); `0` disables. |
+
+**Calibrating the VAD:** deploy with `MEETING_VAD_THRESHOLD=0` (off) and watch the
+`meeting vad[..] OFF(observe): … max_peak=.. avg_peak=..` log lines during a real capture — they
+show the room's speech vs. silence peaks. Set the threshold between the silence floor and the speech
+peaks, then restart to arm it.
 
 ## Deploy (edge)
 

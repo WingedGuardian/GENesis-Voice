@@ -62,7 +62,15 @@ capture, so it goes straight to a transcript file and does **not** touch `ambien
 graduation boundary.
 
 - **Endpoints** — `GET /capture/<token>` serves the browser capture page; `GET /meeting/<token>`
-  is the audio WebSocket. One WS connection opens exactly one cloud (Speechmatics) session.
+  is the audio WebSocket. `GET /health` is an unauthenticated liveness ping (`{alive, ts}` only);
+  full operational metrics are behind `GET /health/<token>`.
+- **Session lifecycle (VAD-gated)** — one WS connection can span **multiple** cloud (Speechmatics)
+  sessions. The bridge measures each frame's energy: a session opens on speech and finalizes after
+  `MEETING_SILENCE_CLOSE_S` of silence, so each meeting (a speech run bounded by long gaps) lands in
+  its **own** transcript and Speechmatics only bills while someone is talking. Speaker labels
+  (S1/S2) are consistent *within* a meeting but reset *across* the silence gaps between meetings.
+  `MEETING_VAD_THRESHOLD=0` (default) disables gating → one session for the whole connection (the
+  prior behavior). A connection that never carries speech opens no cloud session at all.
 - **Per-session model** — the client MAY pick the Speechmatics operating point with a
   `?model=standard|enhanced` query on the WS URL. The server validates it against a whitelist and
   falls back to its configured default (`MEETING_MODEL`, default `enhanced`) for any other value —

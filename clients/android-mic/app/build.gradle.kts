@@ -34,8 +34,8 @@ android {
         applicationId = "com.genesis.meetingmic"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.2.0"
+        versionCode = 3
+        versionName = "0.3.0"
 
         // Surfaced to Kotlin as BuildConfig.MEETING_WS_URL / MEETING_TOKEN.
         buildConfigField("String", "MEETING_WS_URL", "\"$meetingWsUrl\"")
