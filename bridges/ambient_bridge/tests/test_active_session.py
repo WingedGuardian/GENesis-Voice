@@ -29,6 +29,16 @@ def test_start_key_missing_writes_visible_error(tmp_path):
     assert s._client is None
 
 
+def test_transcript_paths_unique_across_sessions(tmp_path):
+    # Two sessions writing to the SAME output dir must get distinct transcript paths — even opened
+    # back-to-back in the same wall-clock second. A second-granular name silently overwrote the
+    # earlier meeting's file on same-second opens (the collision this guards against).
+    a = ActiveSession(_cfg(str(tmp_path)), source="s1")
+    b = ActiveSession(_cfg(str(tmp_path)), source="s2")
+    assert a.path != b.path
+    assert a.path.endswith(".md") and b.path.endswith(".md")
+
+
 def test_finalize_is_idempotent(tmp_path):
     s = ActiveSession(_cfg(str(tmp_path)), source="test")
     asyncio.run(s.finalize())  # no client → flush + CLOSED log
