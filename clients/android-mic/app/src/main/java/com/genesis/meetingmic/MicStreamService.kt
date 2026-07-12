@@ -229,7 +229,9 @@ class MicStreamService : LifecycleService() {
                             // Refresh the live UI counters ~once/sec (the StateFlow otherwise only
                             // emits on phase changes, so bytes/elapsed would appear frozen at 0).
                             if (++ticks % 10 == 0) publish(Phase.LIVE, "capturing")
-                            if (ticks % 100 == 0) updateNotif(liveNotifText())  // ~every 10 s
+                            // ~every 2 s: the notification is the PRIMARY display while the screen
+                            // is locked (the app's core use case), so it must not look frozen.
+                            if (ticks % 20 == 0) updateNotif(liveNotifText())
                         } else {
                             // send() refused → socket is closing/closed; fall into reconnect.
                             onSocketDown("send failed")
