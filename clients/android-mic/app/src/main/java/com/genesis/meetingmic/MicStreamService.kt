@@ -74,9 +74,13 @@ class MicStreamService : LifecycleService() {
         private const val KEY_TOKEN = "token"
         private const val KEY_MODEL = "model"
 
-        // Safety auto-stop: cap a single continuous session so a forgotten/left-running stream can't
-        // silently rack up Speechmatics cost. Resets on each fresh Start (or sticky restart).
-        private const val MAX_SESSION_MS = 8L * 60 * 60 * 1000  // 8 hours
+        // Runaway backstop: cap a single continuous capture so a forgotten/left-running stream can't
+        // stream forever. Sized for a full workday of capture (out-of-house use, ~8 h + commute +
+        // buffer) — NOT a per-meeting limit; the bridge's VAD lifecycle already keeps a mostly-silent
+        // day cheap (it only opens/bills a cloud session while someone is talking). Resets on each
+        // fresh Start (or sticky restart). Once scheduling lands, the scheduled off-time is the
+        // primary stop and this stays only as the runaway guard.
+        private const val MAX_SESSION_MS = 14L * 60 * 60 * 1000  // 14 hours
 
         // 16 kHz mono PCM16 — the bridge's native ambient/meeting rate, sent without resampling.
         const val SAMPLE_RATE = 16000

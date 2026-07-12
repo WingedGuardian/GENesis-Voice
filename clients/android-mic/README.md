@@ -26,9 +26,15 @@ Targets the bridge's already-deployed ingress (see [`../../CONTRACTS.md`](../../
 - **Enhanced ↔ Standard toggle** — picks the Speechmatics operating point for the *next* session
   (Enhanced ≈ higher accuracy/cost, Standard ≈ cheaper). It can't change mid-stream, so flip it,
   then Stop and Start. The choice is remembered.
-- **8-hour safety auto-stop** — a single continuous session stops itself after 8 h so a forgotten
-  stream can't quietly run up cost. Start again to continue. (A sticky restart resets the clock.)
-- **Live status** — the label and notification refresh ~once/second while capturing (elapsed + KB
+- **One transcript per meeting (bridge-side VAD)** — the bridge opens a Speechmatics session on
+  speech and finalizes it after a sustained silence, so a workday of capture produces one `.md` per
+  meeting and only bills while someone is talking. The phone streams continuously; the segmentation
+  happens on the edge. Speaker labels reset between meetings (across the silence gaps). This is
+  controlled by `MEETING_VAD_THRESHOLD` on the bridge (0 = off = one file per capture).
+- **14-hour runaway backstop** — a single continuous capture stops itself after 14 h (sized for a
+  full out-of-house workday, not a per-meeting cap) so a forgotten stream can't run forever. Start
+  again to continue. (A sticky restart resets the clock.)
+- **Live status** — the label and notification refresh every ~1–2 s while capturing (elapsed + KB
   sent), so a frozen `0s · 0 KB` means the socket never actually connected, not just a stale label.
 
 ## Configuration (endpoint + token)

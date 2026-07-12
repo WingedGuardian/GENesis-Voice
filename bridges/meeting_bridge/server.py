@@ -27,6 +27,7 @@ from aiohttp import WSMsgType, web
 
 from .config import MeetingConfig, load_config
 from .session import default_session_factory
+from .vad import GateStats, SessionGate, peak_amplitude
 
 logger = logging.getLogger(__name__)
 
@@ -58,9 +59,10 @@ class MeetingServer:
         self._session_factory = session_factory
         self._closed = False
         # counters (surfaced in the health JSON)
-        self._active = 0
-        self._sessions_total = 0
-        self._frames = 0
+        self._active = 0  # concurrent WS connections
+        self._sessions_total = 0  # cloud (Speechmatics) sessions opened — now one per meeting
+        self._frames = 0  # frames forwarded to a cloud session
+        self._frames_gated = 0  # frames dropped as silence (never billed)
         self._bytes = 0
         self._last_frame_ts: float | None = None
         self._capture_html: str | None = None
@@ -130,23 +132,72 @@ class MeetingServer:
         # (a validated whitelist; anything else keeps the configured default). The model is fixed
         # for the life of a Speechmatics session, so "switching" = stop + restart with the other one.
         cfg = self._cfg_for_request(request)
+        # VAD-driven session lifecycle: the phone streams continuously, so we open a cloud session
+        # on speech and finalize it after `silence_close_s` of silence — Speechmatics only bills
+        # while someone is talking and each meeting lands in its own transcript. threshold=0 disables
+        # the gate (one session spans the whole connection — the legacy behavior). The silence-close
+        # is evaluated inline per frame, which is sound precisely because the client sends frames
+        # continuously; a future client-side VAD (which would go silent on the wire) would instead
+        # need a timer to close an idle session.
+        gate = SessionGate(
+            threshold=cfg.vad_threshold, hangover_s=cfg.vad_hangover_s, silence_close_s=cfg.silence_close_s
+        )
+        stats = GateStats(self._cfg.vad_log_interval_s)
         session = None
+        opened = 0  # cloud sessions opened on THIS connection (for the close log)
         self._active += 1
-        self._sessions_total += 1
-        logger.info("meeting session opening: %s model=%s (active=%d)", source, cfg.model, self._active)
+        logger.info(
+            "meeting connection opening: %s model=%s vad_threshold=%d (active=%d)",
+            source,
+            cfg.model,
+            cfg.vad_threshold,
+            self._active,
+        )
         try:
-            # Inside the try so a factory/start failure is CONTAINED (logged, not propagated to
-            # aiohttp's error logger) and still runs the finally cleanup below.
-            session = self._session_factory(cfg, source)
-            await session.start()
+            # The session is opened lazily (on first speech) INSIDE the loop, still within this try,
+            # so a factory/start failure is CONTAINED (logged, not propagated to aiohttp's error
+            # logger) and still runs the finally cleanup below. A connection that never sends speech
+            # never opens a billed cloud session.
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
-                    await session.send_audio(msg.data)
-                    self._frames += 1
-                    self._bytes += len(msg.data)
-                    self._last_frame_ts = time.time()
+                    now = time.monotonic()
+                    peak = peak_amplitude(msg.data)
+                    forward, close = gate.observe(peak, now)
+                    if forward:
+                        if session is None:
+                            session = await self._open_session(cfg, source)
+                            opened += 1
+                        await session.send_audio(msg.data)
+                        self._frames += 1
+                        self._bytes += len(msg.data)
+                        self._last_frame_ts = time.time()
+                    else:
+                        self._frames_gated += 1
+                        if close and session is not None:
+                            await session.finalize()
+                            session = None
+                            gate.reset()
+                            logger.info("meeting cloud session CLOSE (silence): %s", source)
+                    summary = stats.observe(peak, forward, now)
+                    if summary is not None:
+                        mode = f"ON(thr={cfg.vad_threshold})" if gate.enabled else "OFF(observe)"
+                        logger.info(
+                            "meeting vad[%.0fs] %s: fwd=%d gated=%d max_peak=%d avg_peak=%d",
+                            summary.window_s,
+                            mode,
+                            summary.forwarded,
+                            summary.gated,
+                            summary.max_peak,
+                            summary.avg_peak,
+                        )
                 elif msg.type == WSMsgType.TEXT:
-                    self._on_control(session, msg.data)
+                    # A marker is an explicit "pay attention here" — never drop it into a silence
+                    # gap; open a session if one isn't currently active.
+                    if self._is_marker(msg.data):
+                        if session is None:
+                            session = await self._open_session(cfg, source)
+                            opened += 1
+                        session.add_marker()
                 elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
                     break
         except Exception:
@@ -158,19 +209,32 @@ class MeetingServer:
                 except Exception:
                     logger.warning("meeting session finalize failed for %s", source, exc_info=True)
             self._active -= 1
-            logger.info("meeting session closed: %s (active=%d)", source, self._active)
+            logger.info("meeting connection closed: %s (meetings=%d, active=%d)", source, opened, self._active)
             if not ws.closed:
                 await ws.close()
         return ws
 
-    def _on_control(self, session, raw: str) -> None:
+    async def _open_session(self, cfg: MeetingConfig, source: str):
+        """Build + start a cloud session and count it. Kept tiny so the BINARY (speech) and TEXT
+        (marker) paths open sessions identically."""
+        session = self._session_factory(cfg, source)
+        await session.start()
+        self._sessions_total += 1
+        logger.info(
+            "meeting cloud session OPEN #%d: %s (transcript: %s)",
+            self._sessions_total,
+            source,
+            getattr(session, "path", "?"),
+        )
+        return session
+
+    @staticmethod
+    def _is_marker(raw: str) -> bool:
+        """True iff `raw` is a JSON control frame of type 'marker'. Non-JSON / other → False."""
         try:
-            data = json.loads(raw)
+            return json.loads(raw).get("type") == "marker"
         except ValueError:
-            logger.debug("meeting: non-JSON control frame ignored")
-            return
-        if data.get("type") == "marker":
-            session.add_marker()
+            return False
 
     # ── health ───────────────────────────────────────────────────────────────
     async def _handle_health(self, _request: web.Request) -> web.Response:
@@ -192,6 +256,7 @@ class MeetingServer:
             "active_sessions": self._active,
             "sessions_total": self._sessions_total,
             "frames": self._frames,
+            "frames_gated": self._frames_gated,
             "bytes": self._bytes,
             "last_frame_ts": self._last_frame_ts,
             "pid": os.getpid(),

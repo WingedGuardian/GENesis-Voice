@@ -8,6 +8,7 @@ guard, and the health JSON — WITHOUT needing speechmatics-rt / numpy.
 
 import asyncio
 import json
+import struct
 
 import pytest
 from aiohttp import WSMsgType
@@ -32,13 +33,13 @@ def _cfg(tmp_path, **over):
 class FakeSession:
     """Records what the server relays; signals completion via an event (no wall-clock waits)."""
 
-    def __init__(self, done: asyncio.Event):
+    def __init__(self, done: asyncio.Event, idx: int = 0):
         self._done = done
         self.frames: list[bytes] = []
         self.markers = 0
         self.started = False
         self.finalized = False
-        self.path = "/fake/session.md"
+        self.path = f"/fake/session-{idx}.md"
 
     async def start(self):
         self.started = True
@@ -55,12 +56,18 @@ class FakeSession:
 
 
 def _server_with_fake(cfg):
-    """Return (server, get_session) where get_session() yields the last FakeSession built."""
-    box = {}
+    """Return (server, box, done).
+
+    ``box['sessions']`` lists every FakeSession built on the connection, in order (the VAD lifecycle
+    can open more than one per connection); ``box['session']`` is the most recent; ``done`` fires on
+    each finalize.
+    """
+    box = {"sessions": []}
     done = asyncio.Event()
 
     def factory(_cfg, source):
-        s = FakeSession(done)
+        s = FakeSession(done, idx=len(box["sessions"]))
+        box["sessions"].append(s)
         box["session"] = s
         box["source"] = source
         box["cfg"] = _cfg  # capture the per-connection cfg to assert the model override
@@ -179,12 +186,13 @@ async def test_oversize_frame_guarded(tmp_path):
     try:
         async with await _client(server) as c:
             ws = await c.ws_connect(f"/meeting/{TOKEN}")
-            await ws.send_bytes(b"x" * 64)  # over the 8-byte cap
-            await asyncio.wait_for(done.wait(), timeout=2)  # server closes + finalizes
-            await ws.close()
-        s = box["session"]
-        assert s.frames == []  # the oversize frame was never relayed
-        assert s.finalized is True
+            await ws.send_bytes(b"x" * 64)  # over the 8-byte cap → WS ERROR tears the conn down
+            msg = await asyncio.wait_for(ws.receive(), timeout=3)  # clean close, not a hang
+            assert msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED)
+        # Lazy creation: an oversize frame trips before any audio is relayed, so no billed cloud
+        # session is ever opened, and the connection closes cleanly with no active-count leak.
+        assert box["sessions"] == []
+        assert server._active == 0
     finally:
         server.close()
 
@@ -238,15 +246,17 @@ async def test_health_file_written(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_ws_heartbeat_finalizes_silent_peer(tmp_path):
-    # A phone that vanishes without a WS close frame (screen lock / tab kill / wifi handoff) must
-    # still get finalized — the heartbeat pings it and force-closes on a missed pong. The client
-    # goes silent (autoping=False, never closes); the session must finalize regardless.
+async def test_ws_heartbeat_finalizes_vanished_peer(tmp_path):
+    # A phone that opened a session then vanished without a WS close (screen lock / tab kill / wifi
+    # handoff) must still get its cloud session finalized — the heartbeat pings and force-closes on
+    # a missed pong. Send one frame to open the session (default threshold=0 → every frame is
+    # speech), then go silent with autoping off so no pong is answered.
     cfg = _cfg(tmp_path, ws_heartbeat_s=0.2)
     server, box, done = _server_with_fake(cfg)
     try:
         async with await _client(server) as c:
-            await c.ws_connect(f"/meeting/{TOKEN}", autoping=False)
+            ws = await c.ws_connect(f"/meeting/{TOKEN}", autoping=False)
+            await ws.send_bytes(b"\x01\x02")  # opens a session
             await asyncio.wait_for(done.wait(), timeout=3)  # heartbeat-driven finalize
         assert box["session"].finalized is True
     finally:
@@ -255,9 +265,8 @@ async def test_ws_heartbeat_finalizes_silent_peer(tmp_path):
 
 @pytest.mark.asyncio
 async def test_factory_failure_is_contained(tmp_path):
-    # If the session factory raises (e.g. ActiveSession's makedirs hits a bad path), the handler
-    # must contain it — no active-count leak, no wedge — and the server stays healthy for the next
-    # connection.
+    # If the session factory raises when first needed (the first speech frame), the handler must
+    # contain it — no active-count leak, no wedge — and the server stays healthy for the next conn.
     cfg = _cfg(tmp_path)
 
     def bad_factory(_cfg, _source):
@@ -267,8 +276,116 @@ async def test_factory_failure_is_contained(tmp_path):
     try:
         async with await _client(server) as c:
             ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_bytes(b"\x01\x02")  # triggers the lazy factory → raises → contained
             msg = await asyncio.wait_for(ws.receive(), timeout=3)  # clean close, not a hang
             assert msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED)
         assert server._active == 0  # incremented + decremented cleanly, no leak
+    finally:
+        server.close()
+
+
+# ── VAD-driven session lifecycle ─────────────────────────────────────────────
+def _pcm(*samples: int) -> bytes:
+    """Little-endian PCM16 frame from int16 samples (for driving the energy gate)."""
+    return struct.pack(f"<{len(samples)}h", *samples)
+
+
+@pytest.mark.asyncio
+async def test_vad_disabled_default_single_session_relays_all(tmp_path):
+    # Default threshold=0 → gating OFF: one session spans the whole connection and every frame is
+    # relayed, even a near-silent one (legacy behavior preserved).
+    cfg = _cfg(tmp_path)
+    assert cfg.vad_threshold == 0
+    server, box, done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_bytes(_pcm(2000))
+            await ws.send_bytes(_pcm(0))  # near-silent, but gate is off → still relayed
+            await ws.close()
+            await asyncio.wait_for(done.wait(), timeout=2)
+        assert len(box["sessions"]) == 1  # exactly one cloud session for the connection
+        assert box["session"].frames == [_pcm(2000), _pcm(0)]
+        assert server._frames_gated == 0
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_vad_quiet_frames_never_open_a_session(tmp_path):
+    # With the gate armed, sub-threshold frames at the START of a connection open NO cloud session
+    # (nothing to transcribe / bill) and are counted as gated.
+    cfg = _cfg(tmp_path, vad_threshold=5000)
+    server, box, done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            for _ in range(3):
+                await ws.send_bytes(_pcm(200))  # peak 200 << 5000 → silence
+            await ws.close()
+        assert box["sessions"] == []  # never opened a billed session on pure silence
+        assert server._frames_gated == 3
+        assert server._frames == 0
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_vad_speech_opens_session_and_relays(tmp_path):
+    # A loud (speech) frame opens a session and is relayed; the connection's one meeting finalizes
+    # on close.
+    cfg = _cfg(tmp_path, vad_threshold=1000)
+    server, box, done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_bytes(_pcm(8000))  # peak 8000 >= 1000 → speech
+            await ws.close()
+            await asyncio.wait_for(done.wait(), timeout=2)
+        assert len(box["sessions"]) == 1
+        assert box["session"].frames == [_pcm(8000)]
+        assert box["session"].finalized is True
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_marker_opens_session_when_none_active(tmp_path):
+    # A marker must never be dropped into a silence gap: with the gate armed and no session open, a
+    # marker control frame opens a session so the mark lands.
+    cfg = _cfg(tmp_path, vad_threshold=5000)
+    server, box, done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_str(json.dumps({"type": "marker"}))  # no audio yet → still opens a session
+            await ws.close()
+            await asyncio.wait_for(done.wait(), timeout=2)
+        assert len(box["sessions"]) == 1
+        assert box["session"].markers == 1
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_vad_segments_two_sessions_across_silence(tmp_path):
+    # Speech → sustained silence → speech opens a SECOND cloud session (one file per meeting). Uses
+    # a tiny silence_close_s + a real gap (same timing style as the heartbeat test); the pure
+    # open/close/reopen decision logic is covered deterministically in test_vad.py.
+    cfg = _cfg(tmp_path, vad_threshold=1000, vad_hangover_s=0.0, silence_close_s=0.05)
+    server, box, done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_bytes(_pcm(8000))  # meeting 1: speech opens session 0
+            await asyncio.sleep(0.12)  # silence gap > silence_close_s
+            await ws.send_bytes(_pcm(50))  # silent frame → finalizes session 0
+            await ws.send_bytes(_pcm(8000))  # meeting 2: speech opens session 1
+            await ws.close()
+            await asyncio.wait_for(done.wait(), timeout=2)
+        assert len(box["sessions"]) == 2  # two meetings → two cloud sessions / two files
+        assert box["sessions"][0].finalized is True
+        assert box["sessions"][0].frames == [_pcm(8000)]
+        assert box["sessions"][1].frames == [_pcm(8000)]
     finally:
         server.close()

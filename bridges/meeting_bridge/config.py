@@ -60,6 +60,25 @@ class MeetingConfig:
     # None => Speechmatics auto-detects the speaker count (no cap) — right for an unknown 1:1/small.
     max_speakers: int | None = field(default_factory=lambda: _env_int_or_none("MEETING_MAX_SPEAKERS"))
 
+    # --- VAD-driven session lifecycle (energy gate over the incoming PCM) ---
+    # Peak absolute int16 amplitude at/above which a frame counts as SPEECH. 0 DISABLES gating:
+    # every frame is "speech", so one cloud session spans the whole connection (legacy behavior).
+    # >0 turns on session-per-meeting — a session opens on speech, silent frames are dropped (never
+    # billed by Speechmatics), and the session finalizes after `silence_close_s` of silence, so each
+    # meeting lands in its own transcript. Default 0 (off) so a deploy is behavior-neutral; the value
+    # is calibrated from the peak-amplitude instrumentation on a real capture before being enabled.
+    vad_threshold: int = field(default_factory=lambda: int(_env("MEETING_VAD_THRESHOLD", "0")))
+    # Keep forwarding this long after the last above-threshold frame, so a mid-utterance dip or the
+    # tail of a word isn't clipped by the gate.
+    vad_hangover_s: float = field(default_factory=lambda: float(_env("MEETING_VAD_HANGOVER_S", "0.4")))
+    # Finalize the open cloud session after this much continuous silence (one meeting ends). MUST stay
+    # below Speechmatics' real-time idle/no-audio timeout (measured at E2E) so we close deliberately
+    # rather than the cloud dropping us. Small = more files (a long pause splits a meeting); large =
+    # risks the idle timeout. Default 45s: above normal in-meeting pauses, below likely idle limits.
+    silence_close_s: float = field(default_factory=lambda: float(_env("MEETING_SILENCE_CLOSE_S", "45")))
+    # Periodic peak/pass/gate summary interval (seconds) for threshold calibration; 0 disables.
+    vad_log_interval_s: float = field(default_factory=lambda: float(_env("MEETING_VAD_LOG_INTERVAL_S", "30")))
+
     # --- output ---
     # Distinct from the ambient bridge's ~/listen-sessions so meeting transcripts are isolated.
     output_dir: str = field(
