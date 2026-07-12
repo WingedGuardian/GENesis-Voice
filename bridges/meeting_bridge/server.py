@@ -73,6 +73,7 @@ class MeetingServer:
                 web.get("/capture/{token}", self._handle_capture),
                 web.get("/meeting/{token}", self._handle_ws),
                 web.get("/health", self._handle_health),
+                web.get("/health/{token}", self._handle_health_full),
             ]
         )
         return app
@@ -173,6 +174,15 @@ class MeetingServer:
 
     # ── health ───────────────────────────────────────────────────────────────
     async def _handle_health(self, _request: web.Request) -> web.Response:
+        # Unauthenticated liveness ONLY — deliberately minimal (no session counts, activity
+        # timestamps, or pid) because this route is reachable through the public Funnel. Full
+        # operational metrics require the token: GET /health/<token>.
+        return web.json_response({"alive": True, "ts": time.time()})
+
+    async def _handle_health_full(self, request: web.Request) -> web.Response:
+        token = request.match_info.get("token", "")
+        if not self._authenticate(token):
+            return web.Response(status=403, text="forbidden")
         return web.json_response(self._health_payload())
 
     def _health_payload(self) -> dict:

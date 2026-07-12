@@ -190,6 +190,42 @@ async def test_oversize_frame_guarded(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_health_unauth_is_minimal(tmp_path):
+    # The unauthenticated /health is reachable through the public Funnel, so it must expose ONLY
+    # liveness — never session counts, activity timestamps, or the pid.
+    cfg = _cfg(tmp_path)
+    server, _box, _done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            r = await c.get("/health")
+            assert r.status == 200
+            data = await r.json()
+            assert data["alive"] is True and "ts" in data
+            for leaked in ("active_sessions", "sessions_total", "frames", "bytes", "last_frame_ts", "pid"):
+                assert leaked not in data
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_health_full_requires_token(tmp_path):
+    # Full operational metrics live behind the token: good token → full payload; bad token → 403.
+    cfg = _cfg(tmp_path)
+    server, _box, _done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ok = await c.get(f"/health/{TOKEN}")
+            assert ok.status == 200
+            data = await ok.json()
+            assert "sessions_total" in data and "pid" in data
+
+            bad = await c.get("/health/wrong-token")
+            assert bad.status == 403
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
 async def test_health_file_written(tmp_path):
     cfg = _cfg(tmp_path)
     server, _box, _done = _server_with_fake(cfg)

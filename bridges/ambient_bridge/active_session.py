@@ -16,6 +16,7 @@ import contextlib
 import logging
 import os
 import time
+import uuid
 from datetime import UTC, datetime
 
 from speechmatics.rt import (
@@ -55,7 +56,13 @@ class ActiveSession:
         self._source = source
         ts = datetime.now(UTC)
         os.makedirs(cfg.active_output_dir, exist_ok=True)
-        self._path = os.path.join(cfg.active_output_dir, ts.strftime("%Y%m%dT%H%M%S") + ".md")
+        # Microsecond stamp + a short random suffix so two sessions opened in the same second
+        # (or microsecond) never collide — with session-per-meeting, many transcripts land in one
+        # dir per day, and a second-granular name would silently overwrite the earlier meeting.
+        self._path = os.path.join(
+            cfg.active_output_dir,
+            ts.strftime("%Y%m%dT%H%M%S_%f") + "_" + uuid.uuid4().hex[:6] + ".md",
+        )
         self._acc = TranscriptAccumulator(
             title=f"Active listen {ts.strftime('%Y-%m-%d %H:%M:%S UTC')}")
         self._client: AsyncClient | None = None
