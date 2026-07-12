@@ -52,6 +52,7 @@ class MainActivity : AppCompatActivity() {
         // Pre-fill from the build-time defaults; the user can override either field.
         b.wsUrl.setText(BuildConfig.MEETING_WS_URL)
         b.token.setText(BuildConfig.MEETING_TOKEN)
+        b.versionLabel.text = "v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})"
 
         // Restore the last model choice (default = Enhanced/on); persist on toggle.
         val prefs = getSharedPreferences("ui", MODE_PRIVATE)

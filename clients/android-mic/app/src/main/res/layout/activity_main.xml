@@ -91,6 +91,15 @@
             android:text="@string/status_idle" />
 
         <TextView
+            android:id="@+id/versionLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:textSize="12sp"
+            android:alpha="0.55"
+            android:text="version" />
+
+        <TextView
             android:id="@+id/batteryBanner"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
