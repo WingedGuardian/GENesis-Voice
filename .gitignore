@@ -38,3 +38,16 @@ venv/
 
 # ESPHome build artifacts / cache (per-config .esphome dir — large, machine-specific)
 .esphome/
+
+# Android client (clients/android-mic) — build output, machine paths, signing + baked secrets
+build/
+.gradle/
+local.properties
+*.apk
+*.aab
+*.keystore
+*.jks
+.cxx/
+# Per-build injected endpoint + token (BuildConfig). Only the .example is tracked.
+secrets.properties
+app/secrets.properties

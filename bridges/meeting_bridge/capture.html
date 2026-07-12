@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Meeting capture</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 16px/1.5 -apple-system, system-ui, sans-serif;
+    background: #0d1117; color: #e6edf3;
+    min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 22px; padding: 24px;
+    padding-bottom: max(24px, env(safe-area-inset-bottom));
+  }
+  h1 { font-size: 19px; font-weight: 600; margin: 0; opacity: .85; }
+  #status { font-size: 15px; min-height: 22px; text-align: center; opacity: .8; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+         background: #6e7681; margin-right: 7px; vertical-align: baseline; }
+  .live .dot { background: #2ea043; box-shadow: 0 0 10px #2ea043; }
+  button {
+    width: 100%; max-width: 340px; padding: 18px; font-size: 18px; font-weight: 600;
+    border: 0; border-radius: 14px; color: #fff; background: #238636; cursor: pointer;
+  }
+  button:disabled { opacity: .4; }
+  #stop { background: #da3633; }
+  #marker { background: #1f6feb; }
+  .row { width: 100%; max-width: 340px; display: flex; flex-direction: column; gap: 12px; }
+  #meta { font-size: 13px; opacity: .55; text-align: center; min-height: 18px; }
+  .hint { font-size: 12.5px; opacity: .5; text-align: center; max-width: 340px; }
+</style>
+</head>
+<body>
+  <h1>Meeting capture</h1>
+  <div id="status"><span class="dot"></span>idle</div>
+  <div class="row">
+    <button id="start">Start capture</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="marker" disabled>Mark this moment</button>
+  </div>
+  <div id="meta"></div>
+  <p class="hint">Keep this screen on and in the foreground. Audio streams only while capturing.</p>
+
+<script>
+const TOKEN = "__MEETING_TOKEN__";
+const WS_URL = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/meeting/" + TOKEN;
+const TARGET_RATE = 16000;
+
+const statusEl = document.getElementById("status");
+const metaEl = document.getElementById("meta");
+const startBtn = document.getElementById("start");
+const stopBtn = document.getElementById("stop");
+const markerBtn = document.getElementById("marker");
+
+let ctx, ws, node, stream, wakeLock;
+let bytesSent = 0, startedAt = 0, metaTimer = null;
+
+function setStatus(text, live) {
+  statusEl.innerHTML = '<span class="dot"></span>' + text;
+  statusEl.classList.toggle("live", !!live);
+}
+function fmtDur(s) {
+  s = Math.floor(s); const m = Math.floor(s / 60);
+  return m + ":" + String(s % 60).padStart(2, "0");
+}
+function updateMeta() {
+  if (!startedAt) { metaEl.textContent = ""; return; }
+  const kb = (bytesSent / 1024).toFixed(0);
+  metaEl.textContent = fmtDur((Date.now() - startedAt) / 1000) + " · " + kb + " KB sent";
+}
+
+// AudioWorklet: resamples the mic (native rate, often 48k) down to 16k Int16 PCM and posts
+// ~128 ms frames. Linear interpolation with cross-block continuity (carries the previous block's
+// last sample + the fractional read cursor) so there are no clicks at block boundaries.
+const WORKLET_SRC = `
+class PCMDownsampler extends AudioWorkletProcessor {
+  constructor(opts) {
+    super();
+    this.ratio = sampleRate / (opts.processorOptions.targetRate || 16000);
+    this.prev = 0;        // last input sample of the previous block (virtual index 0)
+    this.t = 1;           // fractional read cursor (virtual coords: 1 == ch[0])
+    this.acc = [];        // pending Int16 samples
+    this.FRAME = 2048;    // ~128 ms at 16k -> 4096-byte frames
+  }
+  sample(v, ch) { return v <= 0 ? this.prev : ch[v - 1]; }
+  process(inputs) {
+    const input = inputs[0];
+    if (!input || !input[0]) return true;
+    const ch = input[0];
+    const N = ch.length;
+    let t = this.t;
+    while (t < N) {
+      const i = Math.floor(t), frac = t - i;
+      const a = this.sample(i, ch), b = this.sample(i + 1, ch);
+      let s = a + (b - a) * frac;
+      s = s < -1 ? -1 : s > 1 ? 1 : s;
+      this.acc.push(s < 0 ? s * 32768 : s * 32767);
+      t += this.ratio;
+    }
+    this.t = t - N;
+    this.prev = ch[N - 1];
+    while (this.acc.length >= this.FRAME) {
+      const chunk = Int16Array.from(this.acc.splice(0, this.FRAME));
+      this.port.postMessage(chunk.buffer, [chunk.buffer]);
+    }
+    return true;
+  }
+}
+registerProcessor("pcm-downsampler", PCMDownsampler);
+`;
+
+async function acquireWakeLock() {
+  try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) { /* best effort */ }
+}
+document.addEventListener("visibilitychange", () => {
+  if (wakeLock !== undefined && document.visibilityState === "visible" && ctx) acquireWakeLock();
+});
+
+async function start() {
+  startBtn.disabled = true;
+  setStatus("requesting mic…");
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      video: false,
+    });
+  } catch (e) {
+    setStatus("mic denied: " + e.message);
+    startBtn.disabled = false;
+    return;
+  }
+
+  // From here the mic is LIVE. Any failure (worklet blocked, unsupported WebView, ws refused)
+  // must release the mic + reset the UI, or the mic stays open with no button to stop it.
+  try {
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET_SRC], { type: "application/javascript" })));
+
+    ws = new WebSocket(WS_URL);
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => {
+      setStatus("connected — capturing", true);
+      startedAt = Date.now(); bytesSent = 0;
+      metaTimer = setInterval(updateMeta, 1000); updateMeta();
+      stopBtn.disabled = false; markerBtn.disabled = false;
+    };
+    ws.onclose = () => { if (ctx) stop("connection closed"); };
+    ws.onerror = () => setStatus("connection error");
+
+    const src = ctx.createMediaStreamSource(stream);
+    node = new AudioWorkletNode(ctx, "pcm-downsampler", { processorOptions: { targetRate: TARGET_RATE } });
+    node.port.onmessage = (e) => {
+      if (ws && ws.readyState === WebSocket.OPEN) { ws.send(e.data); bytesSent += e.data.byteLength; }
+    };
+    src.connect(node);
+    // Do NOT connect node -> destination (would echo the mic to the speaker). The worklet still
+    // runs as long as it's fed by a live source node.
+    await acquireWakeLock();
+  } catch (e) {
+    stop("setup failed: " + (e && e.message ? e.message : e));  // releases the mic + re-enables Start
+  }
+}
+
+function stop(reason) {
+  stopBtn.disabled = true; markerBtn.disabled = true;
+  if (metaTimer) { clearInterval(metaTimer); metaTimer = null; }
+  try { if (node) node.disconnect(); } catch (e) {}
+  try { if (stream) stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+  try { if (ws && ws.readyState <= 1) ws.close(); } catch (e) {}
+  try { if (ctx) ctx.close(); } catch (e) {}
+  try { if (wakeLock) { wakeLock.release(); wakeLock = undefined; } } catch (e) {}
+  ctx = ws = node = stream = null; startedAt = 0;
+  setStatus(reason || "stopped");
+  startBtn.disabled = false;
+}
+
+startBtn.onclick = start;
+stopBtn.onclick = () => stop("stopped");
+markerBtn.onclick = () => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "marker" }));
+    markerBtn.textContent = "Marked ✓";
+    setTimeout(() => (markerBtn.textContent = "Mark this moment"), 1200);
+  }
+};
+</script>
+</body>
+</html>

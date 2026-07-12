@@ -53,6 +53,33 @@ forwarded to `omi_bridge` on loopback; there is no LAN alternative (OMI's cloud 
 - Rows land in the **shared** `ambient.db` as `source=omi-<uid>`, `provenance=ambient_overheard`
   (same as the PE — so a future engine scans both). The §3 graduation boundary applies unchanged.
 
+## 1c. Phone to edge — meeting-capture audio WebSocket
+
+The [`meeting_bridge`](bridges/meeting_bridge/) captures a **near-field 1:1 meeting** from a phone
+(or the browser capture page) and streams it to Speechmatics real-time diarization, writing a live
+diarized `.md`. This is **not** an overheard-ambient path: it is the user's own deliberately-started
+capture, so it goes straight to a transcript file and does **not** touch `ambient.db` or the §3
+graduation boundary.
+
+- **Endpoints** — `GET /capture/<token>` serves the browser capture page; `GET /meeting/<token>`
+  is the audio WebSocket. One WS connection opens exactly one cloud (Speechmatics) session.
+- **Per-session model** — the client MAY pick the Speechmatics operating point with a
+  `?model=standard|enhanced` query on the WS URL. The server validates it against a whitelist and
+  falls back to its configured default (`MEETING_MODEL`, default `enhanced`) for any other value —
+  the query is never trusted raw. The model is fixed for the life of a session, so switching means
+  closing and reopening the socket.
+- **Wire format** — **binary** frames = raw **16-bit little-endian mono PCM at 16 kHz** (the same
+  rate as §1 ambient, sent without resampling). **Text** frames = JSON control; today only
+  `{"type": "marker"}`, which drops a timestamped marker into the transcript.
+- **Auth** — a secret token in the **URL path** (`<token>`), constant-time compared, with a
+  `…_PREVIOUS` token honored during rotation. Path-token because a browser/phone WebSocket cannot
+  set custom headers. Exposed **tailnet-only** via `tailscale serve` (private) — not Funnel; the
+  phone is on the tailnet. `access_log` is disabled so the path token never hits disk.
+- **Liveness** — the server sends WebSocket heartbeat pings and force-closes a peer that stops
+  answering (phone screen-lock / wifi handoff), finalizing the cloud session instead of leaking it.
+- Native background client: [`clients/android-mic`](clients/android-mic/) (foreground mic service,
+  survives screen-lock). Its audio is dropped, not buffered, across a reconnect.
+
 ## 2. Edge (conversational) to Genesis — `/v1/voice/*`
 
 The `s2s_bridge` calls Genesis over HTTP for tool execution, the system prompt, and

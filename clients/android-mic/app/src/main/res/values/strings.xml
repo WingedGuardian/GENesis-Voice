@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Genesis Meeting Mic</string>
+    <string name="label_ws_url">Bridge WebSocket base (…/meeting/)</string>
+    <string name="hint_ws_url">wss://your-host.ts.net/meeting/</string>
+    <string name="label_token">Ingest token</string>
+    <string name="hint_token">paste your MEETING_INGEST_TOKEN</string>
+    <string name="label_model_enhanced">Enhanced model (higher accuracy)</string>
+    <string name="hint_model">On = Enhanced (~$0.43/hr). Off = Standard (~$0.24/hr). Applies to the next session — stop &amp; start to switch.</string>
+    <string name="btn_start">Start</string>
+    <string name="btn_stop">Stop</string>
+    <string name="btn_battery">Allow background running</string>
+    <string name="status_idle">○ Idle</string>
+    <string name="status_mic_denied">✕ Microphone permission denied</string>
+    <string name="status_bad_config">✕ Enter a wss:// URL and a token</string>
+    <string name="battery_hint">This phone may stop the capture when the screen locks. Tap below to allow background running, and on Samsung also exclude this app from Device Care → Sleeping apps.</string>
+</resources>

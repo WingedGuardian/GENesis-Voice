@@ -61,10 +61,43 @@ Set the device's bridge address (in `firmware/voice_pe_config.yaml`, your substi
 to the edge box and the bridge port (default 8080), then reflash. Say the wake word and
 start talking.
 
+## 4. Meeting capture (phone → live diarized transcript)
+
+The `meeting_bridge` captures a near-field 1:1 meeting from your **phone** and streams it to
+Speechmatics real-time diarization, writing a live `.md` you can watch grow. It reuses the ambient
+bridge's Speechmatics `ActiveSession`, so it needs that key present.
+
+```bash
+deploy/install.sh meeting
+mkdir -p ~/.meeting && cp deploy/meeting.env.example ~/.meeting/meeting.env
+chmod 600 ~/.meeting/meeting.env         # then set a long random MEETING_INGEST_TOKEN
+# reuses ~/.ambient-active/speechmatics.key
+systemctl --user daemon-reload
+systemctl --user enable --now meeting-bridge
+```
+
+Expose it to your phone **tailnet-only** (private — not Funnel; the phone is on your tailnet):
+
+```bash
+tailscale serve --bg https+insecure://localhost:8790     # serves /capture and /meeting over HTTPS
+```
+
+Then either open `https://<edge>.<tailnet>.ts.net/capture/<token>` in the phone browser (works only
+while the screen stays on), or — to keep capturing with the **screen locked** — build and sideload
+the native Android client:
+
+- Build + install + Samsung background-survival steps: [`../clients/android-mic/README.md`](../clients/android-mic/README.md).
+- Deliver the built `app-debug.apk` to the phone over the tailnet (e.g. `tailscale serve` a
+  download path, or `python -m http.server` on the edge behind serve), then sideload it.
+
+The transcript lands in `~/meeting-sessions/<timestamp>.md` on the edge. This path is the user's own
+capture — it goes straight to a file and never touches `ambient.db` or the §3 graduation boundary.
+
 ## Notes
 
 - Keep bridge ports on a trusted local network. The device-to-edge socket is unauthenticated
-  by design (see [`../CONTRACTS.md`](../CONTRACTS.md)).
+  by design (see [`../CONTRACTS.md`](../CONTRACTS.md)). The meeting bridge (§1c) is the exception —
+  it is path-token authenticated because it rides the tailnet to your phone.
 - `bridges/s2s_bridge` can also run as a container — see its `Dockerfile`
   (`docker build` then `docker run --env-file edge/.env -p 8080:8080`). The systemd
   path above is the simplest for a VM.
