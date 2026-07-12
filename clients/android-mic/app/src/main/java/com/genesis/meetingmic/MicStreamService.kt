@@ -14,6 +14,8 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -60,15 +62,21 @@ class MicStreamService : LifecycleService() {
         const val ACTION_MARK = "com.genesis.meetingmic.MARK"
         const val EXTRA_WS_URL = "ws_url"   // full base ending in .../meeting/
         const val EXTRA_TOKEN = "token"
+        const val EXTRA_MODEL = "model"     // "standard" | "enhanced" (fixed per session)
 
         private const val CHANNEL_ID = "capture"
         private const val NOTIF_ID = 1
 
         // Persisted so a START_STICKY restart (OS kills the process mid-meeting, redelivers a null
-        // intent) can resume with the same endpoint instead of erroring out. App-private storage.
+        // intent) can resume with the same endpoint/model instead of erroring out. App-private storage.
         private const val PREFS = "capture_creds"
         private const val KEY_URL = "ws_url"
         private const val KEY_TOKEN = "token"
+        private const val KEY_MODEL = "model"
+
+        // Safety auto-stop: cap a single continuous session so a forgotten/left-running stream can't
+        // silently rack up Speechmatics cost. Resets on each fresh Start (or sticky restart).
+        private const val MAX_SESSION_MS = 8L * 60 * 60 * 1000  // 8 hours
 
         // 16 kHz mono PCM16 — the bridge's native ambient/meeting rate, sent without resampling.
         const val SAMPLE_RATE = 16000
@@ -101,6 +109,7 @@ class MicStreamService : LifecycleService() {
     // @Volatile: read from OkHttp callback threads (onSocketDown) as well as the main thread.
     @Volatile private var captureJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private val http: OkHttpClient by lazy {
         // No read timeout: a WebSocket is long-lived. The bridge sends heartbeat pings and OkHttp
@@ -120,6 +129,7 @@ class MicStreamService : LifecycleService() {
             ACTION_START, null -> {
                 var base = intent?.getStringExtra(EXTRA_WS_URL).orEmpty()
                 var token = intent?.getStringExtra(EXTRA_TOKEN).orEmpty()
+                var model = intent?.getStringExtra(EXTRA_MODEL).orEmpty()
                 if (base.isEmpty() || token.isEmpty()) {
                     // Null/empty intent == a START_STICKY restart after an OS kill. Restore the last
                     // creds so capture actually resumes instead of erroring out. (Whether Android
@@ -128,8 +138,9 @@ class MicStreamService : LifecycleService() {
                     val p = getSharedPreferences(PREFS, MODE_PRIVATE)
                     base = p.getString(KEY_URL, "").orEmpty()
                     token = p.getString(KEY_TOKEN, "").orEmpty()
+                    model = p.getString(KEY_MODEL, "").orEmpty()
                 }
-                startCapture(base, token)
+                startCapture(base, token, model)
             }
         }
         // START_STICKY: if the OS kills us for memory, Android restarts the service (null intent);
@@ -138,7 +149,7 @@ class MicStreamService : LifecycleService() {
     }
 
     // ── capture lifecycle ────────────────────────────────────────────────────
-    private fun startCapture(base: String, token: String) {
+    private fun startCapture(base: String, token: String, model: String) {
         if (captureJob?.isActive == true) return  // already running
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
@@ -149,16 +160,16 @@ class MicStreamService : LifecycleService() {
             return
         }
 
-        val url = buildUrl(base, token)
+        val url = buildUrl(base, token, model)
         if (url == null) {
             publish(Phase.ERROR, "invalid capture URL")
             stopSelf()
             return
         }
 
-        // Persist creds so a sticky restart after an OS kill can resume (cleared on explicit stop).
+        // Persist creds+model so a sticky restart after an OS kill can resume (cleared on explicit stop).
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-            .putString(KEY_URL, base).putString(KEY_TOKEN, token).apply()
+            .putString(KEY_URL, base).putString(KEY_TOKEN, token).putString(KEY_MODEL, model).apply()
 
         startForegroundNotif()
         acquireWakeLock()
@@ -192,6 +203,7 @@ class MicStreamService : LifecycleService() {
         }
 
         var backoff = RECONNECT_MIN_MS
+        var ticks = 0  // frame counter; ~10 frames ≈ 1 s at 100 ms/frame
         try {
             recorder.startRecording()
             val buf = ByteArray(FRAME_BYTES)
@@ -202,12 +214,22 @@ class MicStreamService : LifecycleService() {
             while (currentCoroutineContext().isActive) {
                 val n = recorder.read(buf, 0, buf.size)
                 if (n <= 0) { delay(20); continue }
+                // Safety auto-stop after the max continuous duration (routed to the main thread so the
+                // FGS teardown runs there; break out of this loop immediately).
+                if (startedAtMs > 0 && System.currentTimeMillis() - startedAtMs >= MAX_SESSION_MS) {
+                    mainHandler.post { stopCapture("auto-stopped (8h limit)") }
+                    break
+                }
                 val sock = ws.get()
                 when {
                     wsConnected && sock != null -> {
                         if (sock.send(buf.toByteString(0, n))) {
                             bytesSent += n
                             backoff = RECONNECT_MIN_MS  // a good send means we're healthy — reset backoff
+                            // Refresh the live UI counters ~once/sec (the StateFlow otherwise only
+                            // emits on phase changes, so bytes/elapsed would appear frozen at 0).
+                            if (++ticks % 10 == 0) publish(Phase.LIVE, "capturing")
+                            if (ticks % 100 == 0) updateNotif(liveNotifText())  // ~every 10 s
                         } else {
                             // send() refused → socket is closing/closed; fall into reconnect.
                             onSocketDown("send failed")
@@ -297,13 +319,17 @@ class MicStreamService : LifecycleService() {
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
-    private fun buildUrl(base: String, token: String): String? {
+    private fun buildUrl(base: String, token: String, model: String): String? {
         val b = base.trim()
         val t = token.trim()
         if (t.isEmpty()) return null
         if (!b.startsWith("ws://") && !b.startsWith("wss://")) return null
         val sep = if (b.endsWith("/")) "" else "/"
-        return b + sep + t
+        // Model rides as a query param; the bridge validates it against a whitelist and falls back
+        // to its default if it's anything other than standard/enhanced, so an empty value is safe.
+        val m = model.trim().lowercase()
+        val query = if (m == "standard" || m == "enhanced") "?model=$m" else ""
+        return b + sep + t + query
     }
 
     private fun publish(phase: Phase, detail: String = _state.value.detail) {
@@ -338,6 +364,12 @@ class MicStreamService : LifecycleService() {
     private fun updateNotif(text: String) {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(NOTIF_ID, buildNotif(text))
+    }
+
+    private fun liveNotifText(): String {
+        val secs = if (startedAtMs > 0) (System.currentTimeMillis() - startedAtMs) / 1000 else 0L
+        val kb = bytesSent / 1024
+        return "Capturing — ${secs / 60}:${(secs % 60).toString().padStart(2, '0')} · $kb KB"
     }
 
     private fun buildNotif(text: String): Notification {

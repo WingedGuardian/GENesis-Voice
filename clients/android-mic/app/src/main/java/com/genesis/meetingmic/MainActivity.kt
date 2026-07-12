@@ -53,6 +53,13 @@ class MainActivity : AppCompatActivity() {
         b.wsUrl.setText(BuildConfig.MEETING_WS_URL)
         b.token.setText(BuildConfig.MEETING_TOKEN)
 
+        // Restore the last model choice (default = Enhanced/on); persist on toggle.
+        val prefs = getSharedPreferences("ui", MODE_PRIVATE)
+        b.modelSwitch.isChecked = prefs.getBoolean("enhanced", true)
+        b.modelSwitch.setOnCheckedChangeListener { _, checked ->
+            prefs.edit().putBoolean("enhanced", checked).apply()
+        }
+
         b.startBtn.setOnClickListener { requestThenStart() }
         b.stopBtn.setOnClickListener {
             startService(Intent(this, MicStreamService::class.java).setAction(MicStreamService.ACTION_STOP))
@@ -87,10 +94,12 @@ class MainActivity : AppCompatActivity() {
             b.status.text = getString(R.string.status_bad_config)
             return
         }
+        val model = if (b.modelSwitch.isChecked) "enhanced" else "standard"
         val i = Intent(this, MicStreamService::class.java)
             .setAction(MicStreamService.ACTION_START)
             .putExtra(MicStreamService.EXTRA_WS_URL, url)
             .putExtra(MicStreamService.EXTRA_TOKEN, token)
+            .putExtra(MicStreamService.EXTRA_MODEL, model)
         // A microphone FGS must be started while the app is in the foreground (it is — this is a tap).
         ContextCompat.startForegroundService(this, i)
     }

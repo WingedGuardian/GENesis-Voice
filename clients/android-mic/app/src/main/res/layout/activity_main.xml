@@ -45,6 +45,21 @@
             android:autofillHints=""
             android:hint="@string/hint_token" />
 
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/modelSwitch"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:checked="true"
+            android:text="@string/label_model_enhanced" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/hint_model"
+            android:textSize="12.5sp"
+            android:alpha="0.6" />
+
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

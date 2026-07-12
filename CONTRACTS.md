@@ -63,6 +63,11 @@ graduation boundary.
 
 - **Endpoints** — `GET /capture/<token>` serves the browser capture page; `GET /meeting/<token>`
   is the audio WebSocket. One WS connection opens exactly one cloud (Speechmatics) session.
+- **Per-session model** — the client MAY pick the Speechmatics operating point with a
+  `?model=standard|enhanced` query on the WS URL. The server validates it against a whitelist and
+  falls back to its configured default (`MEETING_MODEL`, default `enhanced`) for any other value —
+  the query is never trusted raw. The model is fixed for the life of a session, so switching means
+  closing and reopening the socket.
 - **Wire format** — **binary** frames = raw **16-bit little-endian mono PCM at 16 kHz** (the same
   rate as §1 ambient, sent without resampling). **Text** frames = JSON control; today only
   `{"type": "marker"}`, which drops a timestamped marker into the transcript.

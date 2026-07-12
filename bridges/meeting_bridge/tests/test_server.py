@@ -63,6 +63,7 @@ def _server_with_fake(cfg):
         s = FakeSession(done)
         box["session"] = s
         box["source"] = source
+        box["cfg"] = _cfg  # capture the per-connection cfg to assert the model override
         return s
 
     server = MeetingServer(cfg, session_factory=factory)
@@ -134,6 +135,39 @@ async def test_ws_relays_pcm_and_marker_then_finalizes(tmp_path):
         assert s.frames == [b"\x01\x02\x03\x04", b"\x05\x06"]
         assert s.markers == 1
         assert s.finalized is True
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_model_query_override_applied(tmp_path):
+    # The client picks the Speechmatics model per session via ?model=; a valid value reaches the
+    # session factory as cfg.model (default is "enhanced").
+    cfg = _cfg(tmp_path, model="enhanced")
+    server, box, done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}?model=standard")
+            await ws.send_bytes(b"\x01\x02")
+            await ws.close()
+            await asyncio.wait_for(done.wait(), timeout=2)
+        assert box["cfg"].model == "standard"
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_model_query_invalid_falls_back_to_default(tmp_path):
+    # A bogus/hostile ?model= is never trusted raw — it falls back to the configured default.
+    cfg = _cfg(tmp_path, model="enhanced")
+    server, box, done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}?model=hackzor")
+            await ws.send_bytes(b"\x01\x02")
+            await ws.close()
+            await asyncio.wait_for(done.wait(), timeout=2)
+        assert box["cfg"].model == "enhanced"
     finally:
         server.close()
 

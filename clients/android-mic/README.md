@@ -18,6 +18,18 @@ Targets the bridge's already-deployed ingress (see [`../../CONTRACTS.md`](../../
 - The bridge sends heartbeat pings; OkHttp auto-answers. On a dropped socket the app reconnects
   with backoff and resumes (audio during the gap is dropped, not buffered — buffering stale
   realtime audio would desync live diarization).
+- **Model** rides as `?model=standard|enhanced` on the WS URL (the in-app toggle); the bridge
+  validates + falls back to its default. The model is fixed per session — switching = stop & start.
+
+## Behaviour notes
+
+- **Enhanced ↔ Standard toggle** — picks the Speechmatics operating point for the *next* session
+  (Enhanced ≈ higher accuracy/cost, Standard ≈ cheaper). It can't change mid-stream, so flip it,
+  then Stop and Start. The choice is remembered.
+- **8-hour safety auto-stop** — a single continuous session stops itself after 8 h so a forgotten
+  stream can't quietly run up cost. Start again to continue. (A sticky restart resets the clock.)
+- **Live status** — the label and notification refresh ~once/second while capturing (elapsed + KB
+  sent), so a frozen `0s · 0 KB` means the socket never actually connected, not just a stale label.
 
 ## Configuration (endpoint + token)
 

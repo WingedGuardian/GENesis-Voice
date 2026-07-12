@@ -5,6 +5,8 @@
     <string name="hint_ws_url">wss://your-host.ts.net/meeting/</string>
     <string name="label_token">Ingest token</string>
     <string name="hint_token">paste your MEETING_INGEST_TOKEN</string>
+    <string name="label_model_enhanced">Enhanced model (higher accuracy)</string>
+    <string name="hint_model">On = Enhanced (~$0.43/hr). Off = Standard (~$0.24/hr). Applies to the next session — stop &amp; start to switch.</string>
     <string name="btn_start">Start</string>
     <string name="btn_stop">Stop</string>
     <string name="btn_battery">Allow background running</string>

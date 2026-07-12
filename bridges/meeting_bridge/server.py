@@ -14,6 +14,7 @@ imports (and unit-tests) without speechmatics-rt installed.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hmac
 import json
 import logging
@@ -31,6 +32,9 @@ logger = logging.getLogger(__name__)
 
 _CAPTURE_HTML_PATH = Path(__file__).with_name("capture.html")
 _TOKEN_PLACEHOLDER = "__MEETING_TOKEN__"  # replaced per-request with the validated path token
+# Speechmatics operating points the client may pick per session via ?model=. Anything else
+# (absent, typo, hostile) falls back to the configured default — the model is never trusted raw.
+_ALLOWED_MODELS = ("standard", "enhanced")
 
 
 def tracked_task(coro, *, name: str) -> asyncio.Task:
@@ -81,6 +85,18 @@ class MeetingServer:
         tok = token.encode("utf-8", "ignore")
         return any(hmac.compare_digest(tok, c.encode("utf-8")) for c in candidates)
 
+    # ── per-connection config ────────────────────────────────────────────────
+    def _cfg_for_request(self, request: web.Request) -> MeetingConfig:
+        """Config for this connection, honoring a validated ``?model=`` override.
+
+        The client picks the Speechmatics operating point per session; an absent/unknown value
+        keeps the configured default (never trust the query value raw). Everything else is unchanged.
+        """
+        model = request.query.get("model", "").strip().lower()
+        if model in _ALLOWED_MODELS and model != self._cfg.model:
+            return dataclasses.replace(self._cfg, model=model)
+        return self._cfg
+
     # ── capture page ─────────────────────────────────────────────────────────
     def _load_capture_html(self) -> str:
         if self._capture_html is None:
@@ -109,14 +125,18 @@ class MeetingServer:
         ws = web.WebSocketResponse(max_msg_size=self._cfg.max_frame_bytes, heartbeat=hb)
         await ws.prepare(request)
         source = f"meeting-{request.remote or '?'}-{int(time.time())}"
+        # The client may pick the Speechmatics model per session via ?model=standard|enhanced
+        # (a validated whitelist; anything else keeps the configured default). The model is fixed
+        # for the life of a Speechmatics session, so "switching" = stop + restart with the other one.
+        cfg = self._cfg_for_request(request)
         session = None
         self._active += 1
         self._sessions_total += 1
-        logger.info("meeting session opening: %s (active=%d)", source, self._active)
+        logger.info("meeting session opening: %s model=%s (active=%d)", source, cfg.model, self._active)
         try:
             # Inside the try so a factory/start failure is CONTAINED (logged, not propagated to
             # aiohttp's error logger) and still runs the finally cleanup below.
-            session = self._session_factory(self._cfg, source)
+            session = self._session_factory(cfg, source)
             await session.start()
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
