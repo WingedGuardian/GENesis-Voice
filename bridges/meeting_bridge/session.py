@@ -46,6 +46,8 @@ def default_session_factory(cfg, source: str) -> MeetingSession:
         active_model=cfg.model,
         active_max_delay=cfg.max_delay,
         active_max_speakers=cfg.max_speakers,
+        active_prefer_current_speaker=cfg.prefer_current_speaker,
+        active_speaker_sensitivity=cfg.speaker_sensitivity,
         active_speaker_id_enabled=False,
     )
     return ActiveSession(ambient_cfg, source=source, speaker_id=None)

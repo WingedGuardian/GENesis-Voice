@@ -76,6 +76,10 @@ graduation boundary.
   falls back to its configured default (`MEETING_MODEL`, default `enhanced`) for any other value —
   the query is never trusted raw. The model is fixed for the life of a session, so switching means
   closing and reopening the socket.
+- **Diarization tuning** — the meeting bridge owns its own Speechmatics diarization defaults, tuned
+  to **segment more** than the ambient bridge (multi-speaker rooms otherwise under-segment into merged
+  mega-turns). Env-tunable per room: `MEETING_PREFER_CURRENT_SPEAKER` (default `false`) and
+  `MEETING_SPEAKER_SENSITIVITY` (default `0.6`).
 - **Wire format** — **binary** frames = raw **16-bit little-endian mono PCM at 16 kHz** (the same
   rate as §1 ambient, sent without resampling). **Text** frames = JSON control; today only
   `{"type": "marker"}`, which drops a timestamped marker into the transcript.

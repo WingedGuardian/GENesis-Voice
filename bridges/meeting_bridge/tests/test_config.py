@@ -32,3 +32,35 @@ def test_output_dir_default_and_override(monkeypatch):
     assert MeetingConfig().output_dir.endswith("/meeting-sessions")
     monkeypatch.setenv("MEETING_OUTPUT_DIR", "/tmp/mtg")
     assert MeetingConfig().output_dir == "/tmp/mtg"
+
+
+def test_diarization_defaults_are_meeting_tuned(monkeypatch):
+    # Meeting-appropriate defaults (segment more) — the OPPOSITE of the ambient bridge's
+    # near-field anti-over-split defaults (prefer_current=True, sensitivity=None).
+    monkeypatch.delenv("MEETING_PREFER_CURRENT_SPEAKER", raising=False)
+    monkeypatch.delenv("MEETING_SPEAKER_SENSITIVITY", raising=False)
+    cfg = MeetingConfig()
+    assert cfg.prefer_current_speaker is False
+    assert cfg.speaker_sensitivity == 0.6
+
+
+def test_diarization_env_overrides(monkeypatch):
+    monkeypatch.setenv("MEETING_PREFER_CURRENT_SPEAKER", "true")
+    monkeypatch.setenv("MEETING_SPEAKER_SENSITIVITY", "0.3")
+    cfg = MeetingConfig()
+    assert cfg.prefer_current_speaker is True
+    assert cfg.speaker_sensitivity == 0.3
+
+
+def test_speaker_sensitivity_none_sentinels_defer_to_speechmatics(monkeypatch):
+    # '', 'auto', 'none' → None so _diar_kwargs omits it and Speechmatics uses its own default.
+    monkeypatch.setenv("MEETING_SPEAKER_SENSITIVITY", "none")
+    assert MeetingConfig().speaker_sensitivity is None
+    monkeypatch.setenv("MEETING_SPEAKER_SENSITIVITY", "")
+    assert MeetingConfig().speaker_sensitivity is None
+
+
+def test_prefer_current_speaker_falsey_strings(monkeypatch):
+    for falsey in ("0", "false", "no"):
+        monkeypatch.setenv("MEETING_PREFER_CURRENT_SPEAKER", falsey)
+        assert MeetingConfig().prefer_current_speaker is False
