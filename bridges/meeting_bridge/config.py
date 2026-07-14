@@ -22,6 +22,22 @@ def _env_int_or_none(name: str) -> int | None:
     return int(v)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() not in ("0", "false", "no", "")
+
+
+def _env_float_or_none(name: str, default: float | None) -> float | None:
+    """Float env, or None to defer to Speechmatics' own default. '', 'auto', 'none' → None."""
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    v = v.strip().lower()
+    return None if v in ("", "auto", "none") else float(v)
+
+
 @dataclass(frozen=True)
 class MeetingConfig:
     # --- HTTP/WS ingress ---
@@ -59,6 +75,19 @@ class MeetingConfig:
     max_delay: float = field(default_factory=lambda: float(_env("MEETING_MAX_DELAY", "1.0")))
     # None => Speechmatics auto-detects the speaker count (no cap) — right for an unknown 1:1/small.
     max_speakers: int | None = field(default_factory=lambda: _env_int_or_none("MEETING_MAX_SPEAKERS"))
+    # Diarization defaults are MEETING-tuned (multi-speaker → segment more), the opposite of the
+    # ambient bridge's near-field anti-over-split posture (prefer_current=True, sensitivity=None).
+    # A meeting session inherits from AmbientConfig (session.py) and would otherwise UNDER-segment —
+    # long merged mega-turns, as seen on the first real ~2h capture. These override it:
+    #   prefer_current_speaker=False → let Speechmatics re-attribute to a different speaker at a
+    #     boundary instead of sticking with the current one (ambient uses True to avoid over-split).
+    #   speaker_sensitivity=0.6 → lean toward splitting a new speaker (higher = more speakers).
+    # First calibration from one noisy capture — env-tunable per room; dial down / set prefer=true
+    # if a real meeting OVER-splits (spurious S-flips). None on sensitivity ⇒ Speechmatics default.
+    prefer_current_speaker: bool = field(default_factory=lambda: _env_bool("MEETING_PREFER_CURRENT_SPEAKER", False))
+    speaker_sensitivity: float | None = field(
+        default_factory=lambda: _env_float_or_none("MEETING_SPEAKER_SENSITIVITY", 0.6)
+    )
 
     # --- VAD-driven session lifecycle (energy gate over the incoming PCM) ---
     # Peak absolute int16 amplitude at/above which a frame counts as SPEECH. 0 DISABLES gating:
