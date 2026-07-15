@@ -40,6 +40,9 @@ class FakeSession:
         self.started = False
         self.finalized = False
         self.path = f"/fake/session-{idx}.md"
+        # Committed-transcript count the server polls for the transcript-idle close. Real ActiveSession
+        # exposes this (len of committed turns); tests bump it to simulate Speechmatics committing turns.
+        self.turns = 0
 
     async def start(self):
         self.started = True
@@ -79,6 +82,16 @@ def _server_with_fake(cfg):
 
 async def _client(server):
     return TestClient(TestServer(server.build_app()))
+
+
+async def _wait_for_session(box, timeout=1.0):
+    """Await until the server has opened a FakeSession (the factory runs server-side, so a session
+    isn't visible the instant the client's send_bytes returns)."""
+    for _ in range(int(timeout / 0.005)):
+        if box.get("session") is not None:
+            return box["session"]
+        await asyncio.sleep(0.005)
+    raise AssertionError("session was never opened")
 
 
 @pytest.mark.asyncio
@@ -388,5 +401,144 @@ async def test_vad_segments_two_sessions_across_silence(tmp_path):
         assert box["sessions"][1].finalized is True  # second meeting closed on teardown
         assert box["sessions"][0].frames == [_pcm(8000)]
         assert box["sessions"][1].frames == [_pcm(8000)]
+    finally:
+        server.close()
+
+
+# ── transcript-idle close + dormant re-arm (the post-meeting billed-noise fix) ──────────────────
+# silence_close_s is kept comfortably larger than transcript_idle_close_s so back-to-back frames
+# can't accidentally re-arm dormancy mid-assertion; real gaps drive the tiny thresholds (same style
+# as test_vad_segments_two_sessions_across_silence).
+
+
+@pytest.mark.asyncio
+async def test_transcript_idle_closes_and_goes_dormant(tmp_path):
+    # A session whose committed transcript goes quiet (turns stops climbing) finalizes even though the
+    # mic stays LOUD — and continuing loud "noise" then opens NO new session (dormant), so we stop
+    # billing the post-meeting tail instead of running until disconnect.
+    cfg = _cfg(tmp_path, vad_threshold=1000, vad_hangover_s=0.0, silence_close_s=0.5, transcript_idle_close_s=0.05)
+    server, box, done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_bytes(_pcm(8000))  # opens session 0 (turns stays 0 = no transcript)
+            await asyncio.sleep(0.12)  # > transcript_idle_close_s with no new turn
+            await ws.send_bytes(_pcm(8000))  # loud, but transcript idle → finalize + dormant
+            await ws.send_bytes(_pcm(8000))  # loud noise while dormant → must NOT open a new session
+            await ws.close()
+            await asyncio.wait_for(done.wait(), timeout=2)
+        assert len(box["sessions"]) == 1  # dormant suppressed reopening on noise
+        assert box["sessions"][0].finalized is True
+        assert server._sessions_idle_closed == 1
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_transcript_activity_keeps_session_open(tmp_path):
+    # While Speechmatics keeps committing turns, the idle timer resets each turn → no premature close.
+    cfg = _cfg(tmp_path, vad_threshold=1000, vad_hangover_s=0.0, silence_close_s=0.5, transcript_idle_close_s=0.08)
+    server, box, done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_bytes(_pcm(8000))  # opens session 0
+            session = await _wait_for_session(box)
+            for turn in range(1, 4):  # bump turns each step, gaps < idle → timer keeps resetting
+                session.turns = turn
+                await asyncio.sleep(0.03)
+                await ws.send_bytes(_pcm(8000))
+            await ws.close()
+            await asyncio.wait_for(done.wait(), timeout=2)
+        assert len(box["sessions"]) == 1  # never idle-closed mid-meeting
+        assert server._sessions_idle_closed == 0
+        assert box["sessions"][0].finalized is True  # closed on teardown, not idle
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_dormant_rearms_after_silence_opens_new_session(tmp_path):
+    # After a transcript-idle close, a genuinely quiet room (silence_close_s) re-arms the connection so
+    # a real NEXT meeting opens a fresh session.
+    cfg = _cfg(tmp_path, vad_threshold=1000, vad_hangover_s=0.0, silence_close_s=0.1, transcript_idle_close_s=0.05)
+    server, box, done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_bytes(_pcm(8000))  # session 0
+            await asyncio.sleep(0.12)
+            await ws.send_bytes(_pcm(8000))  # idle-close → dormant (resets the silence timer)
+            await asyncio.sleep(0.25)  # quiet for > silence_close_s
+            await ws.send_bytes(_pcm(50))  # quiet frame → re-arm (no session opens on silence)
+            await ws.send_bytes(_pcm(8000))  # real next meeting → session 1
+            await ws.close()
+            await asyncio.wait_for(done.wait(), timeout=2)
+        assert len(box["sessions"]) == 2
+        assert box["sessions"][1].frames == [_pcm(8000)]
+        assert server._sessions_idle_closed == 1
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_marker_rearms_dormant_connection(tmp_path):
+    # A marker is an explicit "new meeting starts here" — it ends dormancy and opens a fresh session
+    # even while the room is still noisy (no silence gap needed).
+    cfg = _cfg(tmp_path, vad_threshold=1000, vad_hangover_s=0.0, silence_close_s=0.5, transcript_idle_close_s=0.05)
+    server, box, done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_bytes(_pcm(8000))  # session 0
+            await asyncio.sleep(0.12)
+            await ws.send_bytes(_pcm(8000))  # idle-close → dormant
+            await ws.send_str(json.dumps({"type": "marker"}))  # marker → re-arm + open session 1
+            await ws.close()
+            await asyncio.wait_for(done.wait(), timeout=2)
+        assert len(box["sessions"]) == 2
+        assert box["sessions"][1].markers == 1
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_transcript_idle_disabled_keeps_single_session(tmp_path):
+    # transcript_idle_close_s=0 disables the idle close: a loud-but-silent session keeps relaying (the
+    # pre-fix behavior), proving the knob is opt-out.
+    cfg = _cfg(tmp_path, vad_threshold=1000, vad_hangover_s=0.0, silence_close_s=0.5, transcript_idle_close_s=0.0)
+    server, box, done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_bytes(_pcm(8000))
+            await asyncio.sleep(0.12)
+            await ws.send_bytes(_pcm(8000))  # no idle close → same session keeps billing
+            await ws.close()
+            await asyncio.wait_for(done.wait(), timeout=2)
+        assert len(box["sessions"]) == 1
+        assert server._sessions_idle_closed == 0
+        assert box["sessions"][0].frames == [_pcm(8000), _pcm(8000)]
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_gate_disabled_ignores_transcript_idle(tmp_path):
+    # With the gate OFF (threshold 0, legacy one-session-per-connection), the transcript-idle machinery
+    # is inert regardless of its setting — every frame relays into the single session.
+    cfg = _cfg(tmp_path, vad_threshold=0, transcript_idle_close_s=0.05)
+    server, box, done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_bytes(_pcm(8000))
+            await asyncio.sleep(0.12)
+            await ws.send_bytes(_pcm(50))  # gate off → still relayed; no idle close
+            await ws.close()
+            await asyncio.wait_for(done.wait(), timeout=2)
+        assert len(box["sessions"]) == 1
+        assert server._sessions_idle_closed == 0
+        assert box["sessions"][0].frames == [_pcm(8000), _pcm(50)]
     finally:
         server.close()

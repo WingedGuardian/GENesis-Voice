@@ -105,6 +105,19 @@ class MeetingConfig:
     # rather than the cloud dropping us. Small = more files (a long pause splits a meeting); large =
     # risks the idle timeout. Default 45s: above normal in-meeting pauses, below likely idle limits.
     silence_close_s: float = field(default_factory=lambda: float(_env("MEETING_SILENCE_CLOSE_S", "45")))
+    # Finalize a session after this many seconds with NO new committed transcript turn, even while mic
+    # energy stays above threshold. The energy gate can't tell ambient room noise from speech, so in a
+    # noisy room (a real ~98min capture stayed open ~80min past the meeting on background noise) a
+    # session runs — and bills Speechmatics — long after the words stop; the committed-turn cadence is
+    # the real "meeting still going?" signal. After it fires the connection goes DORMANT (no new session
+    # on mere noise) until the room falls silent for `silence_close_s`, a marker is pressed, or the phone
+    # reconnects. Default 300s: generous enough that a genuine mid-meeting pause (a real meeting committed
+    # a turn ~every 40s) never cuts a live transcript, while it trims the post-meeting tail to ~5min.
+    # Lower to trim the tail further, raise if real meetings get split. 0 disables. Only active when the
+    # gate is armed (vad_threshold>0) — legacy one-session mode is unaffected.
+    transcript_idle_close_s: float = field(
+        default_factory=lambda: float(_env("MEETING_TRANSCRIPT_IDLE_CLOSE_S", "300"))
+    )
     # Periodic peak/pass/gate summary interval (seconds) for threshold calibration; 0 disables.
     vad_log_interval_s: float = field(default_factory=lambda: float(_env("MEETING_VAD_LOG_INTERVAL_S", "30")))
 
