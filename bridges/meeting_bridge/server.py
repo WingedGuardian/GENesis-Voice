@@ -64,7 +64,8 @@ class MeetingServer:
         self._active = 0  # concurrent WS connections
         self._sessions_total = 0  # cloud (Speechmatics) sessions opened — now one per meeting
         self._frames = 0  # frames forwarded to a cloud session
-        self._frames_gated = 0  # frames dropped as silence (never billed)
+        self._frames_gated = 0  # frames dropped as silence / not billed (incl. noise while dormant)
+        self._sessions_idle_closed = 0  # sessions finalized on transcript-idle (post-meeting noise tail)
         self._bytes = 0
         self._last_frame_ts: float | None = None
         self._capture_html: str | None = None
@@ -147,6 +148,16 @@ class MeetingServer:
         stats = GateStats(self._cfg.vad_log_interval_s)
         session = None
         opened = 0  # cloud sessions opened on THIS connection (for the close log)
+        # Transcript-idle lifecycle (only meaningful when the gate is armed): `dormant` suppresses
+        # reopening a billed session on mere room noise after a meeting's committed transcript goes
+        # quiet, until the room actually falls silent for silence_close_s / a marker / a reconnect.
+        # last_turns + last_turn_ts track committed-turn cadence; last_loud_ts is a local silence timer
+        # driving the dormant→armed re-arm (needed because after gate.reset() the gate can't re-emit
+        # `close` without a fresh speech run, so an immediately-quiet room would never re-arm off it).
+        dormant = False
+        last_turns = 0
+        last_turn_ts = 0.0
+        last_loud_ts = time.monotonic()
         self._active += 1
         logger.info(
             "meeting connection opening: %s model=%s vad_threshold=%d (active=%d)",
@@ -165,10 +176,50 @@ class MeetingServer:
                     now = time.monotonic()
                     peak = peak_amplitude(msg.data)
                     forward, close = gate.observe(peak, now)
-                    if forward:
+                    # Track strict above-threshold loudness (independent of the gate's hangover) so a
+                    # dormant connection can measure a genuinely quiet room and re-arm.
+                    if gate.enabled and peak >= cfg.vad_threshold:
+                        last_loud_ts = now
+                    # Re-arm: a transcript-idle close parked this connection dormant; a real quiet gap
+                    # (or a marker / reconnect) ends dormancy so a genuine next meeting opens fresh,
+                    # while continuing room noise does not.
+                    if dormant and gate.enabled and now - last_loud_ts >= cfg.silence_close_s:
+                        dormant = False
+                        logger.info("meeting re-armed after %.0fs silence: %s", now - last_loud_ts, source)
+                    # Transcript-idle close: stop billing when Speechmatics' committed transcript has gone
+                    # quiet even though the room hasn't (the energy gate can't tell noise from speech).
+                    # Uses the session's already-deployed committed-turn count; getattr keeps a backend
+                    # without it on the energy-only path.
+                    if gate.enabled and session is not None and cfg.transcript_idle_close_s > 0:
+                        turns = getattr(session, "turns", None)
+                        if turns is None:
+                            pass  # backend has no turn signal → transcript-idle close disabled
+                        elif turns != last_turns:
+                            last_turns = turns
+                            last_turn_ts = now
+                        elif now - last_turn_ts >= cfg.transcript_idle_close_s:
+                            try:
+                                await session.finalize()
+                            except Exception:
+                                logger.warning("meeting session idle-finalize failed for %s", source, exc_info=True)
+                            session = None
+                            gate.reset()
+                            dormant = True
+                            self._sessions_idle_closed += 1
+                            logger.info(
+                                "meeting cloud session CLOSE (transcript idle %.0fs): %s",
+                                cfg.transcript_idle_close_s,
+                                source,
+                            )
+                    # `dormant` suppresses billing on noise that isn't a new meeting; a freshly-opened
+                    # session seeds the idle tracker so a session that never transcribes still closes.
+                    send = forward and not dormant
+                    if send:
                         if session is None:
                             session = await self._open_session(cfg, source)
                             opened += 1
+                            last_turns = getattr(session, "turns", 0) or 0
+                            last_turn_ts = now
                         await session.send_audio(msg.data)
                         self._frames += 1
                         self._bytes += len(msg.data)
@@ -186,7 +237,7 @@ class MeetingServer:
                             session = None
                             gate.reset()
                             logger.info("meeting cloud session CLOSE (silence): %s", source)
-                    summary = stats.observe(peak, forward, now)
+                    summary = stats.observe(peak, send, now)
                     if summary is not None:
                         mode = f"ON(thr={cfg.vad_threshold})" if gate.enabled else "OFF(observe)"
                         logger.info(
@@ -200,11 +251,14 @@ class MeetingServer:
                         )
                 elif msg.type == WSMsgType.TEXT:
                     # A marker is an explicit "pay attention here" — never drop it into a silence
-                    # gap; open a session if one isn't currently active.
+                    # gap, and it ends dormancy (an explicit "a new meeting starts here").
                     if self._is_marker(msg.data):
+                        dormant = False
                         if session is None:
                             session = await self._open_session(cfg, source)
                             opened += 1
+                            last_turns = getattr(session, "turns", 0) or 0
+                            last_turn_ts = time.monotonic()
                         session.add_marker()
                 elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
                     break
@@ -263,6 +317,7 @@ class MeetingServer:
             "alive": True,
             "active_sessions": self._active,
             "sessions_total": self._sessions_total,
+            "sessions_idle_closed": self._sessions_idle_closed,
             "frames": self._frames,
             "frames_gated": self._frames_gated,
             "bytes": self._bytes,
