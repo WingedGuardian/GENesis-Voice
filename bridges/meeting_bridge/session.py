@@ -15,7 +15,15 @@ from typing import Protocol
 
 
 class MeetingSession(Protocol):
-    """The slice of ``ActiveSession`` the server drives."""
+    """The slice of ``ActiveSession`` the server drives.
+
+    OPTIONAL liveness attributes (read via ``getattr``, so a backend may omit them — omitting both
+    just disables the transcript-idle close for that backend):
+
+    - ``last_activity: float | None`` — monotonic ts of the last ASR speech evidence (non-empty
+      partial or committed final); the primary transcript-idle signal.
+    - ``turns: int`` — committed-turn count; the fallback signal.
+    """
 
     path: str
 

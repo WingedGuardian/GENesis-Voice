@@ -59,7 +59,7 @@ phone capture.html ──wss(16k PCM)──▶ meeting_bridge (aiohttp) ──�
 | `MEETING_SESSION_FACTORY` | `meeting_bridge.session:default_session_factory` | Pluggable cloud backend (swap without a code change). |
 | `MEETING_VAD_THRESHOLD` | `0` (off) | Peak int16 energy for "speech". `0` ⇒ gating off (one session per connection). `>0` ⇒ session-per-meeting; calibrate from the peak-log (below). |
 | `MEETING_SILENCE_CLOSE_S` | `45` | Finalize a session after this much mic **silence**. Keep **below** Speechmatics' idle timeout. Also the quiet gap that re-arms a dormant connection. |
-| `MEETING_TRANSCRIPT_IDLE_CLOSE_S` | `300` | Finalize after this long with **no new committed transcript**, even if the mic stays loud — stops billing post-meeting room noise the energy gate can't distinguish from speech. Then dormant (no new session on noise) until silence/marker/reconnect. `0` disables. Lower to trim the tail; raise if real meetings get split. |
+| `MEETING_TRANSCRIPT_IDLE_CLOSE_S` | `300` | Finalize after this long with **no ASR speech evidence** (non-empty partial or final), even if the mic stays loud — stops billing post-meeting room noise the energy gate can't distinguish from speech. Partials count, so a quiet/far-field meeting the ASR hears but can't commit stays open. Then dormant (no new session on noise) until silence/marker/reconnect. `0` disables. |
 | `MEETING_VAD_HANGOVER_S` | `0.4` | Keep forwarding this long after speech so word-tails aren't clipped. |
 | `MEETING_VAD_LOG_INTERVAL_S` | `30` | Peak/pass/gate summary interval (for calibration); `0` disables. |
 

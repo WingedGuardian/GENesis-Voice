@@ -67,6 +67,15 @@ class ActiveSession:
             title=f"Active listen {ts.strftime('%Y-%m-%d %H:%M:%S UTC')}")
         self._client: AsyncClient | None = None
         self._last_partial = 0.0
+        # Monotonic ts of the last ASR SPEECH EVIDENCE — a non-empty partial or a committed final.
+        # Exposed via `last_activity` for liveness consumers (the meeting bridge's transcript-idle
+        # close): partials are the earliest "someone is talking" signal, since finals can lag many
+        # seconds — or never commit at all on quiet/far-field audio.
+        self._last_activity: float | None = None
+        # Last partial TEXT seen — evidence requires the partial to CHANGE (new words being heard).
+        # Speechmatics re-emits the same trailing partial for as long as audio keeps flowing, so a
+        # frozen partial over post-speech noise must not read as a live meeting.
+        self._last_partial_text = ""
         self._finalized = False
         # Set once audio streaming begins (end of start()) — the session's t=0, against which a
         # user marker's elapsed time is measured so its [ts] aligns with the Speechmatics ones.
@@ -109,8 +118,7 @@ class ActiveSession:
                        self._source, self._path)
         client = AsyncClient(api_key=key)
         client.on(ServerMessageType.ADD_TRANSCRIPT, self._on_final)
-        client.on(ServerMessageType.ADD_PARTIAL_TRANSCRIPT,
-                  lambda m: (self._acc.set_partial(m), self._flush_partial()))
+        client.on(ServerMessageType.ADD_PARTIAL_TRANSCRIPT, self._on_partial)
         client.on(ServerMessageType.ERROR, lambda m: logger.error("Speechmatics ERROR: %s", str(m)[:200]))
         client.on(ServerMessageType.WARNING, lambda m: logger.warning("Speechmatics WARNING: %s", str(m)[:200]))
         self._flush()  # header now, so the file exists for tailing immediately
@@ -133,12 +141,42 @@ class ActiveSession:
         # task's loop), so _on_final can schedule the off-loop resolve from inside a sync callback.
         self._loop = asyncio.get_running_loop()
 
+    @property
+    def last_activity(self) -> float | None:
+        """Monotonic ts of the last ASR speech evidence (non-empty partial or committed final);
+        None until the first. The meeting bridge gates its transcript-idle close on this."""
+        return self._last_activity
+
     def _on_final(self, msg: dict) -> None:
         """ADD_TRANSCRIPT handler (sync, on the SDK's event loop): commit + flush, then maybe
-        kick a debounced, off-loop speaker-ID resolve pass."""
+        kick a debounced, off-loop speaker-ID resolve pass. Counts as speech evidence ONLY when
+        the final creates a NEW committed entry: verified against the live API, Speechmatics emits
+        EMPTY finals every couple of seconds for as long as audio flows (a commit heartbeat), and
+        those must not keep a noise-only session's liveness fresh. A same-speaker continuation
+        final MERGES into the last entry (len unchanged) and deliberately doesn't stamp either —
+        its words already stamped as partials, which are the primary evidence signal."""
+        before = len(self._acc.committed)
         self._acc.add_final(msg)
+        if len(self._acc.committed) != before:
+            self._last_activity = time.monotonic()
+            self._last_partial_text = ""  # partial restarts after a commit — the next one counts anew
         self._flush()
         self._maybe_resolve()
+
+    def _on_partial(self, msg: dict) -> None:
+        """ADD_PARTIAL_TRANSCRIPT handler (sync, on the SDK's loop): live-preview + liveness.
+        Same accumulator/flush behavior as the previous inline lambda; additionally counts a
+        CHANGED non-empty partial as speech evidence (same text extraction as
+        TranscriptAccumulator.set_partial). The change requirement is load-bearing: verified
+        against the live API, Speechmatics re-emits the same trailing partial for as long as
+        audio keeps flowing, so with noise after speech a frozen partial would otherwise keep a
+        session's liveness fresh forever. New words → changed text → evidence."""
+        text = ((msg.get("metadata") or {}).get("transcript") or "").strip()
+        if text and text != self._last_partial_text:
+            self._last_partial_text = text
+            self._last_activity = time.monotonic()
+        self._acc.set_partial(msg)
+        self._flush_partial()
 
     async def send_audio(self, frame: bytes) -> None:
         if self._client is not None:

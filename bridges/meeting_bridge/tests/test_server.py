@@ -9,6 +9,7 @@ guard, and the health JSON — WITHOUT needing speechmatics-rt / numpy.
 import asyncio
 import json
 import struct
+import time
 
 import pytest
 from aiohttp import WSMsgType
@@ -40,9 +41,12 @@ class FakeSession:
         self.started = False
         self.finalized = False
         self.path = f"/fake/session-{idx}.md"
-        # Committed-transcript count the server polls for the transcript-idle close. Real ActiveSession
-        # exposes this (len of committed turns); tests bump it to simulate Speechmatics committing turns.
+        # ASR-evidence signals the server polls for the transcript-idle close, mirroring the real
+        # ActiveSession: `last_activity` (monotonic ts of the last non-empty partial or final — the
+        # primary signal) and `turns` (committed-turn count — the fallback). Tests bump these to
+        # simulate Speechmatics hearing speech.
         self.turns = 0
+        self.last_activity: float | None = None
 
     async def start(self):
         self.started = True
@@ -540,5 +544,35 @@ async def test_gate_disabled_ignores_transcript_idle(tmp_path):
         assert len(box["sessions"]) == 1
         assert server._sessions_idle_closed == 0
         assert box["sessions"][0].frames == [_pcm(8000), _pcm(50)]
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_partial_activity_prevents_idle_close(tmp_path):
+    # ASR partial evidence (quiet/far-field speech Speechmatics hears but never commits as a final —
+    # the 7/16 real-meeting failure) counts as liveness: with turns frozen at 0 but `last_activity`
+    # fresh, the session must NOT idle-close. Once the evidence goes stale, it closes as before.
+    cfg = _cfg(tmp_path, vad_threshold=1000, vad_hangover_s=0.0, silence_close_s=0.5, transcript_idle_close_s=0.08)
+    server, box, done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_bytes(_pcm(8000))  # opens session 0
+            session = await _wait_for_session(box)
+            for _ in range(4):  # fresh partial evidence each step, turns never move
+                session.last_activity = time.monotonic()
+                await asyncio.sleep(0.03)
+                await ws.send_bytes(_pcm(8000))
+            assert len(box["sessions"]) == 1
+            assert server._sessions_idle_closed == 0  # partials kept it open past 4x the idle window
+            await asyncio.sleep(0.12)  # evidence goes stale (> transcript_idle_close_s)
+            await ws.send_bytes(_pcm(8000))  # loud, but no fresh evidence → idle-close + dormant
+            await ws.send_bytes(_pcm(8000))  # still dormant → no reopen
+            await ws.close()
+            await asyncio.wait_for(done.wait(), timeout=2)
+        assert server._sessions_idle_closed == 1
+        assert box["sessions"][0].finalized is True
+        assert len(box["sessions"]) == 1
     finally:
         server.close()

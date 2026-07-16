@@ -71,11 +71,13 @@ graduation boundary.
   (S1/S2) are consistent *within* a meeting but reset *across* the silence gaps between meetings.
   `MEETING_VAD_THRESHOLD=0` (default) disables gating → one session for the whole connection (the
   prior behavior). A connection that never carries speech opens no cloud session at all. A session
-  ALSO finalizes on **transcript idle** — `MEETING_TRANSCRIPT_IDLE_CLOSE_S` with no new committed turn,
-  even while the mic stays loud — because a real room is rarely silent enough for the energy gate to
-  close it, so a meeting's session would otherwise bill ambient noise long after the words stop. After a
-  transcript-idle close the connection is **dormant** (mere room noise opens no new billed session) until
-  it re-arms: a `MEETING_SILENCE_CLOSE_S` quiet gap, a marker, or a reconnect.
+  ALSO finalizes on **transcript idle** — `MEETING_TRANSCRIPT_IDLE_CLOSE_S` with no new **ASR speech
+  evidence** (a non-empty partial or a committed final), even while the mic stays loud — because a real
+  room is rarely silent enough for the energy gate to close it, so a meeting's session would otherwise
+  bill ambient noise long after the words stop. Partials count as evidence so a quiet/far-field meeting
+  the ASR hears but cannot commit as finals is never read as "over". After a transcript-idle close the
+  connection is **dormant** (mere room noise opens no new billed session) until it re-arms: a
+  `MEETING_SILENCE_CLOSE_S` quiet gap, a marker, or a reconnect.
 - **Per-session model** — the client MAY pick the Speechmatics operating point with a
   `?model=standard|enhanced` query on the WS URL. The server validates it against a whitelist and
   falls back to its configured default (`MEETING_MODEL`, default `enhanced`) for any other value —

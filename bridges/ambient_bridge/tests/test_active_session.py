@@ -136,3 +136,66 @@ def test_active_session_speaker_id_off_is_pure_relay(tmp_path):
     s = ActiveSession(_cfg_sid(str(tmp_path)), source="t", speaker_id=None)
     assert s._ring is None and s._resolver is None
     asyncio.run(s.send_audio(b"\x00\x00" * 100))  # must not raise
+
+
+def test_last_activity_none_until_speech_evidence(tmp_path):
+    # Evidence = a NON-EMPTY partial or a committed final. Empty/keep-alive partials and missing
+    # metadata must not count (else post-meeting noise would read as a live meeting downstream).
+    s = ActiveSession(_cfg(str(tmp_path)), source="test")
+    assert s.last_activity is None
+    s._on_partial({})  # malformed/empty message → no crash, no evidence
+    s._on_partial({"metadata": {"transcript": "   "}})  # whitespace-only → no evidence
+    assert s.last_activity is None
+
+
+def _final_msg(text="hello there"):
+    # Minimal real ADD_TRANSCRIPT shape (same as test_active_transcript's _final helper).
+    return {
+        "metadata": {"transcript": text},
+        "results": [
+            {"type": "word", "start_time": 1.0, "alternatives": [{"content": w, "speaker": "S1"}]}
+            for w in text.split()
+        ],
+    }
+
+
+def test_last_activity_bumped_by_partial_and_final(tmp_path):
+    s = ActiveSession(_cfg(str(tmp_path)), source="test")
+    s._on_partial({"metadata": {"transcript": "hello th"}})  # changed non-empty partial = evidence
+    t1 = s.last_activity
+    assert t1 is not None
+    s._on_final({"results": []})  # EMPTY final (Speechmatics' commit heartbeat) = NOT evidence
+    assert s.last_activity == t1
+    s._on_final(_final_msg())  # a final that commits a turn = evidence
+    assert s.last_activity is not None and s.last_activity >= t1
+
+
+def test_last_activity_requires_partial_progress(tmp_path):
+    # Speechmatics re-emits the same trailing partial for as long as audio flows (verified live) —
+    # an UNCHANGED partial must not refresh evidence, else post-speech noise reads as a live
+    # meeting forever. Changed text = new words = evidence; a final resets the tracker so a
+    # genuinely repeated utterance counts again.
+    s = ActiveSession(_cfg(str(tmp_path)), source="test")
+    s._on_partial({"metadata": {"transcript": "the budget"}})
+    t1 = s.last_activity
+    assert t1 is not None
+    s._on_partial({"metadata": {"transcript": "the budget"}})  # frozen re-emission → no refresh
+    assert s.last_activity == t1
+    s._on_partial({"metadata": {"transcript": "the budget forecast"}})  # progress → evidence
+    t2 = s.last_activity
+    assert t2 is not None and t2 >= t1
+    s._on_final(_final_msg("the budget forecast"))  # a real commit resets the tracker...
+    s._on_partial({"metadata": {"transcript": "the budget forecast"}})  # ...so same text counts anew
+    assert s.last_activity is not None and s.last_activity >= t2
+
+
+def test_same_speaker_continuation_final_is_not_evidence(tmp_path):
+    # add_final MERGES a same-speaker continuation into the last committed entry (len unchanged),
+    # so it deliberately does NOT stamp evidence — its words already stamped as (changed) partials,
+    # the primary signal. This pins that the len-delta check is not a complete final-detector.
+    s = ActiveSession(_cfg(str(tmp_path)), source="test")
+    s._on_final(_final_msg("the budget"))
+    t1 = s.last_activity
+    assert t1 is not None
+    s._on_final(_final_msg("forecast looks good"))  # same speaker S1 → merged, len unchanged
+    assert s.last_activity == t1
