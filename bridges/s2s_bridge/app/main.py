@@ -149,7 +149,11 @@ class Application:
         # Initialize Genesis tool service — fetches tools + system prompt
         genesis_url = os.environ.get("GENESIS_URL", "http://localhost:5000")
         genesis_token = os.environ.get("GENESIS_TOKEN", "")
-        self.genesis_tool_service = GenesisToolService(genesis_url, genesis_token)
+        self.genesis_tool_service = GenesisToolService(
+            genesis_url,
+            genesis_token,
+            session_split_seconds=session_reuse_timeout,
+        )
 
         # Fetch system prompt and tool declarations from Genesis
         instructions = ""
@@ -276,14 +280,16 @@ class Application:
                         "changed?) — fresh prompt cached for the next service", exc_info=True,
                     )
 
-    async def _persist_transcript(self, messages: list) -> None:
+    async def _persist_transcript(self, messages: list, satellite_id: str) -> None:
         """Persist a voice transcript out-of-band so it never blocks teardown.
 
         Spawned as a background task from on_client_disconnected — a slow Genesis
         here must not delay the OpenAI teardown (see the reconnect-race guard).
         """
         try:
-            result = await self.genesis_tool_service.store_conversation(messages)
+            result = await self.genesis_tool_service.sync_conversation(
+                messages, satellite_id=satellite_id
+            )
             if result:
                 logger.info("💾 Voice conversation persisted to Genesis memory")
         except Exception as e:  # never let a persist failure escape the task
@@ -556,14 +562,16 @@ class Application:
             # Fire-and-forget: a slow Genesis must NOT delay the teardown below —
             # a ~6s persist once let this handler's _disconnect() run AFTER a new
             # connection had reset the session, clobbering it. Context is already
-            # cached by handle_client_disconnect; store_conversation writes a
+            # cached by handle_client_disconnect; sync_conversation writes a
             # local fallback on failure, so backgrounding loses nothing.
             if self.genesis_tool_service and self.session_manager:
                 cached = self.session_manager.get_cached_context(client_id)
                 if cached:
                     messages = cached.get_messages()
                     if messages:
-                        task = asyncio.create_task(self._persist_transcript(messages))
+                        task = asyncio.create_task(
+                            self._persist_transcript(messages, client_id)
+                        )
                         self._persist_tasks.add(task)
                         task.add_done_callback(self._persist_tasks.discard)
 
