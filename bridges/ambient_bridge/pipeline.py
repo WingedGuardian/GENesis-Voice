@@ -72,14 +72,18 @@ def _asr_feats(result) -> dict:
     """Quality fingerprint of a sherpa decode. ``ys_log_probs`` (per-token log-probs, closer to
     0 = more confident) is stored RAW so the offline analysis can pick the discriminating
     statistic (mean / min / frac-below-θ) instead of pre-committing to one. lang/emotion/event
-    are kept only when populated (this Zipformer usually leaves them empty)."""
+    are kept only when populated (SenseVoice sets ``lang`` per utterance; this Zipformer usually leaves them empty)."""
     try:
-        feats: dict = {
-            "ys_log_probs": [round(float(x), 3) for x in result.ys_log_probs],
-            "n_tokens": len(result.tokens),
-        }
+        feats: dict = {"n_tokens": len(result.tokens)}
+        # ys_log_probs is transducer-only; SenseVoice/CTC return [] → omit rather than store noise.
+        ys = [round(float(x), 3) for x in result.ys_log_probs]
+        if ys:
+            feats["ys_log_probs"] = ys
         for k in ("lang", "emotion", "event"):
-            v = (getattr(result, k, "") or "").strip()
+            # SenseVoice returns these as delimiter-wrapped special tokens ("<|zh|>", "<|HAPPY|>",
+            # "<|Speech|>"); strip the <| |> so meta carries clean values ("zh"). The transducer
+            # leaves them empty, so this is a no-op there.
+            v = (getattr(result, k, "") or "").strip().strip("<|>").strip()
             if v:
                 feats[k] = v
         return feats
@@ -128,24 +132,40 @@ class AmbientEngine:
     def __init__(self, cfg: AmbientConfig, store: AmbientStore) -> None:
         self._cfg = cfg
         self._store = store
-        d = cfg.zipformer_dir
         # Variable-length utterances make the ORT arena ratchet; see ort_session.py. Logged
         # below so a fail-open (arena-off requested but conf unwritable → plain "cpu") is
         # visible in the service journal, not just a startup WARNING.
         provider = ort_provider(cfg)
-        self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
-            encoder=_pick(d, "encoder"), decoder=_pick(d, "decoder"),
-            joiner=_pick(d, "joiner"), tokens=f"{d}/tokens.txt",
-            num_threads=cfg.num_threads, decoding_method=cfg.decoding_method,
-            max_active_paths=cfg.max_active_paths,
-            provider=provider,
-        )
+        if cfg.asr_backend == "sense_voice":
+            # SenseVoice-Small: multilingual (zh/en/ja/ko/yue) CTC model. language="" auto-detects
+            # per utterance; use_itn adds punctuation/ITN. decoding_method/max_active_paths are
+            # transducer-only and do NOT apply. Special tokens (lang/emotion/event) are parsed off
+            # .text into result fields, so .text stays clean.
+            sd = cfg.sense_voice_dir
+            self.asr_name = "sense-voice"
+            self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+                model=_pick(sd, "model"), tokens=f"{sd}/tokens.txt",
+                num_threads=cfg.num_threads, use_itn=True, language="",
+                provider=provider,
+            )
+            logger.info("SenseVoice recognizer loaded from %s (use_itn=True language=auto provider=%s)",
+                        sd, provider)
+        else:
+            d = cfg.zipformer_dir
+            self.asr_name = "sherpa-zipformer"
+            self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
+                encoder=_pick(d, "encoder"), decoder=_pick(d, "decoder"),
+                joiner=_pick(d, "joiner"), tokens=f"{d}/tokens.txt",
+                num_threads=cfg.num_threads, decoding_method=cfg.decoding_method,
+                max_active_paths=cfg.max_active_paths,
+                provider=provider,
+            )
+            logger.info("Zipformer recognizer loaded from %s (decoding=%s max_active_paths=%d provider=%s)",
+                        d, cfg.decoding_method, cfg.max_active_paths, provider)
         self._rec_lock = threading.Lock()
         self._diar_submit: Callable[[DiarWindow], Awaitable[None]] | None = None
         self._diar_window_samples = 0
         self._enroll_collect: Callable[[np.ndarray, float], None] | None = None
-        logger.info("Zipformer recognizer loaded from %s (decoding=%s max_active_paths=%d provider=%s)",
-                    d, cfg.decoding_method, cfg.max_active_paths, provider)
 
     def enable_diarization(self, submit: Callable[[DiarWindow], Awaitable[None]], window_samples: int) -> None:
         self._diar_submit = submit
@@ -354,7 +374,7 @@ class AmbientPipeline:
             text, asr_feats = self._engine.transcribe(samples)
             if not text:
                 continue
-            meta = {"asr": "sherpa-zipformer", "shadow_ver": _SHADOW_VER}
+            meta = {"asr": self._engine.asr_name, "shadow_ver": _SHADOW_VER}
             if asr_feats:
                 meta["asr_feats"] = asr_feats
             audio = _audio_feats(samples)

@@ -41,8 +41,25 @@ def test_asr_feats_keeps_populated_optional_fields():
 
 
 def test_asr_feats_empty_decode():
+    # empty ys_log_probs is omitted (not stored as []): the transducer's empty decode and a
+    # SenseVoice/CTC decode (which never emits log-probs) both collapse to just the token count.
     f = pipeline._asr_feats(_FakeResult([], []))
-    assert f == {"ys_log_probs": [], "n_tokens": 0}
+    assert f == {"n_tokens": 0}
+
+
+def test_asr_feats_sense_voice_omits_logprobs_keeps_lang():
+    # SenseVoice: no per-token log-probs, but a populated per-utterance language tag.
+    f = pipeline._asr_feats(_FakeResult([], ["中", "文"], lang="zh"))
+    assert f == {"n_tokens": 2, "lang": "zh"}  # no ys_log_probs key
+
+
+def test_asr_feats_strips_sense_voice_token_delimiters():
+    # REAL SenseVoice contract: lang/emotion/event come back delimiter-wrapped ("<|zh|>",
+    # "<|HAPPY|>", "<|Speech|>") — meta must carry the clean values, not the raw tokens.
+    f = pipeline._asr_feats(
+        _FakeResult([], ["中", "文"], lang="<|zh|>", emotion="<|HAPPY|>", event="<|Speech|>")
+    )
+    assert f == {"n_tokens": 2, "lang": "zh", "emotion": "HAPPY", "event": "Speech"}
 
 
 def test_asr_feats_guard_never_raises_on_bad_result():
@@ -83,6 +100,13 @@ def _patch_recognizer(monkeypatch):
         @staticmethod
         def from_transducer(**kwargs):
             captured.update(kwargs)
+            captured["_factory"] = "from_transducer"
+            return object()
+
+        @staticmethod
+        def from_sense_voice(**kwargs):
+            captured.update(kwargs)
+            captured["_factory"] = "from_sense_voice"
             return object()
 
     monkeypatch.setattr(pipeline.sherpa_onnx, "OfflineRecognizer", _FakeRecognizer, raising=False)
@@ -108,6 +132,43 @@ def test_engine_decode_method_env_override(monkeypatch):
     pipeline.AmbientEngine(AmbientConfig(), store=object())
     assert captured["decoding_method"] == "greedy_search"
     assert captured["max_active_paths"] == 8
+
+
+def test_engine_default_backend_is_zipformer(monkeypatch):
+    # clean env → zipformer transducer factory + the "sherpa-zipformer" meta label
+    monkeypatch.delenv("AMBIENT_ASR_BACKEND", raising=False)
+    captured = _patch_recognizer(monkeypatch)
+    eng = pipeline.AmbientEngine(AmbientConfig(), store=object())
+    assert captured["_factory"] == "from_transducer"
+    assert eng.asr_name == "sherpa-zipformer"
+
+
+def test_engine_sense_voice_backend(monkeypatch):
+    # AMBIENT_ASR_BACKEND=sense_voice → from_sense_voice with ITN + auto language, and NO
+    # transducer-only knobs; meta label flips to "sense-voice".
+    monkeypatch.setenv("AMBIENT_ASR_BACKEND", "sense_voice")
+    monkeypatch.setenv("AMBIENT_SENSE_VOICE_DIR", "/models/sv")
+    captured = _patch_recognizer(monkeypatch)
+    eng = pipeline.AmbientEngine(AmbientConfig(), store=object())
+    assert captured["_factory"] == "from_sense_voice"
+    assert eng.asr_name == "sense-voice"
+    assert captured["model"] == "/models/sv/model.onnx"
+    assert captured["tokens"] == "/models/sv/tokens.txt"
+    assert captured["use_itn"] is True
+    assert captured["language"] == ""
+    assert "decoding_method" not in captured  # transducer-only, not passed to SenseVoice
+    assert "max_active_paths" not in captured
+
+
+def test_engine_sense_voice_gets_provider(monkeypatch, tmp_path):
+    # the arena-off provider string must reach SenseVoice too (same variable-shape ORT sessions)
+    conf = tmp_path / "ort.conf"
+    monkeypatch.setenv("AMBIENT_ASR_BACKEND", "sense_voice")
+    monkeypatch.setenv("AMBIENT_ORT_ARENA_OFF", "1")
+    monkeypatch.setenv("AMBIENT_ORT_CONF_PATH", str(conf))
+    captured = _patch_recognizer(monkeypatch)
+    pipeline.AmbientEngine(AmbientConfig(), store=object())
+    assert captured["provider"] == f"cpu:{conf}"
 
 
 # --- ORT arena opt-out: provider plumbing (see ort_session.py) ------------------------------

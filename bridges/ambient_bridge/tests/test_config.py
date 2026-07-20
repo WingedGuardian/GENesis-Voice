@@ -89,6 +89,23 @@ def test_instrument_env_on(monkeypatch):
     assert c.instrument_lag_warn_s == 1.5
 
 
+def test_asr_backend_defaults_zipformer(monkeypatch):
+    # clean env → the incumbent zipformer backend (existing installs unaffected)
+    for k in ("AMBIENT_ASR_BACKEND", "AMBIENT_SENSE_VOICE_DIR"):
+        monkeypatch.delenv(k, raising=False)
+    c = AmbientConfig()
+    assert c.asr_backend == "zipformer"
+    assert c.sense_voice_dir.endswith("/sense-voice")
+
+
+def test_asr_backend_env_sense_voice(monkeypatch):
+    monkeypatch.setenv("AMBIENT_ASR_BACKEND", "sense_voice")
+    monkeypatch.setenv("AMBIENT_SENSE_VOICE_DIR", "/models/sv")
+    c = AmbientConfig()
+    assert c.asr_backend == "sense_voice"
+    assert c.sense_voice_dir == "/models/sv"
+
+
 def test_decode_method_defaults(monkeypatch):
     # clean env → modified_beam_search with max_active_paths=4 (new default)
     for k in ("AMBIENT_DECODING_METHOD", "AMBIENT_MAX_ACTIVE_PATHS"):
