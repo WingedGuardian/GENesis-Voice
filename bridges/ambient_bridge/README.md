@@ -64,7 +64,13 @@ always re-run the feeder smoke test after deploying.
 python3 -m venv ~/ambient-venv
 ~/ambient-venv/bin/pip install sherpa-onnx onnxruntime soxr soundfile websockets numpy aiohttp speechmatics-rt aioesphomeapi
 wget -P ~/models https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
-# Zipformer STT model dir expected at ~/models/sherpa-zip (encoder/decoder/joiner/tokens)
+# STT backend (see AMBIENT_ASR_BACKEND below). Default "zipformer": English-only transducer at
+#   ~/models/sherpa-zip (encoder/decoder/joiner/tokens).
+# For a multilingual household set AMBIENT_ASR_BACKEND=sense_voice and install SenseVoice-Small
+#   (zh/en/ja/ko/yue, auto language detect + punctuation) into ~/models/sense-voice:
+#   wget -qO- https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2 | tar xj
+#   mv sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17 ~/models/sense-voice
+#   (dir must contain model.int8.onnx + tokens.txt; int8 ~230MB, CPU RTF ~0.12 on 4 cores)
 # Diarization (Stage-1b) models in ~/models (deploy/install.sh ambient downloads these):
 #   sherpa-onnx-pyannote-segmentation-3-0/model.onnx   (segmentation)
 #   3dspeaker_speech_eres2net_*_16k.onnx               (speaker embedding, English-validated)
@@ -81,9 +87,9 @@ systemctl --user daemon-reload && systemctl --user enable --now ambient-bridge
 ```
 
 ## Active mode (cloud — "Listen Mode")
-A dual-mode listening service. **Passive** (default) = the local Zipformer path above (private,
-fast). **Active** = high-accuracy CLOUD transcription (Speechmatics realtime, diarized) for e.g.
-interviews.
+A dual-mode listening service. **Passive** (default) = the local ASR path above (private, fast;
+Zipformer or SenseVoice per `AMBIENT_ASR_BACKEND`). **Active** = high-accuracy CLOUD transcription
+(Speechmatics realtime, diarized) for e.g. interviews.
 
 - The device POSTs the mode to the HTTP control endpoint on its Active-Listening toggle:
   `POST http://<edge>:8767/mode {"mode":"active"|"passive"}`. One device → one connection → a
@@ -108,7 +114,11 @@ cat ~/ambient_health.json   # alive, utterances_total, db rows, rss_parent_mb / 
 sends raw 16k) · `AMBIENT_VAD_MIN_SILENCE` (0.4) · `AMBIENT_TTL_HOURS` (48) ·
 `AMBIENT_ROW_CEILING` (200000) · `AMBIENT_*` model paths.
 
-ASR decode: `AMBIENT_DECODING_METHOD` (`modified_beam_search`; set `greedy_search` to roll back —
+ASR backend: `AMBIENT_ASR_BACKEND` (`zipformer` default = English-only transducer;
+`sense_voice` = multilingual SenseVoice-Small) · `AMBIENT_ZIPFORMER_DIR` (`~/models/sherpa-zip`) ·
+`AMBIENT_SENSE_VOICE_DIR` (`~/models/sense-voice`). Only the selected backend's model must be present.
+
+ASR decode (zipformer only): `AMBIENT_DECODING_METHOD` (`modified_beam_search`; set `greedy_search` to roll back —
 beam modestly improves clean-but-hard speech at ~1.3x latency, RTF ~0.08) · `AMBIENT_MAX_ACTIVE_PATHS`
 (4; beam width, floored to ≥1; ignored by greedy).
 

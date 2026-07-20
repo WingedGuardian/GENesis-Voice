@@ -60,7 +60,14 @@ class AmbientConfig:
     # --- models (paths on the VM) ---
     models_dir: str = field(default_factory=lambda: _env("AMBIENT_MODELS_DIR", os.path.expanduser("~/models")))
     silero_vad: str = field(default_factory=lambda: _env("AMBIENT_SILERO_VAD", os.path.expanduser("~/models/silero_vad.onnx")))
+    # --- ASR backend selection ---
+    # "zipformer" (default): English-only offline transducer (~/models/sherpa-zip) — the incumbent,
+    # unchanged for existing installs. "sense_voice": SenseVoice-Small (zh/en/ja/ko/yue, auto
+    # per-utterance language detect + ITN punctuation) for multilingual households — set via the
+    # edge systemd drop-in. Only the selected backend's model files need to be present.
+    asr_backend: str = field(default_factory=lambda: _env("AMBIENT_ASR_BACKEND", "zipformer"))
     zipformer_dir: str = field(default_factory=lambda: _env("AMBIENT_ZIPFORMER_DIR", os.path.expanduser("~/models/sherpa-zip")))
+    sense_voice_dir: str = field(default_factory=lambda: _env("AMBIENT_SENSE_VOICE_DIR", os.path.expanduser("~/models/sense-voice")))
     num_threads: int = field(default_factory=lambda: int(_env("AMBIENT_NUM_THREADS", "4")))
     # ASR decode: modified_beam_search modestly improves clean-but-hard speech vs greedy at ~1.3x
     # latency (RTF ~0.08, far below real-time — measured on the edge). greedy_search reachable via env
