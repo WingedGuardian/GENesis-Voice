@@ -728,6 +728,18 @@ class AmbientServer:
                 # max_loop_lag_s: surfaced ONLY under instrumentation, so the default JSON is unchanged.
                 **({"max_loop_lag_s": round(self._max_loop_lag_s, 3)} if self._cfg.instrument else {}),
                 **self._conn_stats.snapshot(),
+                # Recovery-failing verdict — emitted ONLY when auto-recovery is armed; otherwise the
+                # keys are absent and the core evaluator sees today's behavior (never alerts on an
+                # absent device). Restart-safe: keyed off RecoveryState's PERSISTED last-seen/counter.
+                **(
+                    self._recovery.recovery_status(
+                        active=self._active,
+                        escalation_dark_s=self._cfg.recovery_escalation_dark_s,
+                        min_reboots=self._cfg.recovery_escalation_min_reboots,
+                    )
+                    if self._recovery is not None
+                    else {}
+                ),
                 **stats,
             }
             tmp = self._cfg.health_path + ".tmp"
@@ -774,12 +786,14 @@ class AmbientServer:
         cfg = self._cfg
         try:
             dark = rec.dark_for()
-            rec.record_reboot()
             logger.warning("RECOVERY: device dark %.0fs (> %.0fs) — rebooting %s",
                            dark or 0.0, cfg.recovery_no_conn_threshold_s, cfg.recovery_device_ip)
-            ok = await reboot_device(
+            ok, error = await reboot_device(
                 cfg.recovery_device_ip, cfg.recovery_device_port, self._recovery_psk,
                 button_name=cfg.recovery_button_name, timeout_s=cfg.recovery_reboot_timeout_s)
+            # Record the ATTEMPT (counts toward cooldown/cap) + the sanitized failure reason, AFTER
+            # the bounded-timeout press so we capture its outcome. reboot_device never raises.
+            rec.record_reboot(error=error)
             if ok:
                 logger.warning("RECOVERY: reboot press sent to %s — awaiting reconnect",
                                cfg.recovery_device_ip)

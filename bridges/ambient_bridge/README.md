@@ -179,7 +179,23 @@ Knobs: `AMBIENT_RECOVERY_ENABLED` (0) · `AMBIENT_RECOVERY_DEVICE_IP` ("") ·
 this long dark) · `AMBIENT_RECOVERY_SEEN_WINDOW_S` (7200 — dark longer than this ⇒ treated as
 legitimately absent, not rebooted) · `AMBIENT_RECOVERY_REBOOT_COOLDOWN_S` (300) ·
 `AMBIENT_RECOVERY_MAX_REBOOTS` (3) · `AMBIENT_RECOVERY_REBOOT_WINDOW_S` (3600) ·
-`AMBIENT_RECOVERY_STATE` (~/ambient_recovery_state.json) · `AMBIENT_RECOVERY_REBOOT_TIMEOUT_S` (15).
+`AMBIENT_RECOVERY_STATE` (~/ambient_recovery_state.json) · `AMBIENT_RECOVERY_REBOOT_TIMEOUT_S` (15) ·
+`AMBIENT_RECOVERY_ESCALATION_DARK_S` (14400 — surface `recovery_failing` once dark ≥ this) ·
+`AMBIENT_RECOVERY_ESCALATION_MIN_REBOOTS` (1).
+
+### `recovery_failing` health signal
+When recovery is armed, the health JSON gains four keys the Genesis core watches:
+`recovery_failing` (bool), `failed_reboot_count`, `device_dark_since` (ISO), and `last_reboot_error`
+(a **sanitized** classification — no device IP/PSK; full detail is logged locally only).
+`recovery_failing` is True once the device has been dark ≥ `AMBIENT_RECOVERY_ESCALATION_DARK_S`
+(well past `SEEN_WINDOW_S`, so recovery has definitively stopped trying) **and** at least
+`…_MIN_REBOOTS` reboot attempts since it was last seen failed to bring it back — i.e. *auto-recovery
+engaged and could not restore capture*. It resets when the device reconnects, and is restart-safe
+(keyed off the persisted last-seen/counter, not the in-process connection timer). Genesis escalates
+it to a `degraded` capture-health alert. The keys are **absent when recovery is disabled**, so an
+install without recovery is unchanged (a merely-absent device never alerts — no network signal
+distinguishes "unplugged" from "crashed"; this fires only because arming recovery asserts the device
+is expected up).
 
 ## Not yet (tracked in the design)
 The filter / attention / sense-making tiers and the graduation boundary to Genesis memory.
