@@ -18,6 +18,7 @@ missing dep can't break the bridge import (recovery just logs and no-ops).
 
 Pure stdlib otherwise; no genesis imports.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -26,6 +27,7 @@ import logging
 import os
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 
 logger = logging.getLogger("ambient.recovery")
 
@@ -40,11 +42,18 @@ async def reboot_device(
     button_name: str = DEFAULT_BUTTON_NAME,
     timeout_s: float = 15.0,
     client_factory: Callable[[], object] | None = None,
-) -> bool:
+) -> tuple[bool, str | None]:
     """Reboot an ESPHome device by pressing its ``button_name`` button via the native API.
 
-    Best-effort: returns ``True`` iff the button press was sent; never raises. ``client_factory``
-    is an injection seam for tests (default builds a real ``aioesphomeapi.APIClient``)."""
+    Best-effort: returns ``(ok, error)`` — ``ok`` is True iff the button press was sent;
+    ``error`` is a SANITIZED short reason on failure (else None). Never raises.
+    ``client_factory`` is an injection seam for tests (default builds a real
+    ``aioesphomeapi.APIClient``).
+
+    Privacy: the ``error`` return is surfaced onward (health JSON -> dashboard/Telegram), so it
+    must never carry the device IP or the noise PSK — full detail (incl. IP) is LOGGED LOCALLY
+    only; the returned reason is a bounded classification (a fixed phrase or the exception class
+    name)."""
     import asyncio
 
     if client_factory is None:
@@ -52,33 +61,40 @@ async def reboot_device(
             from aioesphomeapi import APIClient
         except Exception as exc:  # noqa: BLE001 — optional dep; recovery degrades to a no-op
             logger.error("recovery: aioesphomeapi unavailable (%r) — cannot reboot device", exc)
-            return False
+            return False, "aioesphomeapi unavailable"
 
         def client_factory() -> object:  # noqa: E306
             return APIClient(ip, port, "", noise_psk=psk)
 
     cli = client_factory()
 
-    async def _press() -> bool:
+    async def _press() -> tuple[bool, str | None]:
         await cli.connect(login=True)
         entities, _services = await cli.list_entities_services()
         # Select by NAME among BUTTON entities (portable — no hard-coded entity key). Duck-typed on
         # the class name so this stays importable/testable without aioesphomeapi present.
         button = next(
-            (e for e in entities
-             if getattr(e, "name", None) == button_name
-             and type(e).__name__ == "ButtonInfo"
-             and getattr(e, "key", None) is not None),
+            (
+                e
+                for e in entities
+                if getattr(e, "name", None) == button_name
+                and type(e).__name__ == "ButtonInfo"
+                and getattr(e, "key", None) is not None
+            ),
             None,
         )
         if button is None:
             logger.error("recovery: no button named %r on %s — not rebooting", button_name, ip)
-            return False
+            return False, "restart button not found"
         cli.button_command(button.key)  # synchronous in aioesphomeapi
-        await asyncio.sleep(1.0)         # let the press flush before we disconnect
-        logger.warning("recovery: pressed %r (key=%s) on %s — reboot requested "
-                       "(confirmed only once the device reconnects)", button_name, button.key, ip)
-        return True
+        await asyncio.sleep(1.0)  # let the press flush before we disconnect
+        logger.warning(
+            "recovery: pressed %r (key=%s) on %s — reboot requested (confirmed only once the device reconnects)",
+            button_name,
+            button.key,
+            ip,
+        )
+        return True, None
 
     try:
         # ONE timeout around the WHOLE exchange: a wedged device can stall connect OR the entity
@@ -86,10 +102,12 @@ async def reboot_device(
         return await asyncio.wait_for(_press(), timeout=timeout_s)
     except TimeoutError:
         logger.error("recovery: reboot of %s timed out after %.0fs", ip, timeout_s)
-        return False
+        return False, "reboot timed out"
     except Exception as exc:  # noqa: BLE001 — best-effort; a failed reboot must not crash the bridge
+        # Log the full repr (incl. IP) LOCALLY; return only the exception class name — the error
+        # message may embed the IP/PSK and must not leak onto the health JSON / dashboard / Telegram.
         logger.error("recovery: reboot of %s failed: %r", ip, exc)
-        return False
+        return False, type(exc).__name__
     finally:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(cli.disconnect(), timeout=5.0)
@@ -118,13 +136,23 @@ class RecoveryState:
         self._clock = clock
         self._last_seen_ts: float | None = None
         self._reboot_ts: list[float] = []
+        # Consecutive reboot ATTEMPTS since the device was last seen. A successful reboot
+        # reconnects the device -> mark_seen() -> this resets to 0, so a non-zero value means
+        # "recovery engaged and none of those attempts restored the device". Persisted so the
+        # signal survives a bridge restart mid-wedge (the escalation must be restart-safe).
+        self._reboots_since_seen: int = 0
+        self._last_reboot_error: str | None = None
         self._load()
 
     # --- device-presence tracking ---------------------------------------------------------------
 
     def mark_seen(self) -> None:
-        """Record that the device is connected right now (call while active>0)."""
+        """Record that the device is connected right now (call while active>0). Reconnection
+        means recovery worked (or the device came back on its own), so clear the failure
+        bookkeeping — ``recovery_failing`` is only ever "still dark AFTER attempts"."""
         self._last_seen_ts = self._clock()
+        self._reboots_since_seen = 0
+        self._last_reboot_error = None
         self._save()
 
     @property
@@ -172,15 +200,50 @@ class RecoveryState:
             return False
         return self.can_reboot()
 
-    def record_reboot(self) -> None:
-        """Record a reboot ATTEMPT (counts toward cooldown + cap even if the press fails)."""
+    def record_reboot(self, error: str | None = None) -> None:
+        """Record a reboot ATTEMPT (counts toward cooldown + cap even if the press fails), bump the
+        since-seen counter, and store the (sanitized) failure reason if the press did not succeed.
+        ``error`` MUST be pre-sanitized by the caller (no IP/PSK) — it flows onto the health JSON."""
         self._reboot_ts.append(self._clock())
+        self._reboots_since_seen += 1
+        self._last_reboot_error = error
         self._save()
+
+    def recovery_status(
+        self,
+        *,
+        active: int,
+        escalation_dark_s: float,
+        min_reboots: int,
+    ) -> dict:
+        """Pure verdict for the health payload: is auto-recovery armed, engaged, and STILL unable
+        to restore the device? ``recovery_failing`` is True iff the device is currently dark
+        (``active == 0``), has been dark at least ``escalation_dark_s`` (well past the reboot window,
+        so recovery has definitively stopped trying), and at least ``min_reboots`` attempts since it
+        was last seen failed to bring it back. Restart-safe: keyed off the PERSISTED last-seen /
+        counter, never the in-process ConnectionStats dark timer. ``device_dark_since`` is ISO (the
+        core interpolates it into an alert), never a raw epoch float."""
+        dark = self.dark_for()
+        failing = (
+            active == 0 and dark is not None and dark >= escalation_dark_s and self._reboots_since_seen >= min_reboots
+        )
+        since = datetime.fromtimestamp(self._last_seen_ts, UTC).isoformat() if self._last_seen_ts is not None else None
+        return {
+            "recovery_failing": failing,
+            "failed_reboot_count": self._reboots_since_seen,
+            "device_dark_since": since,
+            "last_reboot_error": self._last_reboot_error,
+        }
 
     # --- persistence ----------------------------------------------------------------------------
 
     def _save(self) -> None:
-        data = {"last_seen_ts": self._last_seen_ts, "reboot_ts": self._reboot_ts}
+        data = {
+            "last_seen_ts": self._last_seen_ts,
+            "reboot_ts": self._reboot_ts,
+            "reboots_since_seen": self._reboots_since_seen,
+            "last_reboot_error": self._last_reboot_error,
+        }
         try:
             tmp = self._path + ".tmp"
             with open(tmp, "w") as f:
@@ -202,3 +265,8 @@ class RecoveryState:
         self._last_seen_ts = float(raw_seen) if isinstance(raw_seen, (int, float)) else None
         rb = d.get("reboot_ts") or []
         self._reboot_ts = [float(t) for t in rb if isinstance(t, (int, float))]
+        # Back-compat: pre-existing state files (written before this field) lack the key -> 0.
+        raw_since = d.get("reboots_since_seen")
+        self._reboots_since_seen = int(raw_since) if isinstance(raw_since, int) else 0
+        raw_err = d.get("last_reboot_error")
+        self._last_reboot_error = raw_err if isinstance(raw_err, str) else None

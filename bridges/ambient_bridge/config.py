@@ -127,6 +127,12 @@ class AmbientConfig:
     recovery_reboot_window_s: float = field(default_factory=lambda: float(_env("AMBIENT_RECOVERY_REBOOT_WINDOW_S", "3600")))
     recovery_state_path: str = field(default_factory=lambda: _env("AMBIENT_RECOVERY_STATE", os.path.expanduser("~/ambient_recovery_state.json")))
     recovery_reboot_timeout_s: float = field(default_factory=lambda: float(_env("AMBIENT_RECOVERY_REBOOT_TIMEOUT_S", "15")))
+    # recovery_failing escalation (surfaced in ambient_health.json → the Genesis core alert): flag the
+    # capture as impaired once the device has been dark at least this long — comfortably PAST
+    # recovery_seen_window_s (7200s) so recovery has definitively stopped trying (no race with a last
+    # in-window reboot) — AND at least this many reboot attempts since last-seen failed to restore it.
+    recovery_escalation_dark_s: float = field(default_factory=lambda: float(_env("AMBIENT_RECOVERY_ESCALATION_DARK_S", "14400")))
+    recovery_escalation_min_reboots: int = field(default_factory=lambda: int(_env("AMBIENT_RECOVERY_ESCALATION_MIN_REBOOTS", "1")))
 
     # --- diarization (Stage-1b, additive) ---
     # Speaker diarization runs DEFERRED on closed windows; if models are missing or
