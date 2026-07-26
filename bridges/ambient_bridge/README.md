@@ -118,6 +118,13 @@ ASR backend: `AMBIENT_ASR_BACKEND` (`zipformer` default = English-only transduce
 `sense_voice` = multilingual SenseVoice-Small) · `AMBIENT_ZIPFORMER_DIR` (`~/models/sherpa-zip`) ·
 `AMBIENT_SENSE_VOICE_DIR` (`~/models/sense-voice`). Only the selected backend's model must be present.
 
+Capture-quality gate (Tier-1; all default OFF/no-op — opt in on a multilingual/far-field edge):
+`AMBIENT_MIN_UTTERANCE_S` (0.0=off; e.g. `1.0` drops sub-second far-field blips — real speech is
+~4s, garbage ~0.7s) · `AMBIENT_ASR_DROP_LANGS` (empty=off; comma DENY-list of languages KNOWN ABSENT
+from the household, whose appearance means SenseVoice hallucinated on noise — e.g. `ja,ko` for a
+Mandarin+English house; never an allow-list, which would false-drop mis-tagged real speech) ·
+`AMBIENT_DROP_BGM` (0=off; `1` drops rows SenseVoice tags as background music — CAUTION: on far-field capture SenseVoice tags real speech-with-background-audio as BGM, so `1` false-drops real content; verify against your own rows first. This install keeps it OFF).
+
 ASR decode (zipformer only): `AMBIENT_DECODING_METHOD` (`modified_beam_search`; set `greedy_search` to roll back —
 beam modestly improves clean-but-hard speech at ~1.3x latency, RTF ~0.08) · `AMBIENT_MAX_ACTIVE_PATHS`
 (4; beam width, floored to ≥1; ignored by greedy).

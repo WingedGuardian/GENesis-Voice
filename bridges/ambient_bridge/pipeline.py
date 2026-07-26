@@ -113,6 +113,20 @@ def _audio_feats(samples) -> dict:
         return {}
 
 
+def _passes_capture_gate(dur: float, lang: str, event: str, cfg) -> bool:
+    """Tier-1 capture gate: drop obvious far-field noise before it becomes a stored row.
+    Each check is opt-in — a no-op when its cfg knob is at the default (so existing installs
+    are unaffected). ``lang``/``event`` are the (already delimiter-stripped) SenseVoice tags;
+    empty for the zipformer backend, which therefore always passes. See config.py."""
+    if cfg.min_utterance_s and dur < cfg.min_utterance_s:
+        return False
+    if cfg.drop_bgm and event == "BGM":
+        return False
+    if lang and lang in cfg.asr_drop_langs:
+        return False
+    return True
+
+
 @dataclass
 class DiarWindow:
     """A closed window of continuous audio + the utterances that fall in it.
@@ -373,6 +387,12 @@ class AmbientPipeline:
                     logger.warning("enroll collect failed (capture unaffected)", exc_info=True)
             text, asr_feats = self._engine.transcribe(samples)
             if not text:
+                continue
+            # Tier-1 capture gate (soak-derived): drop far-field blips / hallucinated-language /
+            # BGM before they become rows. No-op unless the cfg knobs are set (config.py).
+            if not _passes_capture_gate(
+                dur, asr_feats.get("lang", ""), asr_feats.get("event", ""), self._cfg
+            ):
                 continue
             meta = {"asr": self._engine.asr_name, "shadow_ver": _SHADOW_VER}
             if asr_feats:

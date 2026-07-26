@@ -5,6 +5,8 @@ total functions — a malformed result or odd audio buffer must yield ``{}``, ne
 because any exception here would kill ambient capture. sherpa_onnx/soxr are stubbed by
 conftest, so this imports and runs off-edge / in CI.
 """
+from types import SimpleNamespace
+
 import numpy as np
 
 from ambient_bridge import pipeline
@@ -252,3 +254,43 @@ def test_diar_engine_provider_default_cpu(monkeypatch):
     pipeline.DiarizationEngine(AmbientConfig())
     assert captured["seg_provider"] == "cpu"
     assert captured["emb_provider"] == "cpu"
+
+
+# --- Tier-1 capture gate (soak-derived: drop blips / hallucinated-lang / BGM) --------------
+
+def _gatecfg(min_utterance_s=0.0, drop_bgm=False, asr_drop_langs=frozenset()):
+    return SimpleNamespace(min_utterance_s=min_utterance_s, drop_bgm=drop_bgm,
+                           asr_drop_langs=asr_drop_langs)
+
+
+def test_capture_gate_all_default_keeps_everything():
+    # backward compat: a no-op (default) config keeps every utterance, even a short ja BGM one
+    assert pipeline._passes_capture_gate(0.2, "ja", "BGM", _gatecfg()) is True
+
+
+def test_capture_gate_min_utterance_drops_short():
+    cfg = _gatecfg(min_utterance_s=1.0)
+    assert pipeline._passes_capture_gate(0.7, "zh", "Speech", cfg) is False
+    assert pipeline._passes_capture_gate(1.5, "zh", "Speech", cfg) is True
+
+
+def test_capture_gate_denylist_drops_only_absent_langs():
+    cfg = _gatecfg(asr_drop_langs=frozenset({"ja", "ko"}))
+    assert pipeline._passes_capture_gate(4.0, "ja", "Speech", cfg) is False
+    assert pipeline._passes_capture_gate(4.0, "ko", "Speech", cfg) is False
+    assert pipeline._passes_capture_gate(4.0, "yue", "Speech", cfg) is True  # mistagged Mandarin kept
+    assert pipeline._passes_capture_gate(4.0, "zh", "Speech", cfg) is True
+    assert pipeline._passes_capture_gate(4.0, "", "Speech", cfg) is True     # zipformer (no lang) kept
+
+
+def test_capture_gate_bgm_only_when_enabled():
+    assert pipeline._passes_capture_gate(4.0, "en", "BGM", _gatecfg(drop_bgm=True)) is False
+    assert pipeline._passes_capture_gate(4.0, "en", "BGM", _gatecfg(drop_bgm=False)) is True
+
+
+def test_capture_gate_combined():
+    cfg = _gatecfg(min_utterance_s=1.0, drop_bgm=True, asr_drop_langs=frozenset({"ja"}))
+    assert pipeline._passes_capture_gate(1.5, "zh", "Speech", cfg) is True    # passes all
+    assert pipeline._passes_capture_gate(0.5, "zh", "Speech", cfg) is False   # too short
+    assert pipeline._passes_capture_gate(2.0, "ja", "Speech", cfg) is False   # denylisted lang
+    assert pipeline._passes_capture_gate(2.0, "en", "BGM", cfg) is False      # bgm
