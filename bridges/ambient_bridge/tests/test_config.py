@@ -154,3 +154,22 @@ def test_ort_arena_and_recycle_env_overrides(monkeypatch):
     assert c.ort_conf_path == "/tmp/x/ort.conf"
     assert c.diar_rss_ceiling_mb == 1400
     assert c.diar_recycle_cooldown_s == 600.0
+
+
+def test_capture_gate_defaults_noop(monkeypatch):
+    for k in ("AMBIENT_MIN_UTTERANCE_S", "AMBIENT_ASR_DROP_LANGS", "AMBIENT_DROP_BGM"):
+        monkeypatch.delenv(k, raising=False)
+    c = AmbientConfig()
+    assert c.min_utterance_s == 0.0
+    assert c.asr_drop_langs == frozenset()
+    assert c.drop_bgm is False
+
+
+def test_capture_gate_env_overrides(monkeypatch):
+    monkeypatch.setenv("AMBIENT_MIN_UTTERANCE_S", "1.0")
+    monkeypatch.setenv("AMBIENT_ASR_DROP_LANGS", "ja, ko")  # surrounding spaces tolerated
+    monkeypatch.setenv("AMBIENT_DROP_BGM", "1")
+    c = AmbientConfig()
+    assert c.min_utterance_s == 1.0
+    assert c.asr_drop_langs == frozenset({"ja", "ko"})
+    assert c.drop_bgm is True
