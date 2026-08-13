@@ -23,19 +23,25 @@ from app.genesis_tool_service import GenesisToolService
 from app.session_manager import SessionManager
 from app.websocket_handler import WebSocketHandler
 
-# Configure logging
+# Load .env BEFORE configuring logging, so an S2S_LOG_LEVEL supplied via .env is honored.
+dotenv.load_dotenv()
+
+# Configure logging. S2S_LOG_LEVEL (default INFO) gates verbosity — set DEBUG to
+# surface verbatim transcript text (kept off the default INFO journal for privacy).
+# Mirrors MEETING_LOG_LEVEL / OMI_LOG_LEVEL in the sibling bridges.
+_s2s_log_level = getattr(logging, os.environ.get("S2S_LOG_LEVEL", "INFO").upper(), logging.INFO)
+if not isinstance(_s2s_log_level, int):  # a bad value can resolve to a non-level attr (e.g. BASIC_FORMAT)
+    _s2s_log_level = logging.INFO
 logging.basicConfig(
-    level=logging.INFO,
+    level=_s2s_log_level,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Reduce verbosity of noisy loggers
+# Reduce verbosity of noisy loggers. (No __main__ override — S2S_LOG_LEVEL governs
+# this module's own logs too.)
 logging.getLogger("aiortc").setLevel(logging.WARNING)
 logging.getLogger("websockets").setLevel(logging.WARNING)
-logging.getLogger("__main__").setLevel(logging.INFO)
-
-dotenv.load_dotenv()
 
 # Bound on the per-session Genesis prompt re-fetch: a hung Genesis must not add dead
 # air to voice session start. Normal fetches are ~100ms (LAN); on timeout/failure the

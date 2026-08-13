@@ -405,7 +405,10 @@ class AmbientPipeline:
             )
             self.utterances += 1
             stored += 1
-            logger.info("[%s] (%.1fs) %s", self._source, dur, text)
+            # Keep source/duration visibility at INFO; verbatim transcript text is
+            # DEBUG-only (privacy — INFO lands in journald). AMBIENT_LOG_LEVEL=DEBUG surfaces it.
+            logger.info("[%s] (%.1fs) utterance stored", self._source, dur)
+            logger.debug("[%s] text: %s", self._source, text)
             if self._diar_on:
                 abs_end = abs_start + len(samples)
                 # One-time guard: seg.start must be an absolute sample index in the

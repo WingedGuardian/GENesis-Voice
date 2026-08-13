@@ -231,13 +231,27 @@ def test_new_instance_starts_independent_session(monkeypatch, tmp_path):
 # ── durability: log-before-POST, retry, fallback ─────────────────────
 
 
-def test_logs_new_turns_before_post(monkeypatch, caplog, tmp_path):
+def test_turn_text_is_debug_only_not_info(monkeypatch, caplog, tmp_path):
+    """Privacy: verbatim turn text must NOT reach INFO (it lands in journald in
+    plaintext there). Only the count summary logs at INFO; the text is DEBUG-only,
+    reachable via S2S_LOG_LEVEL=DEBUG for on-demand debugging."""
     _patch_client(monkeypatch, [_FakeResp()])
     svc = _svc(tmp_path)
     with caplog.at_level(logging.INFO, logger="app.genesis_tool_service"):
         asyncio.run(svc.sync_conversation([{"role": "user", "content": "what time is it"}]))
-    blob = "\n".join(r.message for r in caplog.records)
-    assert "what time is it" in blob
+    info_blob = "\n".join(r.message for r in caplog.records)
+    assert "what time is it" not in info_blob  # verbatim text NOT at INFO
+    assert "Persisting voice conversation" in info_blob  # count summary still logs
+
+
+def test_turn_text_available_at_debug(monkeypatch, caplog, tmp_path):
+    """The verbatim text is still recoverable at DEBUG level for debugging."""
+    _patch_client(monkeypatch, [_FakeResp()])
+    svc = _svc(tmp_path)
+    with caplog.at_level(logging.DEBUG, logger="app.genesis_tool_service"):
+        asyncio.run(svc.sync_conversation([{"role": "user", "content": "what time is it"}]))
+    debug_blob = "\n".join(r.message for r in caplog.records)
+    assert "what time is it" in debug_blob
 
 
 def test_4xx_is_permanent_no_retry_writes_fallback(monkeypatch, tmp_path):
