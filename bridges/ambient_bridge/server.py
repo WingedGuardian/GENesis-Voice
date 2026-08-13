@@ -39,8 +39,11 @@ from .pipeline import AmbientEngine, DiarWindow, _autodetect_embedding
 from .speaker_id import SpeakerIDRegistry
 from .store import AmbientStore
 
+_ambient_log_level = getattr(logging, os.environ.get("AMBIENT_LOG_LEVEL", "INFO").upper(), logging.INFO)
+if not isinstance(_ambient_log_level, int):  # a bad value can resolve to a non-level attr
+    _ambient_log_level = logging.INFO
 logging.basicConfig(
-    level=getattr(logging, os.environ.get("AMBIENT_LOG_LEVEL", "INFO").upper(), logging.INFO),
+    level=_ambient_log_level,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 logger = logging.getLogger("ambient.server")
