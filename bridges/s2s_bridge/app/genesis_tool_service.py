@@ -152,8 +152,12 @@ class GenesisToolService:
             len(pending),
             len(turns),
         )
+        # Verbatim turn text is DEBUG-only — at INFO it would land in journald in
+        # plaintext (captured voice content). The count summary above stays at INFO;
+        # set S2S_LOG_LEVEL=DEBUG to surface the text for on-demand debugging. The
+        # local fallback file (on persist failure) already preserves the transcript.
         for turn in pending:
-            logger.info("  %s: %s", turn["role"], turn["text"])
+            logger.debug("  %s: %s", turn["role"], turn["text"])
 
         payload = {
             "session_id": self._session_id,

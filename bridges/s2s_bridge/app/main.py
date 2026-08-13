@@ -23,9 +23,11 @@ from app.genesis_tool_service import GenesisToolService
 from app.session_manager import SessionManager
 from app.websocket_handler import WebSocketHandler
 
-# Configure logging
+# Configure logging. S2S_LOG_LEVEL (default INFO) gates verbosity — set DEBUG to
+# surface verbatim transcript text (kept off the default INFO journal for privacy).
+# Mirrors MEETING_LOG_LEVEL / OMI_LOG_LEVEL in the sibling bridges.
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, os.environ.get("S2S_LOG_LEVEL", "INFO").upper(), logging.INFO),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
