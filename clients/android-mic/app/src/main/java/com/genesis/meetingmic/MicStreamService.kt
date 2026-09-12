@@ -308,6 +308,13 @@ class MicStreamService : LifecycleService() {
     private fun onSocketOpened(socket: WebSocket, runId: Long, attemptId: Long) {
         synchronized(ws) {
             if (ws.get() !== socket) return
+            // Keep audio gated in CONNECTING until the capability request is queued. Otherwise the
+            // capture thread can enqueue PCM first and bridge startup can delay the hello response
+            // long enough to misclassify an ack-capable bridge as legacy.
+            if (!socket.send("{\"type\":\"hello\",\"capabilities\":[\"audio_ack_v1\"]}")) {
+                onSocketDown(socket, runId, attemptId, "capability hello send failed")
+                return
+            }
             val update = delivery.socketOpened(
                 runId,
                 attemptId,
@@ -316,7 +323,6 @@ class MicStreamService : LifecycleService() {
             applyFailureAlert(update.alert)
             publish(Phase.CONNECTING, "connected; awaiting bridge receipt")
             updateNotif("Connected — confirming audio delivery")
-            socket.send("{\"type\":\"hello\",\"capabilities\":[\"audio_ack_v1\"]}")
             scheduleReceiptTick(socket, runId, attemptId)
         }
     }
