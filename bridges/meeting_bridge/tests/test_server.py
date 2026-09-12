@@ -164,6 +164,41 @@ async def test_ws_relays_pcm_and_marker_then_finalizes(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_ws_negotiates_audio_receipt_ack_and_counts_all_received_pcm(tmp_path):
+    cfg = _cfg(tmp_path, vad_threshold=5000)
+    server, _box, _done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_str(json.dumps({"type": "hello", "capabilities": ["audio_ack_v1"]}))
+            hello = await asyncio.wait_for(ws.receive_json(), timeout=2)
+            assert hello == {"type": "hello", "capabilities": ["audio_ack_v1"]}
+
+            quiet = _pcm(0, 0, 0, 0)
+            await ws.send_bytes(quiet)
+            ack = await asyncio.wait_for(ws.receive_json(), timeout=2)
+            assert ack == {"type": "audio_ack", "bytes": len(quiet)}
+            await ws.close()
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_ws_does_not_send_ack_without_capability_negotiation(tmp_path):
+    cfg = _cfg(tmp_path)
+    server, _box, _done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_bytes(b"\x01\x02")
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(ws.receive_json(), timeout=0.05)
+            await ws.close()
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
 async def test_model_query_override_applied(tmp_path):
     # The client picks the Speechmatics model per session via ?model=; a valid value reaches the
     # session factory as cfg.model (default is "enhanced").

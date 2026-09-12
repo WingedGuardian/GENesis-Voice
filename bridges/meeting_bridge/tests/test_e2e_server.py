@@ -58,8 +58,13 @@ async def _drive_ws(port, token, frames):
     url = f"http://127.0.0.1:{port}/meeting/{token}"
     async with aiohttp.ClientSession() as sess:
         async with sess.ws_connect(url) as ws:
+            await ws.send_str(json.dumps({"type": "hello", "capabilities": ["audio_ack_v1"]}))
+            hello = await ws.receive_json()
+            assert hello == {"type": "hello", "capabilities": ["audio_ack_v1"]}
             for fr in frames:
                 await ws.send_bytes(fr)
+            ack = await ws.receive_json()
+            assert ack == {"type": "audio_ack", "bytes": len(frames[0])}
             await ws.send_str(json.dumps({"type": "marker"}))
             await ws.close()
 

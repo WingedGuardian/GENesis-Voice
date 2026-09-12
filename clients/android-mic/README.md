@@ -15,6 +15,8 @@ Targets the bridge's already-deployed ingress (see [`../../CONTRACTS.md`](../../
 - `wss://<edge-host>/meeting/<token>` — path-token auth (the browser can't set WS headers).
 - **Binary** frames: raw little-endian PCM16 @ 16 kHz mono (`AudioRecord`, `VOICE_RECOGNITION`).
 - **Text** frames: JSON control — `{"type":"marker"}` from the notification's **Mark** action.
+- **Delivery receipts:** the app requests `audio_ack_v1`; the bridge returns cumulative received
+  bytes. Local OkHttp enqueue success is never displayed as confirmed bridge delivery.
 - The bridge sends heartbeat pings; OkHttp auto-answers. On a dropped socket the app reconnects
   with backoff and resumes (audio during the gap is dropped, not buffered — buffering stale
   realtime audio would desync live diarization).
@@ -34,8 +36,12 @@ Targets the bridge's already-deployed ingress (see [`../../CONTRACTS.md`](../../
 - **14-hour runaway backstop** — a single continuous capture stops itself after 14 h (sized for a
   full out-of-house workday, not a per-meeting cap) so a forgotten stream can't run forever. Start
   again to continue. (A sticky restart resets the clock.)
-- **Live status** — the label and notification refresh every ~1–2 s while capturing (elapsed + KB
-  sent), so a frozen `0s · 0 KB` means the socket never actually connected, not just a stale label.
+- **Live status** — `Audio reaching bridge` appears only after an advancing server receipt. A dead
+  socket says audio is not reaching the bridge and reconnects with backoff; an ack-capable bridge
+  that stops confirming progress is treated the same way after 10 s (five expected receipt
+  intervals). An older bridge is labeled `delivery unconfirmed` rather than healthy. Each outage
+  raises a persistent, soundless notification with one vibration; recovery retains an interruption
+  warning because audio from the gap was dropped.
 
 ## Configuration (endpoint + token)
 
@@ -87,7 +93,7 @@ Without this, expect capture to die a few minutes after the screen turns off.
 ## Use
 
 1. Confirm the `wss://…/meeting/` base + token are filled, tap **Start**.
-2. Status shows `● Capturing`. Lock the screen — the notification persists and capture continues.
+2. Wait for `● Audio reaching bridge`. Lock the screen — the notification persists and capture continues.
 3. **Mark** (from the notification) drops a marker into the transcript; **Stop** ends the session.
 4. On the edge, a `~/meeting-sessions/<timestamp>.md` grows live with diarized turns.
 
@@ -99,6 +105,7 @@ clients/android-mic/
     AndroidManifest.xml                     # mic FGS type + permissions
     java/com/genesis/meetingmic/
       MainActivity.kt                       # config, Start/Stop, status, battery-exemption prompt
+      DeliveryReceiptTracker.kt             # pure receipt-progress state machine
       MicStreamService.kt                   # foreground mic service: AudioRecord -> OkHttp WS
     res/…                                   # layout, strings, adaptive icon
   app/build.gradle.kts                      # AGP 8.5, compileSdk 34, OkHttp; BuildConfig injection

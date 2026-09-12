@@ -88,8 +88,11 @@ graduation boundary.
   mega-turns). Env-tunable per room: `MEETING_PREFER_CURRENT_SPEAKER` (default `false`) and
   `MEETING_SPEAKER_SENSITIVITY` (default `0.6`).
 - **Wire format** — **binary** frames = raw **16-bit little-endian mono PCM at 16 kHz** (the same
-  rate as §1 ambient, sent without resampling). **Text** frames = JSON control; today only
-  `{"type": "marker"}`, which drops a timestamped marker into the transcript.
+  rate as §1 ambient, sent without resampling). **Text** frames = JSON control. A marker is
+  `{"type":"marker"}`. Receipt-aware clients opt in with
+  `{"type":"hello","capabilities":["audio_ack_v1"]}`; the bridge advertises the same capability
+  and sends cumulative `{"type":"audio_ack","bytes":N}` receipts after the first frame and about
+  every two seconds. The count covers every PCM byte received, including VAD-gated silence.
 - **Auth** — a secret token in the **URL path** (`<token>`), constant-time compared, with a
   `…_PREVIOUS` token honored during rotation. Path-token because a browser/phone WebSocket cannot
   set custom headers. Exposed **tailnet-only** via `tailscale serve` (private) — not Funnel; the
@@ -97,7 +100,9 @@ graduation boundary.
 - **Liveness** — the server sends WebSocket heartbeat pings and force-closes a peer that stops
   answering (phone screen-lock / wifi handoff), finalizing the cloud session instead of leaking it.
 - Native background client: [`clients/android-mic`](clients/android-mic/) (foreground mic service,
-  survives screen-lock). Its audio is dropped, not buffered, across a reconnect.
+  survives screen-lock). It reports healthy delivery only after advancing bridge receipts; a
+  transport failure produces an explicit persistent notification and one vibration without sound.
+  Its audio is dropped, not buffered, across a reconnect.
 
 ## 2. Edge (conversational) to Genesis — `/v1/voice/*`
 
