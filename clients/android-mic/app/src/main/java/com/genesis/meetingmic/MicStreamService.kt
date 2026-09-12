@@ -354,7 +354,7 @@ class MicStreamService : LifecycleService() {
                 hadDeliveryGap = true
                 publish(Phase.RECONNECTING, "audio not reaching bridge; reconnecting ($reason)")
                 updateNotif("Audio delivery failed — reconnecting")
-                notifyDeliveryFailure()
+                notifyDeliveryFailure(captureStopped = false)
             }
         }
         socket.cancel()
@@ -388,7 +388,7 @@ class MicStreamService : LifecycleService() {
                     hadDeliveryGap = true
                     publish(Phase.ERROR, "audio capture failed; not reaching bridge ($reason)")
                     updateNotif("Audio capture failed")
-                    notifyDeliveryFailure()
+                    notifyDeliveryFailure(captureStopped = true)
                 }
             }
             socket?.cancel()
@@ -548,19 +548,29 @@ class MicStreamService : LifecycleService() {
         }
     }
 
-    private fun notifyDeliveryFailure() {
-        if (outageAlerted) return
+    private fun notifyDeliveryFailure(captureStopped: Boolean) {
+        // A fatal AudioRecord error can follow an already-alerted transport outage.
+        // Replace that notification with terminal guidance while onlyAlertOnce keeps
+        // the update from vibrating a second time.
+        if (outageAlerted && !captureStopped) return
         outageAlerted = true
         createChannel()
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val title = if (captureStopped) "Meeting audio capture stopped" else "Meeting audio delivery failed"
+        val text = if (captureStopped) {
+            "Microphone capture stopped. Open the app to restart."
+        } else {
+            "Audio is not reaching the bridge. Reconnecting…"
+        }
         nm.notify(
             FAILURE_NOTIF_ID,
             NotificationCompat.Builder(this, FAILURE_CHANNEL_ID)
-                .setContentTitle("Meeting audio delivery failed")
-                .setContentText("Audio is not reaching the bridge. Reconnecting…")
+                .setContentTitle(title)
+                .setContentText(text)
                 .setSmallIcon(R.drawable.ic_mic)
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .setVibrate(longArrayOf(0, 300))
+                .setOnlyAlertOnce(true)
                 .setOngoing(true)
                 .build(),
         )
