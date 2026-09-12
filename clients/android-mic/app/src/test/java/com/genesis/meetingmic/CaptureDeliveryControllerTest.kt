@@ -17,6 +17,7 @@ class CaptureDeliveryControllerTest {
         val healthy = controller.ack(run, attempt, 3_200, 2_000)!!
         assertEquals(CaptureDeliveryPhase.HEALTHY, healthy.snapshot.phase)
         assertEquals(3_200, healthy.snapshot.confirmedBytes)
+        assertTrue(healthy.resetReconnectBackoff)
         assertTrue(controller.canSend(run))
     }
 
@@ -27,6 +28,7 @@ class CaptureDeliveryControllerTest {
         assertEquals(CaptureDeliveryPhase.RECONNECTING, stale.snapshot.phase)
         assertEquals(FailureAlertCommand.SHOW_RECONNECTING, stale.alert)
         assertTrue(stale.closeSocket)
+        assertTrue(stale.scheduleReconnect)
         assertTrue(stale.snapshot.hadDeliveryGap)
         assertFalse(controller.receiptChecksActive(run, attempt))
         assertTrue(controller.needsReconnect(run))
@@ -41,6 +43,7 @@ class CaptureDeliveryControllerTest {
         controller.capabilityConfirmed(run, attempt)
         val restored = controller.ack(run, attempt, 3_200, 21_000)!!
         assertEquals(FailureAlertCommand.CLEAR, restored.alert)
+        assertTrue(restored.resetReconnectBackoff)
         assertEquals(CaptureDeliveryPhase.HEALTHY, restored.snapshot.phase)
         assertTrue(restored.snapshot.hadDeliveryGap)
     }
@@ -54,6 +57,7 @@ class CaptureDeliveryControllerTest {
         val unconfirmed = controller.receiptTick(run, legacy, 30_001)!!
         assertEquals(CaptureDeliveryPhase.UNCONFIRMED, unconfirmed.snapshot.phase)
         assertEquals(FailureAlertCommand.CLEAR, unconfirmed.alert)
+        assertTrue(unconfirmed.resetReconnectBackoff)
         assertEquals("Marked ✓ — delivery unconfirmed", controller.markerNotification())
     }
 
@@ -62,6 +66,7 @@ class CaptureDeliveryControllerTest {
         val attempt = controller.beginAttempt(run)!!
         val first = controller.socketDown(run, attempt)!!
         assertEquals(FailureAlertCommand.SHOW_RECONNECTING, first.alert)
+        assertTrue(first.scheduleReconnect)
         assertNull(controller.socketDown(run, attempt))
     }
 

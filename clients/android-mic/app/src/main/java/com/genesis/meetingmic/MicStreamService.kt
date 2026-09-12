@@ -188,10 +188,9 @@ class MicStreamService : LifecycleService() {
         val started = delivery.start()
         val runId = started.snapshot.runId
         activeUrl = url
-        reconnectBackoffMs = RECONNECT_MIN_MS
         startForegroundNotif()
         acquireWakeLock()
-        applyFailureAlert(started.alert)
+        applyDeliveryEffects(started, runId)
         startedAtMs = System.currentTimeMillis()
         publish(Phase.CONNECTING, "connecting")
 
@@ -314,7 +313,7 @@ class MicStreamService : LifecycleService() {
                 attemptId,
                 SystemClock.elapsedRealtime(),
             ) ?: return
-            applyFailureAlert(update.alert)
+            applyDeliveryEffects(update, runId)
             publish(Phase.CONNECTING, "connected; awaiting bridge receipt")
             updateNotif("Connected — confirming audio delivery")
             scheduleReceiptTick(socket, runId, attemptId)
@@ -336,8 +335,7 @@ class MicStreamService : LifecycleService() {
                         message.optLong("bytes", -1),
                         SystemClock.elapsedRealtime(),
                     ) ?: return
-                    reconnectBackoffMs = RECONNECT_MIN_MS
-                    applyFailureAlert(update.alert)
+                    applyDeliveryEffects(update, runId)
                     publish(Phase.LIVE, liveDetail(update.snapshot))
                     updateNotif(liveNotifText(update.snapshot))
                 }
@@ -354,7 +352,7 @@ class MicStreamService : LifecycleService() {
                 SystemClock.elapsedRealtime(),
             )
             if (update != null) {
-                applyFailureAlert(update.alert)
+                applyDeliveryEffects(update, runId)
                 when (update.snapshot.phase) {
                     CaptureDeliveryPhase.UNCONFIRMED -> {
                         publish(Phase.UNCONFIRMED, "bridge does not support delivery receipts")
@@ -364,7 +362,6 @@ class MicStreamService : LifecycleService() {
                         ws.set(null)
                         publish(Phase.RECONNECTING, "audio not reaching bridge; reconnecting (bridge receipts stopped)")
                         updateNotif("Audio delivery failed — reconnecting")
-                        scheduleReconnect(runId)
                     }
                     else -> Unit
                 }
@@ -388,11 +385,10 @@ class MicStreamService : LifecycleService() {
             if (ws.get() !== socket) return
             val update = delivery.handshakeTimedOut(runId, attemptId) ?: return
             ws.set(null)
-            applyFailureAlert(update.alert)
+            applyDeliveryEffects(update, runId)
             publish(Phase.RECONNECTING, "audio not reaching bridge; reconnecting (WebSocket handshake timed out)")
             updateNotif("Audio delivery failed — reconnecting")
             socket.cancel()
-            scheduleReconnect(runId)
         }
     }
 
@@ -406,12 +402,17 @@ class MicStreamService : LifecycleService() {
             if (ws.get() !== socket) return
             val update = delivery.socketDown(runId, attemptId) ?: return
             ws.set(null)
-            applyFailureAlert(update.alert)
+            applyDeliveryEffects(update, runId)
             publish(Phase.RECONNECTING, "audio not reaching bridge; reconnecting ($reason)")
             updateNotif("Audio delivery failed — reconnecting")
             socket.cancel()
-            scheduleReconnect(runId)
         }
+    }
+
+    private fun applyDeliveryEffects(update: CaptureDeliveryUpdate, runId: Long) {
+        applyFailureAlert(update.alert)
+        if (update.resetReconnectBackoff) reconnectBackoffMs = RECONNECT_MIN_MS
+        if (update.scheduleReconnect) scheduleReconnect(runId)
     }
 
     private fun scheduleReconnect(runId: Long) {
@@ -454,7 +455,7 @@ class MicStreamService : LifecycleService() {
                 ws.getAndSet(null).also {
                     publish(Phase.ERROR, "audio capture failed; not reaching bridge ($reason)")
                     updateNotif("Audio capture failed")
-                    applyFailureAlert(update.alert)
+                    applyDeliveryEffects(update, runId)
                 }
             }
             socket?.cancel()
@@ -471,7 +472,7 @@ class MicStreamService : LifecycleService() {
             activeUrl = null
             val update = delivery.stop()
             ws.getAndSet(null).also {
-                applyFailureAlert(update.alert)
+                applyDeliveryEffects(update, update.snapshot.runId)
                 publish(Phase.STOPPED, reason)
             }
         }

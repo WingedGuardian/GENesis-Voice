@@ -30,6 +30,8 @@ data class CaptureDeliveryUpdate(
     val snapshot: CaptureDeliverySnapshot,
     val alert: FailureAlertCommand = FailureAlertCommand.NONE,
     val closeSocket: Boolean = false,
+    val scheduleReconnect: Boolean = false,
+    val resetReconnectBackoff: Boolean = false,
 )
 
 /**
@@ -56,7 +58,10 @@ class CaptureDeliveryController(receiptTimeoutMs: Long) {
         phase = CaptureDeliveryPhase.CONNECTING
         alert = FailureAlertCommand.NONE
         hadDeliveryGap = false
-        return update(alert = FailureAlertCommand.CLEAR)
+        return update(
+            alert = FailureAlertCommand.CLEAR,
+            resetReconnectBackoff = true,
+        )
     }
 
     @Synchronized
@@ -197,7 +202,11 @@ class CaptureDeliveryController(receiptTimeoutMs: Long) {
             FailureAlertCommand.SHOW_RECONNECTING
         }
         alert = FailureAlertCommand.SHOW_RECONNECTING
-        return update(alert = alertCommand, closeSocket = closeSocket)
+        return update(
+            alert = alertCommand,
+            closeSocket = closeSocket,
+            scheduleReconnect = true,
+        )
     }
 
     private fun deliveryRestoredUpdate(): CaptureDeliveryUpdate {
@@ -207,7 +216,7 @@ class CaptureDeliveryController(receiptTimeoutMs: Long) {
             FailureAlertCommand.CLEAR
         }
         alert = FailureAlertCommand.NONE
-        return update(alert = alertCommand)
+        return update(alert = alertCommand, resetReconnectBackoff = true)
     }
 
     private fun isCurrentRun(forRunId: Long): Boolean = active && runId == forRunId
@@ -225,7 +234,15 @@ class CaptureDeliveryController(receiptTimeoutMs: Long) {
     private fun update(
         alert: FailureAlertCommand = FailureAlertCommand.NONE,
         closeSocket: Boolean = false,
-    ) = CaptureDeliveryUpdate(snapshotUnlocked(), alert, closeSocket)
+        scheduleReconnect: Boolean = false,
+        resetReconnectBackoff: Boolean = false,
+    ) = CaptureDeliveryUpdate(
+        snapshot = snapshotUnlocked(),
+        alert = alert,
+        closeSocket = closeSocket,
+        scheduleReconnect = scheduleReconnect,
+        resetReconnectBackoff = resetReconnectBackoff,
+    )
 
     private fun snapshotUnlocked() = CaptureDeliverySnapshot(
         runId = runId,
