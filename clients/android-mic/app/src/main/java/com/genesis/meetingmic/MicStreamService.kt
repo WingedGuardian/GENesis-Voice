@@ -95,6 +95,9 @@ class MicStreamService : LifecycleService() {
 
         private const val RECONNECT_MIN_MS = 1_000L
         private const val RECONNECT_MAX_MS = 15_000L
+        // The receipt timer starts only after onOpen. Bound a peer that accepts TCP but never
+        // completes the HTTP upgrade; 30 s is the lower edge of issue #45's alert window.
+        private const val HANDSHAKE_TIMEOUT_MS = 30_000L
         private const val RECEIPT_TIMEOUT_MS = 10_000L
 
         enum class Phase { IDLE, CONNECTING, LIVE, UNCONFIRMED, RECONNECTING, STOPPED, ERROR }
@@ -189,6 +192,7 @@ class MicStreamService : LifecycleService() {
         startForegroundNotif()
         acquireWakeLock()
         synchronized(receipts) { receipts.onSocketOpened(SystemClock.elapsedRealtime()) }
+        cancelDeliveryFailure()
         outageAlerted = false
         hadDeliveryGap = false
         captureActive = true
@@ -258,6 +262,8 @@ class MicStreamService : LifecycleService() {
                                             publish(Phase.LIVE, liveDetail())
                                         }
                                         DeliveryReceiptStatus.UNCONFIRMED -> if (_state.value.phase != Phase.UNCONFIRMED) {
+                                            outageAlerted = false
+                                            cancelDeliveryFailure()
                                             publish(Phase.UNCONFIRMED, "bridge does not support delivery receipts")
                                             updateNotif("Audio delivery unconfirmed")
                                         }
@@ -342,6 +348,12 @@ class MicStreamService : LifecycleService() {
                 }
             })
             ws.set(sock)
+            mainHandler.postDelayed({
+                val timedOut = synchronized(ws) {
+                    captureActive && ws.get() === sock && !wsConnected
+                }
+                if (timedOut) onSocketDown(sock, "WebSocket handshake timed out")
+            }, HANDSHAKE_TIMEOUT_MS)
         }
     }
 

@@ -39,7 +39,9 @@ Targets the bridge's already-deployed ingress (see [`../../CONTRACTS.md`](../../
 - **Live status** — `Audio reaching bridge` appears only after an advancing server receipt. A dead
   socket says audio is not reaching the bridge and reconnects with backoff; an ack-capable bridge
   that stops confirming progress is treated the same way after 10 s (five expected receipt
-  intervals). An older bridge is labeled `delivery unconfirmed` rather than healthy. Each outage
+  intervals). A connection that does not finish its WebSocket handshake within 30 s enters the
+  same visible reconnect path. An older bridge is labeled `delivery unconfirmed` rather than
+  healthy. Each outage
   raises a persistent, soundless notification with one vibration; recovery retains an interruption
   warning because audio from the gap was dropped.
 
