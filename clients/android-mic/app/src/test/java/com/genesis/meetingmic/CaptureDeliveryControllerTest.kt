@@ -29,6 +29,7 @@ class CaptureDeliveryControllerTest {
         assertTrue(stale.closeSocket)
         assertTrue(stale.snapshot.hadDeliveryGap)
         assertFalse(controller.receiptChecksActive(run, attempt))
+        assertTrue(controller.needsReconnect(run))
         assertNull(controller.socketDown(run, attempt))
     }
 

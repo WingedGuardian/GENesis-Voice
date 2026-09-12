@@ -120,6 +120,8 @@ class MicStreamService : LifecycleService() {
     private val delivery = CaptureDeliveryController(RECEIPT_TIMEOUT_MS)
     @Volatile private var startedAtMs = 0L
     private var captureJob: Job? = null
+    private var activeUrl: String? = null
+    private var reconnectBackoffMs = RECONNECT_MIN_MS
     private var wakeLock: PowerManager.WakeLock? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -185,6 +187,8 @@ class MicStreamService : LifecycleService() {
 
         val started = delivery.start()
         val runId = started.snapshot.runId
+        activeUrl = url
+        reconnectBackoffMs = RECONNECT_MIN_MS
         startForegroundNotif()
         acquireWakeLock()
         applyFailureAlert(started.alert)
@@ -222,7 +226,6 @@ class MicStreamService : LifecycleService() {
             return
         }
 
-        var backoff = RECONNECT_MIN_MS
         try {
             recorder.startRecording()
             val buf = ByteArray(FRAME_BYTES)
@@ -245,9 +248,7 @@ class MicStreamService : LifecycleService() {
                 val sock = ws.get()
                 when {
                     delivery.canSend(runId) && sock != null -> {
-                        if (sock.send(buf.toByteString(0, n))) {
-                            backoff = RECONNECT_MIN_MS
-                        } else {
+                        if (!sock.send(buf.toByteString(0, n))) {
                             // send() refused → socket is closing/closed; fall into reconnect.
                             val attemptId = delivery.currentAttempt(runId)
                             if (attemptId != null) {
@@ -255,15 +256,8 @@ class MicStreamService : LifecycleService() {
                             }
                         }
                     }
-                    sock == null && delivery.needsReconnect(runId) -> {
-                        // Socket is down; pace reconnect attempts with backoff (audio in this window is dropped).
-                        delay(backoff)
-                        backoff = (backoff * 2).coerceAtMost(RECONNECT_MAX_MS)
-                        if (currentCoroutineContext().isActive) {
-                            withContext(Dispatchers.Main.immediate) { openSocket(url, runId) }
-                        }
-                    }
                     // else: connected socket not yet open (CONNECTING) → drop this frame, keep reading.
+                    // Reconnect scheduling is main-handler driven so a blocked mic read cannot stall it.
                 }
             }
         } catch (e: CancellationException) {
@@ -342,6 +336,7 @@ class MicStreamService : LifecycleService() {
                         message.optLong("bytes", -1),
                         SystemClock.elapsedRealtime(),
                     ) ?: return
+                    reconnectBackoffMs = RECONNECT_MIN_MS
                     applyFailureAlert(update.alert)
                     publish(Phase.LIVE, liveDetail(update.snapshot))
                     updateNotif(liveNotifText(update.snapshot))
@@ -369,6 +364,7 @@ class MicStreamService : LifecycleService() {
                         ws.set(null)
                         publish(Phase.RECONNECTING, "audio not reaching bridge; reconnecting (bridge receipts stopped)")
                         updateNotif("Audio delivery failed — reconnecting")
+                        scheduleReconnect(runId)
                     }
                     else -> Unit
                 }
@@ -396,6 +392,7 @@ class MicStreamService : LifecycleService() {
             publish(Phase.RECONNECTING, "audio not reaching bridge; reconnecting (WebSocket handshake timed out)")
             updateNotif("Audio delivery failed — reconnecting")
             socket.cancel()
+            scheduleReconnect(runId)
         }
     }
 
@@ -413,7 +410,22 @@ class MicStreamService : LifecycleService() {
             publish(Phase.RECONNECTING, "audio not reaching bridge; reconnecting ($reason)")
             updateNotif("Audio delivery failed — reconnecting")
             socket.cancel()
+            scheduleReconnect(runId)
         }
+    }
+
+    private fun scheduleReconnect(runId: Long) {
+        val url = activeUrl ?: return
+        val delayMs = reconnectBackoffMs
+        reconnectBackoffMs = (reconnectBackoffMs * 2).coerceAtMost(RECONNECT_MAX_MS)
+        mainHandler.postDelayed({
+            synchronized(ws) {
+                if (activeUrl != url || ws.get() != null || !delivery.needsReconnect(runId)) {
+                    return@postDelayed
+                }
+            }
+            openSocket(url, runId)
+        }, delayMs)
     }
 
     private fun supportsAudioAck(message: JSONObject): Boolean {
@@ -438,6 +450,7 @@ class MicStreamService : LifecycleService() {
         mainHandler.post {
             val socket = synchronized(ws) {
                 val update = delivery.captureFailed(runId) ?: return@post
+                activeUrl = null
                 ws.getAndSet(null).also {
                     publish(Phase.ERROR, "audio capture failed; not reaching bridge ($reason)")
                     updateNotif("Audio capture failed")
@@ -455,6 +468,7 @@ class MicStreamService : LifecycleService() {
         val socket = synchronized(ws) {
             captureJob?.cancel()
             captureJob = null
+            activeUrl = null
             val update = delivery.stop()
             ws.getAndSet(null).also {
                 applyFailureAlert(update.alert)
@@ -476,6 +490,7 @@ class MicStreamService : LifecycleService() {
         val socket = synchronized(ws) {
             captureJob?.cancel()
             captureJob = null
+            activeUrl = null
             delivery.stop() // invalidate every queued callback; preserve any terminal alert onscreen
             ws.getAndSet(null)
         }
