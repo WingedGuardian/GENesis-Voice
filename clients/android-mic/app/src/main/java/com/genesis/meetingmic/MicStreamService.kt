@@ -17,6 +17,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
@@ -31,6 +32,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -38,6 +40,7 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
+import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -65,7 +68,9 @@ class MicStreamService : LifecycleService() {
         const val EXTRA_MODEL = "model"     // "standard" | "enhanced" (fixed per session)
 
         private const val CHANNEL_ID = "capture"
+        private const val FAILURE_CHANNEL_ID = "capture_delivery_failure"
         private const val NOTIF_ID = 1
+        private const val FAILURE_NOTIF_ID = 2
 
         // Persisted so a START_STICKY restart (OS kills the process mid-meeting, redelivers a null
         // intent) can resume with the same endpoint/model instead of erroring out. App-private storage.
@@ -91,13 +96,18 @@ class MicStreamService : LifecycleService() {
 
         private const val RECONNECT_MIN_MS = 1_000L
         private const val RECONNECT_MAX_MS = 15_000L
+        // The receipt timer starts only after onOpen. Bound a peer that accepts TCP but never
+        // completes the HTTP upgrade; 30 s is the lower edge of issue #45's alert window.
+        private const val HANDSHAKE_TIMEOUT_MS = 30_000L
+        private const val RECEIPT_TIMEOUT_MS = 10_000L
+        private const val RECEIPT_CHECK_INTERVAL_MS = 1_000L
 
-        enum class Phase { IDLE, CONNECTING, LIVE, RECONNECTING, STOPPED, ERROR }
+        enum class Phase { IDLE, CONNECTING, LIVE, UNCONFIRMED, RECONNECTING, STOPPED, ERROR }
 
         data class CaptureState(
             val phase: Phase = Phase.IDLE,
             val detail: String = "",
-            val bytesSent: Long = 0,
+            val bytesConfirmed: Long = 0,
             val startedAtMs: Long = 0,
         )
 
@@ -107,11 +117,11 @@ class MicStreamService : LifecycleService() {
     }
 
     private val ws = AtomicReference<WebSocket?>(null)
-    @Volatile private var wsConnected = false
-    @Volatile private var bytesSent = 0L
+    private val delivery = CaptureDeliveryController(RECEIPT_TIMEOUT_MS)
     @Volatile private var startedAtMs = 0L
-    // @Volatile: read from OkHttp callback threads (onSocketDown) as well as the main thread.
-    @Volatile private var captureJob: Job? = null
+    private var captureJob: Job? = null
+    private var activeUrl: String? = null
+    private var reconnectBackoffMs = RECONNECT_MIN_MS
     private var wakeLock: PowerManager.WakeLock? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -175,21 +185,27 @@ class MicStreamService : LifecycleService() {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
             .putString(KEY_URL, base).putString(KEY_TOKEN, token).putString(KEY_MODEL, model).apply()
 
+        val started = delivery.start()
+        val runId = started.snapshot.runId
+        activeUrl = url
         startForegroundNotif()
         acquireWakeLock()
-        bytesSent = 0L
+        applyDeliveryEffects(started, runId)
         startedAtMs = System.currentTimeMillis()
         publish(Phase.CONNECTING, "connecting")
 
         captureJob = lifecycleScope.launch(Dispatchers.IO) {
-            connectAndStream(url)
+            connectAndStream(url, runId)
         }
     }
 
     /** Owns the AudioRecord for its whole lifetime; reconnects the socket underneath it. */
-    private suspend fun connectAndStream(url: String) {
+    private suspend fun connectAndStream(url: String, runId: Long) {
         val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL, ENCODING)
-        if (minBuf <= 0) { publish(Phase.ERROR, "AudioRecord unsupported"); stopSelf(); return }
+        if (minBuf <= 0) {
+            reportCaptureFailure(runId, "AudioRecord unsupported")
+            return
+        }
         val recordBuf = maxOf(minBuf, FRAME_BYTES * 2)
 
         val recorder = try {
@@ -200,114 +216,268 @@ class MicStreamService : LifecycleService() {
                 SAMPLE_RATE, CHANNEL, ENCODING, recordBuf,
             )
         } catch (e: Exception) {
-            publish(Phase.ERROR, "AudioRecord init failed"); stopSelf(); return
+            reportCaptureFailure(runId, "AudioRecord init failed")
+            return
         }
         if (recorder.state != AudioRecord.STATE_INITIALIZED) {
-            publish(Phase.ERROR, "AudioRecord not initialized"); recorder.release(); stopSelf(); return
+            recorder.release()
+            reportCaptureFailure(runId, "AudioRecord not initialized")
+            return
         }
 
-        var backoff = RECONNECT_MIN_MS
-        var ticks = 0  // frame counter; ~10 frames ≈ 1 s at 100 ms/frame
         try {
             recorder.startRecording()
             val buf = ByteArray(FRAME_BYTES)
-            openSocket(url)
+            withContext(Dispatchers.Main.immediate) { openSocket(url, runId) }
             // Gate on THIS coroutine's own liveness (not captureJob, which is assigned after launch()
             // returns and could still be null when the body first runs). Cancellation of the job
             // flips this to false and drains the loop.
             while (currentCoroutineContext().isActive) {
                 val n = recorder.read(buf, 0, buf.size)
+                if (n < 0) {
+                    throw IllegalStateException("microphone capture failed ($n)")
+                }
                 if (n <= 0) { delay(20); continue }
                 // Safety auto-stop after the max continuous duration (routed to the main thread so the
                 // FGS teardown runs there; break out of this loop immediately).
                 if (startedAtMs > 0 && System.currentTimeMillis() - startedAtMs >= MAX_SESSION_MS) {
-                    mainHandler.post { stopCapture("auto-stopped (8h limit)") }
+                    mainHandler.post { stopCapture("auto-stopped (14h limit)") }
                     break
                 }
                 val sock = ws.get()
                 when {
-                    wsConnected && sock != null -> {
-                        if (sock.send(buf.toByteString(0, n))) {
-                            bytesSent += n
-                            backoff = RECONNECT_MIN_MS  // a good send means we're healthy — reset backoff
-                            // Refresh the live UI counters ~once/sec (the StateFlow otherwise only
-                            // emits on phase changes, so bytes/elapsed would appear frozen at 0).
-                            if (++ticks % 10 == 0) publish(Phase.LIVE, "capturing")
-                            // ~every 2 s: the notification is the PRIMARY display while the screen
-                            // is locked (the app's core use case), so it must not look frozen.
-                            if (ticks % 20 == 0) updateNotif(liveNotifText())
-                        } else {
+                    delivery.canSend(runId) && sock != null -> {
+                        if (!sock.send(buf.toByteString(0, n))) {
                             // send() refused → socket is closing/closed; fall into reconnect.
-                            onSocketDown("send failed")
+                            val attemptId = delivery.currentAttempt(runId)
+                            if (attemptId != null) {
+                                mainHandler.post { onSocketDown(sock, runId, attemptId, "send failed") }
+                            }
                         }
                     }
-                    sock == null && _state.value.phase == Phase.RECONNECTING -> {
-                        // Socket is down; pace reconnect attempts with backoff (audio in this window is dropped).
-                        delay(backoff)
-                        backoff = (backoff * 2).coerceAtMost(RECONNECT_MAX_MS)
-                        if (currentCoroutineContext().isActive) openSocket(url)
-                    }
                     // else: connected socket not yet open (CONNECTING) → drop this frame, keep reading.
+                    // Reconnect scheduling is main-handler driven so a blocked mic read cannot stall it.
                 }
             }
         } catch (e: CancellationException) {
             throw e  // a normal stop (job cancelled) — don't clobber the STOPPED status with ERROR
         } catch (e: Exception) {
-            publish(Phase.ERROR, e.message ?: "capture error")
+            reportCaptureFailure(runId, e.message ?: "capture error")
         } finally {
             try { recorder.stop() } catch (_: Exception) {}
             recorder.release()
         }
     }
 
-    private fun openSocket(url: String) {
-        // Close any prior socket before opening a fresh one.
-        ws.getAndSet(null)?.cancel()
-        wsConnected = false
-        publish(if (startedAtMs == 0L) Phase.CONNECTING else _state.value.phase)
-        val req = Request.Builder().url(url).build()
-        val sock = http.newWebSocket(req, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                wsConnected = true
-                publish(Phase.LIVE, "capturing")
-                updateNotif("Capturing — connected")
-            }
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                onSocketDown("closed ${code}")
-            }
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                onSocketDown(t.message ?: "ws failure")
-            }
-        })
-        ws.set(sock)
+    private fun openSocket(url: String, runId: Long) {
+        synchronized(ws) {
+            val attemptId = delivery.beginAttempt(runId) ?: return
+            ws.getAndSet(null)?.cancel()
+            publish(if (startedAtMs == 0L) Phase.CONNECTING else _state.value.phase)
+            val req = Request.Builder().url(url).build()
+            val sock = http.newWebSocket(req, object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    mainHandler.post { onSocketOpened(webSocket, runId, attemptId) }
+                }
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    mainHandler.post { onSocketMessage(webSocket, runId, attemptId, text) }
+                }
+                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                    mainHandler.post { onSocketDown(webSocket, runId, attemptId, "closed ${code}") }
+                }
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    mainHandler.post {
+                        onSocketDown(webSocket, runId, attemptId, t.message ?: "ws failure")
+                    }
+                }
+            })
+            ws.set(sock)
+            mainHandler.postDelayed({
+                onHandshakeTimeout(sock, runId, attemptId)
+            }, HANDSHAKE_TIMEOUT_MS)
+        }
     }
 
-    private fun onSocketDown(reason: String) {
-        wsConnected = false
-        ws.getAndSet(null)
-        if (captureJob?.isActive == true) {
-            publish(Phase.RECONNECTING, "reconnecting ($reason)")
-            updateNotif("Reconnecting…")
+    private fun onSocketOpened(socket: WebSocket, runId: Long, attemptId: Long) {
+        synchronized(ws) {
+            if (ws.get() !== socket) return
+            // Keep audio gated in CONNECTING until the capability request is queued. Otherwise the
+            // capture thread can enqueue PCM first and bridge startup can delay the hello response
+            // long enough to misclassify an ack-capable bridge as legacy.
+            if (!socket.send("{\"type\":\"hello\",\"capabilities\":[\"audio_ack_v1\"]}")) {
+                onSocketDown(socket, runId, attemptId, "capability hello send failed")
+                return
+            }
+            val update = delivery.socketOpened(
+                runId,
+                attemptId,
+                SystemClock.elapsedRealtime(),
+            ) ?: return
+            applyDeliveryEffects(update, runId)
+            publish(Phase.CONNECTING, "connected; awaiting bridge receipt")
+            updateNotif("Connected — confirming audio delivery")
+            scheduleReceiptTick(socket, runId, attemptId)
+        }
+    }
+
+    private fun onSocketMessage(socket: WebSocket, runId: Long, attemptId: Long, text: String) {
+        val message = try { JSONObject(text) } catch (_: Exception) { return }
+        synchronized(ws) {
+            if (ws.get() !== socket) return
+            when (message.optString("type")) {
+                "hello" -> if (supportsAudioAck(message)) {
+                    delivery.capabilityConfirmed(runId, attemptId)
+                }
+                "audio_ack" -> {
+                    val update = delivery.ack(
+                        runId,
+                        attemptId,
+                        message.optLong("bytes", -1),
+                        SystemClock.elapsedRealtime(),
+                    ) ?: return
+                    applyDeliveryEffects(update, runId)
+                    publish(Phase.LIVE, liveDetail(update.snapshot))
+                    updateNotif(liveNotifText(update.snapshot))
+                }
+            }
+        }
+    }
+
+    private fun onReceiptTick(socket: WebSocket, runId: Long, attemptId: Long) {
+        synchronized(ws) {
+            if (ws.get() !== socket) return
+            val update = delivery.receiptTick(
+                runId,
+                attemptId,
+                SystemClock.elapsedRealtime(),
+            )
+            if (update != null) {
+                applyDeliveryEffects(update, runId)
+                when (update.snapshot.phase) {
+                    CaptureDeliveryPhase.UNCONFIRMED -> {
+                        publish(Phase.UNCONFIRMED, "bridge does not support delivery receipts")
+                        updateNotif("Audio delivery unconfirmed")
+                    }
+                    CaptureDeliveryPhase.RECONNECTING -> {
+                        ws.set(null)
+                        publish(Phase.RECONNECTING, "audio not reaching bridge; reconnecting (bridge receipts stopped)")
+                        updateNotif("Audio delivery failed — reconnecting")
+                    }
+                    else -> Unit
+                }
+                if (update.closeSocket) socket.cancel()
+            }
+            if (ws.get() === socket && delivery.receiptChecksActive(runId, attemptId)) {
+                scheduleReceiptTick(socket, runId, attemptId)
+            }
+        }
+    }
+
+    private fun scheduleReceiptTick(socket: WebSocket, runId: Long, attemptId: Long) {
+        mainHandler.postDelayed(
+            { onReceiptTick(socket, runId, attemptId) },
+            RECEIPT_CHECK_INTERVAL_MS,
+        )
+    }
+
+    private fun onHandshakeTimeout(socket: WebSocket, runId: Long, attemptId: Long) {
+        synchronized(ws) {
+            if (ws.get() !== socket) return
+            val update = delivery.handshakeTimedOut(runId, attemptId) ?: return
+            ws.set(null)
+            applyDeliveryEffects(update, runId)
+            publish(Phase.RECONNECTING, "audio not reaching bridge; reconnecting (WebSocket handshake timed out)")
+            updateNotif("Audio delivery failed — reconnecting")
+            socket.cancel()
+        }
+    }
+
+    private fun onSocketDown(
+        socket: WebSocket,
+        runId: Long,
+        attemptId: Long,
+        reason: String,
+    ) {
+        synchronized(ws) {
+            if (ws.get() !== socket) return
+            val update = delivery.socketDown(runId, attemptId) ?: return
+            ws.set(null)
+            applyDeliveryEffects(update, runId)
+            publish(Phase.RECONNECTING, "audio not reaching bridge; reconnecting ($reason)")
+            updateNotif("Audio delivery failed — reconnecting")
+            socket.cancel()
+        }
+    }
+
+    private fun applyDeliveryEffects(update: CaptureDeliveryUpdate, runId: Long) {
+        applyFailureAlert(update.alert)
+        if (update.resetReconnectBackoff) reconnectBackoffMs = RECONNECT_MIN_MS
+        if (update.scheduleReconnect) scheduleReconnect(runId)
+    }
+
+    private fun scheduleReconnect(runId: Long) {
+        val url = activeUrl ?: return
+        val delayMs = reconnectBackoffMs
+        reconnectBackoffMs = (reconnectBackoffMs * 2).coerceAtMost(RECONNECT_MAX_MS)
+        mainHandler.postDelayed({
+            synchronized(ws) {
+                if (activeUrl != url || ws.get() != null || !delivery.needsReconnect(runId)) {
+                    return@postDelayed
+                }
+            }
+            openSocket(url, runId)
+        }, delayMs)
+    }
+
+    private fun supportsAudioAck(message: JSONObject): Boolean {
+        val capabilities = message.optJSONArray("capabilities") ?: return false
+        return (0 until capabilities.length()).any {
+            capabilities.optString(it) == "audio_ack_v1"
         }
     }
 
     private fun sendMarker() {
-        val sock = ws.get()
-        if (wsConnected && sock != null) {
-            sock.send("{\"type\":\"marker\"}")
-            updateNotif("Marked ✓")
+        synchronized(ws) {
+            val sock = ws.get()
+            val snapshot = delivery.snapshot()
+            if (delivery.canSend(snapshot.runId) && sock != null) {
+                sock.send("{\"type\":\"marker\"}")
+                updateNotif(delivery.markerNotification())
+            }
+        }
+    }
+
+    private fun reportCaptureFailure(runId: Long, reason: String) {
+        mainHandler.post {
+            val socket = synchronized(ws) {
+                val update = delivery.captureFailed(runId) ?: return@post
+                activeUrl = null
+                ws.getAndSet(null).also {
+                    publish(Phase.ERROR, "audio capture failed; not reaching bridge ($reason)")
+                    updateNotif("Audio capture failed")
+                    applyDeliveryEffects(update, runId)
+                }
+            }
+            socket?.cancel()
+            releaseWakeLock()
         }
     }
 
     private fun stopCapture(reason: String) {
         // Explicit stop → forget creds so a later sticky restart doesn't silently resume capture.
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().clear().apply()
-        captureJob?.cancel()
-        captureJob = null
-        wsConnected = false
-        ws.getAndSet(null)?.close(1000, "client stop")
+        val socket = synchronized(ws) {
+            captureJob?.cancel()
+            captureJob = null
+            activeUrl = null
+            val update = delivery.stop()
+            ws.getAndSet(null).also {
+                applyDeliveryEffects(update, update.snapshot.runId)
+                publish(Phase.STOPPED, reason)
+            }
+        }
+        socket?.close(1000, "client stop")
         releaseWakeLock()
-        publish(Phase.STOPPED, reason)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
@@ -318,8 +488,14 @@ class MicStreamService : LifecycleService() {
 
     override fun onDestroy() {
         // Belt-and-suspenders: never leak the wake lock or socket if the OS tears us down.
-        captureJob?.cancel()
-        ws.getAndSet(null)?.cancel()
+        val socket = synchronized(ws) {
+            captureJob?.cancel()
+            captureJob = null
+            activeUrl = null
+            delivery.stop() // invalidate every queued callback; preserve any terminal alert onscreen
+            ws.getAndSet(null)
+        }
+        socket?.cancel()
         releaseWakeLock()
         super.onDestroy()
     }
@@ -339,7 +515,8 @@ class MicStreamService : LifecycleService() {
     }
 
     private fun publish(phase: Phase, detail: String = _state.value.detail) {
-        _state.value = CaptureState(phase, detail, bytesSent, startedAtMs)
+        val confirmed = delivery.snapshot().confirmedBytes
+        _state.value = CaptureState(phase, detail, confirmed, startedAtMs)
     }
 
     private fun acquireWakeLock() {
@@ -372,11 +549,16 @@ class MicStreamService : LifecycleService() {
         nm.notify(NOTIF_ID, buildNotif(text))
     }
 
-    private fun liveNotifText(): String {
+    private fun liveNotifText(snapshot: CaptureDeliverySnapshot): String {
+        if (snapshot.hadDeliveryGap) return "Audio restored — earlier gap detected"
         val secs = if (startedAtMs > 0) (System.currentTimeMillis() - startedAtMs) / 1000 else 0L
-        val kb = bytesSent / 1024
-        return "Capturing — ${secs / 60}:${(secs % 60).toString().padStart(2, '0')} · $kb KB"
+        val kb = snapshot.confirmedBytes / 1024
+        return "Audio reaching bridge — ${secs / 60}:${(secs % 60).toString().padStart(2, '0')} · $kb KB"
     }
+
+    private fun liveDetail(snapshot: CaptureDeliverySnapshot): String = if (snapshot.hadDeliveryGap) {
+        "audio reaching bridge; earlier interruption may have lost audio"
+    } else "audio reaching bridge"
 
     private fun buildNotif(text: String): Notification {
         val stopPi = servicePendingIntent(ACTION_STOP, 10)
@@ -415,6 +597,61 @@ class MicStreamService : LifecycleService() {
                     ).apply { description = "Ongoing while streaming meeting audio" },
                 )
             }
+            if (nm.getNotificationChannel(FAILURE_CHANNEL_ID) == null) {
+                nm.createNotificationChannel(
+                    NotificationChannel(
+                        FAILURE_CHANNEL_ID, "Meeting delivery failures",
+                        NotificationManager.IMPORTANCE_HIGH,
+                    ).apply {
+                        description = "Alerts when meeting audio is not reaching the bridge"
+                        setSound(null, null)
+                        enableVibration(true)
+                    },
+                )
+            }
         }
+    }
+
+    private fun applyFailureAlert(command: FailureAlertCommand) {
+        if (command == FailureAlertCommand.NONE) return
+        if (command == FailureAlertCommand.CLEAR) {
+            cancelDeliveryFailure()
+            return
+        }
+        createChannel()
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val captureStopped = command == FailureAlertCommand.SHOW_CAPTURE_STOPPED
+        val openPi = PendingIntent.getActivity(
+            this, 13, Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val title = if (captureStopped) {
+            "Meeting audio capture stopped"
+        } else {
+            "Meeting audio delivery failed"
+        }
+        val text = if (captureStopped) {
+            "Microphone capture stopped. Open the app to restart."
+        } else {
+            "Audio is not reaching the bridge. Reconnecting…"
+        }
+        nm.notify(
+            FAILURE_NOTIF_ID,
+            NotificationCompat.Builder(this, FAILURE_CHANNEL_ID)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setSmallIcon(R.drawable.ic_mic)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setContentIntent(openPi)
+                .setVibrate(longArrayOf(0, 300))
+                .setOnlyAlertOnce(true)
+                .setOngoing(true)
+                .build(),
+        )
+    }
+
+    private fun cancelDeliveryFailure() {
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.cancel(FAILURE_NOTIF_ID)
     }
 }

@@ -3,6 +3,7 @@ package com.genesis.meetingmic
 import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -111,19 +112,31 @@ class MainActivity : AppCompatActivity() {
                 MicStreamService.state.collect { s ->
                     val secs = if (s.startedAtMs > 0)
                         ((System.currentTimeMillis() - s.startedAtMs) / 1000) else 0
-                    val kb = s.bytesSent / 1024
+                    val kb = s.bytesConfirmed / 1024
                     b.status.text = when (s.phase) {
                         MicStreamService.Companion.Phase.LIVE ->
-                            "● Capturing — ${secs}s · ${kb} KB sent"
+                            if (s.detail.contains("interruption"))
+                                "⚠ Audio reaching bridge — earlier interruption; recording may be incomplete"
+                            else "● Audio reaching bridge — ${secs}s · ${kb} KB confirmed"
+                        MicStreamService.Companion.Phase.UNCONFIRMED ->
+                            "⚠ Audio delivery unconfirmed — recording may be incomplete"
                         MicStreamService.Companion.Phase.RECONNECTING ->
-                            "◍ Reconnecting… (${s.detail})"
-                        MicStreamService.Companion.Phase.CONNECTING -> "◌ Connecting…"
+                            "✕ Audio delivery failed — ${s.detail}"
+                        MicStreamService.Companion.Phase.CONNECTING ->
+                            "◌ Connecting — audio not yet reaching bridge"
                         MicStreamService.Companion.Phase.STOPPED -> "○ Stopped"
                         MicStreamService.Companion.Phase.ERROR -> "✕ Error: ${s.detail}"
                         MicStreamService.Companion.Phase.IDLE -> "○ Idle"
                     }
+                    b.status.setBackgroundColor(when (s.phase) {
+                        MicStreamService.Companion.Phase.RECONNECTING,
+                        MicStreamService.Companion.Phase.ERROR -> Color.parseColor("#33D32F2F")
+                        MicStreamService.Companion.Phase.UNCONFIRMED -> Color.parseColor("#33FF9800")
+                        else -> Color.TRANSPARENT
+                    })
                     val live = s.phase == MicStreamService.Companion.Phase.LIVE ||
                         s.phase == MicStreamService.Companion.Phase.RECONNECTING ||
+                        s.phase == MicStreamService.Companion.Phase.UNCONFIRMED ||
                         s.phase == MicStreamService.Companion.Phase.CONNECTING
                     b.startBtn.isEnabled = !live
                     b.stopBtn.isEnabled = live

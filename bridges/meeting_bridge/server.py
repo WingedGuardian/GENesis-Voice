@@ -160,6 +160,9 @@ class MeetingServer:
         last_turns = 0
         last_evidence_ts = 0.0
         last_loud_ts = time.monotonic()
+        ack_enabled = False
+        received_bytes = 0
+        last_ack_ts = 0.0
         self._active += 1
         logger.info(
             "meeting connection opening: %s model=%s vad_threshold=%d (active=%d)",
@@ -176,6 +179,10 @@ class MeetingServer:
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
                     now = time.monotonic()
+                    received_bytes += len(msg.data)
+                    if ack_enabled and (last_ack_ts == 0.0 or now - last_ack_ts >= 2.0):
+                        await ws.send_json({"type": "audio_ack", "bytes": received_bytes})
+                        last_ack_ts = now
                     peak = peak_amplitude(msg.data)
                     forward, close = gate.observe(peak, now)
                     # Track strict above-threshold loudness (independent of the gate's hangover) so a
@@ -257,6 +264,10 @@ class MeetingServer:
                             summary.avg_peak,
                         )
                 elif msg.type == WSMsgType.TEXT:
+                    if self._requests_audio_ack(msg.data):
+                        ack_enabled = True
+                        await ws.send_json({"type": "hello", "capabilities": ["audio_ack_v1"]})
+                        continue
                     # A marker is an explicit "pay attention here" — never drop it into a silence
                     # gap, and it ends dormancy (an explicit "a new meeting starts here").
                     if self._is_marker(msg.data):
@@ -303,6 +314,20 @@ class MeetingServer:
         try:
             return json.loads(raw).get("type") == "marker"
         except ValueError:
+            return False
+
+    @staticmethod
+    def _requests_audio_ack(raw: str) -> bool:
+        """Whether a client hello opts into the receipt-ack extension."""
+        try:
+            payload = json.loads(raw)
+            capabilities = payload.get("capabilities", [])
+            return (
+                payload.get("type") == "hello"
+                and isinstance(capabilities, list)
+                and "audio_ack_v1" in capabilities
+            )
+        except (ValueError, TypeError):
             return False
 
     # ── health ───────────────────────────────────────────────────────────────

@@ -37,6 +37,8 @@ phone capture.html ──wss(16k PCM)──▶ meeting_bridge (aiohttp) ──�
   the session finalizes after `MEETING_SILENCE_CLOSE_S` of silence — so one connection can span
   several sessions and **each meeting lands in its own transcript** (speaker labels reset across the
   gaps). A `{"type":"marker"}` text frame drops a bookmark (opening a session if none is active).
+  Clients may negotiate `audio_ack_v1`; the bridge then returns cumulative received-byte receipts
+  after the first PCM frame and about every two seconds. Clients that do not opt in are unchanged.
   `MEETING_VAD_THRESHOLD=0` (default) disables gating → one session for the whole connection.
 - **`GET /health`** — unauthenticated liveness only (`{alive, ts}`); **`GET /health/<token>`**
   returns full operational metrics (session/frame counts incl. `frames_gated`) behind the token.
