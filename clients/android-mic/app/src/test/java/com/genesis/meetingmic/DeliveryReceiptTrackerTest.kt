@@ -38,19 +38,4 @@ class DeliveryReceiptTrackerTest {
         assertEquals(6_400, tracker.confirmedBytes)
         assertEquals(DeliveryReceiptStatus.HEALTHY, tracker.status(11_999))
     }
-
-    @Test fun `stopped run cannot apply a delayed callback`() {
-        val generations = CaptureRunGeneration()
-        val stopped = generations.begin()
-        generations.invalidate()
-        assertEquals(false, generations.isCurrent(stopped))
-    }
-
-    @Test fun `restarted run rejects callbacks from the prior run`() {
-        val generations = CaptureRunGeneration()
-        val old = generations.begin()
-        val replacement = generations.begin()
-        assertEquals(false, generations.isCurrent(old))
-        assertEquals(true, generations.isCurrent(replacement))
-    }
 }

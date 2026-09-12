@@ -1,7 +1,5 @@
 package com.genesis.meetingmic
 
-import java.util.concurrent.atomic.AtomicLong
-
 enum class DeliveryReceiptStatus { WAITING, HEALTHY, UNCONFIRMED, STALE }
 
 /** Pure receipt-progress state. Socket-open and local enqueue are deliberately not success. */
@@ -11,6 +9,13 @@ class DeliveryReceiptTracker(private val timeoutMs: Long) {
     private var openedAtMs: Long = 0
     private var lastAckAtMs: Long = 0
     private var ackSupported = false
+
+    fun reset() {
+        openedAtMs = 0
+        lastAckAtMs = 0
+        confirmedBytes = 0
+        ackSupported = false
+    }
 
     fun onSocketOpened(nowMs: Long) {
         openedAtMs = nowMs
@@ -37,12 +42,4 @@ class DeliveryReceiptTracker(private val timeoutMs: Long) {
             DeliveryReceiptStatus.UNCONFIRMED
         else -> DeliveryReceiptStatus.WAITING
     }
-}
-
-/** Identifies one capture run so delayed callbacks cannot mutate a later run. */
-class CaptureRunGeneration {
-    private val value = AtomicLong(0)
-    fun begin(): Long = value.incrementAndGet()
-    fun invalidate() { value.incrementAndGet() }
-    fun isCurrent(token: Long): Boolean = value.get() == token
 }

@@ -107,6 +107,7 @@ clients/android-mic/
     AndroidManifest.xml                     # mic FGS type + permissions
     java/com/genesis/meetingmic/
       MainActivity.kt                       # config, Start/Stop, status, battery-exemption prompt
+      CaptureDeliveryController.kt          # run/attempt/receipt/alert transition owner
       DeliveryReceiptTracker.kt             # pure receipt-progress state machine
       MicStreamService.kt                   # foreground mic service: AudioRecord -> OkHttp WS
     res/…                                   # layout, strings, adaptive icon
