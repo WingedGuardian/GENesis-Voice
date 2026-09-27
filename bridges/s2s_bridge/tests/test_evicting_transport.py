@@ -122,3 +122,45 @@ def test_a_half_open_connection_is_replaced_quickly():
     took, state = asyncio.run(_replace_half_open())
     assert state == "OPEN"
     assert took < 3.0, f"new client took {took:.1f}s to be served"
+
+
+async def _replace_with_slow_teardown():
+    """The old handler's teardown clears the OUTPUT socket (set_client_connection(None))
+    in its own task, after its receive loop ends, with no tie to old.close()
+    returning. Delay that clear, and the new client must still own the output."""
+    port = _free_port()
+    transport = WebSocketHandler(host="127.0.0.1", port=port).create_transport()
+    output = transport.output()
+    real_set = output.set_client_connection
+
+    async def slow_set(ws):
+        if ws is None:
+            await asyncio.sleep(0.5)  # a slow teardown on the evicted connection
+        await real_set(ws)
+
+    output.set_client_connection = slow_set
+    task = PipelineTask(
+        Pipeline([transport.input(), output]), idle_timeout_secs=None, cancel_on_idle_timeout=False,
+    )
+    run = asyncio.create_task(PipelineRunner(handle_sigint=False).run(task))
+    try:
+        await asyncio.sleep(1.0)
+        first = await websockets.connect(f"ws://127.0.0.1:{port}/")
+        await asyncio.sleep(0.5)
+        second = await websockets.connect(f"ws://127.0.0.1:{port}/")
+        await asyncio.sleep(1.5)  # past the slow teardown
+        return output._websocket, transport.input()._websocket, second.state.name, first.state.name
+    finally:
+        await task.cancel()
+        try:
+            await asyncio.wait_for(run, 5)
+        except Exception:
+            pass
+
+
+def test_the_evicted_handlers_teardown_cannot_clear_the_new_client():
+    out_ws, in_ws, second, first = asyncio.run(_replace_with_slow_teardown())
+    assert first == "CLOSED"
+    assert second == "OPEN"
+    assert in_ws is not None
+    assert out_ws is in_ws, "the old teardown cleared the reconnected device's output socket"
