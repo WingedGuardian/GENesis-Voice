@@ -19,6 +19,8 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.transports.websocket.server import WebsocketServerParams, WebsocketServerTransport
 
+from app.evicting_transport import EvictingWebsocketServerTransport
+
 from app.audio_recording_service import AudioRecordingService
 from app.interrupt_relay import InterruptRelay
 from app.noise_gate import NoiseGate
@@ -36,7 +38,7 @@ def _disable_ws_pings() -> None:
     the connection with a ``1002 (protocol error) invalid opcode`` and no clean close,
     which kills the conversation (observed live: a long session died this way ~60s in; the
     sibling ambient bridge documents and disables the same on the same device). pipecat
-    1.3.0's ``WebsocketServerParams`` exposes no ping control and calls
+    1.3.0's (and 1.12.0's) ``WebsocketServerParams`` exposes no ping control and calls
     ``websocket_serve(handler, host, port)`` (transports/websocket/server.py) with the
     ``websockets`` default ``ping_interval=20``, so we wrap that module-level callable to
     FORCE the pings off. The device fundamentally cannot handle pings, so this is a hard
@@ -183,7 +185,9 @@ class WebSocketHandler:
 
         # Create WebsocketServerTransport with WebsocketServerParams
         # The transport will start its own server automatically
-        self.transport = WebsocketServerTransport(
+        # Evicting variant: a reconnect replaces a stale (half-open) socket instead of
+        # being refused, as pipecat did before 1.4.0. See app/evicting_transport.py.
+        self.transport = EvictingWebsocketServerTransport(
             host=self.host,
             port=self.port,
             params=WebsocketServerParams(

@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
 # Runtime deps (kept in sync with deploy/install.sh). onnxruntime has real
 # glibc wheels here, so no stub is needed (unlike the old HA Alpine image).
 RUN pip install --no-cache-dir \
-    "pipecat-ai[openai,websocket]==1.3.0" openai "websockets>=13.0" \
+    "pipecat-ai[openai,websocket]==1.12.0" openai "websockets>=13.0" \
     "fastapi>=0.115.0" "uvicorn[standard]>=0.23.0" python-dotenv httpx \
     aiohttp aiofiles pydantic loguru numpy Pillow protobuf nltk Markdown \
     soxr pyloudnorm docstring_parser onnxruntime
