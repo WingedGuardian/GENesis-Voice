@@ -3,7 +3,7 @@
 The Voice PE's minimal WebSocket stack rejects server PING control frames — it closes
 the connection with a `1002 (protocol error) invalid opcode`, killing the conversation
 (observed live: a long session died this way; the sibling ambient bridge documents and
-disables the same on the same device). pipecat 1.3.0's WebsocketServerParams exposes no
+disables the same on the same device). pipecat 1.3.0's (and 1.12.0's) WebsocketServerParams exposes no
 ping control and calls `websocket_serve(handler, host, port)` with the websockets default
 `ping_interval=20`, so the bridge wraps that module-level callable to force pings OFF.
 These tests pin that behavior against pipecat's real module attribute.

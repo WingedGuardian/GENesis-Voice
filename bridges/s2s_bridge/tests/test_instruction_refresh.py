@@ -58,6 +58,19 @@ def test_refresh_updates_cache_and_live_service_settings():
     assert settings.system_instruction.startswith("FRESH")
 
 
+def test_refresh_survives_pipecat_recomposing_the_system_instruction():
+    """From pipecat 1.12 the service recomposes system_instruction from its
+    _base_system_instruction on start and on every context frame. A refresh that
+    left the base stale would silently revert to the old prompt one turn later."""
+    app = _app_with_service()
+    app.genesis_tool_service = _FakeToolService(prompt="FRESH: Today is Thursday, July 2, 2026")
+    asyncio.run(app._refresh_instructions())
+    svc = app.openai_service
+    if hasattr(svc, "_sync_registered_tool_handlers"):
+        svc._sync_registered_tool_handlers(None)  # what start() and context frames run
+    assert svc._settings.system_instruction.startswith("FRESH")
+
+
 def test_refresh_failure_keeps_cached_instructions():
     app = _app_with_service()
     app.genesis_tool_service = _FakeToolService(exc=RuntimeError("genesis down"))

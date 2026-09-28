@@ -26,7 +26,7 @@ install_s2s() {
   "$venv/bin/pip" install --upgrade pip
   # Matches the add-on's runtime set (see bridges/s2s_bridge/Dockerfile).
   "$venv/bin/pip" install \
-    "pipecat-ai[openai,websocket]==1.3.0" openai "websockets>=13.0" \
+    "pipecat-ai[openai,websocket]==1.12.0" openai "websockets>=13.0" \
     "fastapi>=0.115.0" "uvicorn[standard]>=0.23.0" python-dotenv httpx \
     aiohttp aiofiles pydantic loguru numpy Pillow protobuf nltk Markdown \
     soxr pyloudnorm docstring_parser onnxruntime

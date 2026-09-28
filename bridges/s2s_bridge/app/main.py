@@ -49,6 +49,10 @@ logging.getLogger("websockets").setLevel(logging.WARNING)
 _PROMPT_REFRESH_TIMEOUT_S = 3.0
 
 
+#: pipecat 1.3.0's default, which the bridge ran unpinned until now. See Application.s2s_model.
+DEFAULT_S2S_MODEL = "gpt-realtime-2"
+
+
 class Application:
     """Main application class using Pipecat."""
 
@@ -83,6 +87,14 @@ class Application:
         # OpenAI Realtime voice (preset). Configurable via the VOICE_S2S_VOICE
         # add-on option; default "ash". Re-read from env in initialize().
         self.s2s_voice: str = "ash"
+        # Realtime model, pinned HERE rather than inherited from pipecat's default,
+        # which moves between releases (1.3.0: gpt-realtime-2, 1.12.0:
+        # gpt-realtime-2.1). Override with S2S_MODEL. Re-read in initialize().
+        self.s2s_model: str = DEFAULT_S2S_MODEL
+
+    def _read_model_config(self) -> None:
+        """Read S2S_MODEL; blank or unset keeps the pinned default."""
+        self.s2s_model = os.environ.get("S2S_MODEL", "").strip() or DEFAULT_S2S_MODEL
 
     async def initialize(self) -> None:
         """Initialize all components."""
@@ -97,6 +109,7 @@ class Application:
 
         # OpenAI Realtime voice preset (configurable add-on option; default "ash")
         self.s2s_voice = os.environ.get("VOICE_S2S_VOICE", "ash")
+        self._read_model_config()
 
         # Session rotation interval (override for testing)
         self._rotation_interval = float(
@@ -241,7 +254,7 @@ class Application:
         froze it). The pipeline holds the OpenAI service object forever, so a fresh
         prompt must be pushed into the LIVE service's settings: ``_send_session_update``
         reads BOTH ``_settings.session_properties`` and ``_settings.system_instruction``
-        (pipecat 1.3.0), so both are updated. Any failure keeps the cached prompt —
+        (pipecat 1.3.0 through 1.12.0), so both are updated. Any failure keeps the cached prompt —
         session start must never block on Genesis.
         """
         if not self.genesis_tool_service:
@@ -270,12 +283,18 @@ class Application:
                 try:
                     svc._settings.session_properties.instructions = fresh
                     svc._settings.system_instruction = fresh
-                    # pipecat also tracks a _base_system_instruction for composing
-                    # addon instructions; left stale it would clobber the refresh if
-                    # an update-settings frame ever recomposes. None sent today —
-                    # this keeps the latent path consistent too.
+                    # pipecat recomposes system_instruction from _base_system_instruction
+                    # on start and on EVERY context frame (1.12; 1.3.0 only on an
+                    # update-settings frame). Left stale, the refresh would revert one
+                    # turn later — so this line is what keeps it. Pinned by
+                    # test_refresh_survives_pipecat_recomposing_the_system_instruction.
                     if hasattr(svc, "_base_system_instruction"):
                         svc._base_system_instruction = fresh
+                    else:
+                        logger.warning(
+                            "⚠️ pipecat has no _base_system_instruction (internals moved?) "
+                            "— the refreshed prompt may be reverted on the next turn"
+                        )
                     logger.info("📜 Genesis prompt refreshed (%d chars) — live session updated",
                                 len(fresh))
                 except AttributeError:
@@ -407,10 +426,14 @@ class Application:
             # Create new service instance
             self.openai_service = OpenAIRealtimeLLMService(
                 api_key=self.openai_api_key,
+                model=self.s2s_model,
                 session_properties=session_properties,
                 start_audio_paused=False
             )
-            logger.info(f"✅ OpenAI Service created: {type(self.openai_service).__name__}")
+            logger.info(
+                f"✅ OpenAI Service created: {type(self.openai_service).__name__} "
+                f"model={self.s2s_model}"
+            )
 
             # Register disconnect tool handler
             disconnect_tool_handler = create_disconnect_tool_handler(
