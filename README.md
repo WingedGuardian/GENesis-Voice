@@ -5,7 +5,7 @@ Genesis install ears and a spoken voice through a [Home Assistant Voice
 PE](https://www.home-assistant.io/voice-pe/) device — running entirely on hardware you
 control, with the cloud touched only for the conversational model you opt into.
 
-Three capabilities ship here, independent of each other:
+Four capabilities ship here, independent of each other:
 
 - **Conversational** (`bridges/s2s_bridge`): wake-word, full-duplex spoken conversation
   backed by OpenAI's Realtime speech-to-speech model. Production-ready.
@@ -18,6 +18,9 @@ Three capabilities ship here, independent of each other:
   of the Voice PE. Receives OMI's real-time transcript webhook and writes into the *same*
   isolated `ambient.db` (`source=omi-<uid>`). **Stage 1 — capture only**, never contacts
   Genesis. Two ambient devices, one substrate.
+- **Codex SSH voice** (`bridges/codex_voice`): an optional relay that keeps the
+  Linux Codex terminal while a Windows PC provides its microphone and speakers.
+  See [setup and diagnostics](bridges/codex_voice/README.md); no resident service.
 
 ## Topology — three boxes
 
@@ -66,6 +69,7 @@ secrets files — the code is generic.
 - `omi_bridge` — Stage 1 (capture only). Real-time transcript webhook → shared
   `ambient.db`. The attention engine and any graduation of signal into Genesis are future
   work; the same firehose-quarantine and graduation boundary apply.
+
 
 ## License
 

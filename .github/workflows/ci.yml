@@ -18,10 +18,15 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install ruff==0.15.8
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Ruff
         run: ruff check --config ruff.toml .
       - name: Syntax (compileall)
         run: python -m compileall -q bridges firmware
+      - name: Codex voice relay tests
+        run: python -m unittest discover -s bridges/codex_voice/tests -v
 
   shell:
     name: Shell scripts
