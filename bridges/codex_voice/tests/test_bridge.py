@@ -172,6 +172,27 @@ class Frames(unittest.IsolatedAsyncioTestCase):
             await bridge.exchange(process, {'type': 'hello'})
 
 
+class SocketSelection(unittest.TestCase):
+    def test_doctor_honors_codex_home_and_explicit_socket(self):
+        cases = [({}, Path('/example/home/.codex')),
+                 ({'CODEX_HOME': ''}, Path('/example/home/.codex')),
+                 ({'CODEX_HOME': '/example/custom codex home'}, Path('/example/custom codex home')),
+                 ({'CODEX_HOME': 'relative-codex-home'}, Path('relative-codex-home'))]
+        suffix = Path('app-server-control/app-server-control.sock')
+        for environment, home in cases:
+            with self.subTest(environment=environment):
+                with patch.dict(bridge.os.environ, {'HOME': '/example/home', **environment}, clear=True):
+                    with patch.object(bridge.sys, 'argv', ['bridge.py', 'doctor', '--audio']):
+                        with patch.object(bridge, 'doctor', new_callable=AsyncMock) as check:
+                            self.assertEqual(bridge.main(), 0)
+                        self.assertEqual(check.call_args.args[0].socket, home / suffix)
+        with patch.dict(bridge.os.environ, {'CODEX_HOME': '/example/custom-home'}):
+            with patch.object(bridge.sys, 'argv', ['bridge.py', 'doctor', '--audio', '--socket', '/example/explicit.sock']):
+                with patch.object(bridge, 'doctor', new_callable=AsyncMock) as check:
+                    self.assertEqual(bridge.main(), 0)
+                self.assertEqual(check.call_args.args[0].socket, Path('/example/explicit.sock'))
+
+
 class Authentication(unittest.IsolatedAsyncioTestCase):
     def test_setup_uses_the_actual_scrubbed_helper_environment(self):
         with patch.dict(bridge.os.environ, {'HOME': '/example/home', 'SSH_AUTH_SOCK': '/example/agent',

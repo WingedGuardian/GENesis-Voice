@@ -324,7 +324,8 @@ def main():
             command.add_argument('--windows-package', help='Windows vendor root or npm @openai/codex directory')
         if name == 'doctor':
             command.add_argument('--audio', action='store_true', help='Negotiate live WebRTC and open devices muted')
-            command.add_argument('--socket', type=Path, default=Path.home() / '.codex/app-server-control/app-server-control.sock')
+            codex_home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
+            command.add_argument('--socket', type=Path, default=codex_home / 'app-server-control/app-server-control.sock')
     args = parser.parse_args()
     try:
         if args.action == 'install':

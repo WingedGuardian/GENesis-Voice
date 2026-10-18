@@ -63,7 +63,8 @@ create an ephemeral diagnostic thread, negotiate a real WebRTC voice session,
 open both Windows devices muted/suppressed, poll them for ten seconds, and stop.
 This uses the voice provider and may count toward your account's usage. It
 doesn't speak or transmit microphone audio, and doesn't print SDP or transcripts.
-The daemon must be running (`codex app-server daemon start`); `--socket` can select
+The daemon must be running (`codex app-server daemon start`); the default socket
+follows `CODEX_HOME` (or `~/.codex` when unset/empty). `--socket` can select
 another local app-server Unix socket. A final spoken F8 test verifies perception
 and playback. Enumeration alone is deliberately not called an audio success.
 
