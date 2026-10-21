@@ -61,6 +61,7 @@ class LocalRecorder(
         private const val ENCODER_RETRY_MS = 30_000L
         private const val ENCODER_MAX_FAILURES = 3
         private const val WAKE_LEASE_MS = 60_000L
+        private const val PREVIOUS_WRITER_WAIT_MS = 10_000L
         private const val MIME = MediaFormat.MIMETYPE_AUDIO_AAC
 
         /** Segments a writer currently has open; retention never touches them. */
@@ -68,6 +69,13 @@ class LocalRecorder(
 
         /** True while a writer still has the segment with this base name open. */
         fun isOpen(base: String): Boolean = base in openBases
+
+        /**
+         * The most recently started writer in this process, whichever service instance started it: a
+         * Stop ends the service, so the next Start has a new recorder but must still wait for the old
+         * writer to release its encoder.
+         */
+        private val lastWriter = java.util.concurrent.atomic.AtomicReference<Thread?>(null)
 
         fun dir(context: Context): File =
             (context.getExternalFilesDir("recordings") ?: File(context.filesDir, "recordings"))
@@ -99,14 +107,18 @@ class LocalRecorder(
                 .filter { it.startUtcMs <= nowUtcMs + RetentionPolicy.DAY_MS }
             val doomed = RetentionPolicy.toDelete(segments, nowUtcMs, low)
             var expiredUnsynced = 0
+            var removed = 0
             SegmentSync.folderLock.lock()
             try {
                 for (s in doomed) {
                     val f = files.getValue(s.id)
                     if (!f.exists()) continue  // renamed by sync since the listing; judged next time
+                    // The sidecar goes only once the audio is really gone: a recording that survives a
+                    // failed delete keeps its timing.
+                    if (!f.delete() && f.exists()) continue
                     if (!SegmentSync.isSynced(f)) expiredUnsynced += 1
-                    f.delete()
                     File(d, SegmentSync.baseOf(f) + ".json").delete()
+                    removed += 1
                 }
                 d.listFiles { f -> f.name.endsWith(".json") }.orEmpty()
                     .filter { it.nameWithoutExtension !in openBases }
@@ -121,7 +133,7 @@ class LocalRecorder(
             }
             // Never silent: a recording that expired before reaching the edge is reported.
             SegmentSync.noteExpiredUnsynced(context, expiredUnsynced)
-            return doomed.size
+            return removed
         }
 
         /** One line describing what is stored on this phone, read straight from the folder. */
@@ -152,20 +164,34 @@ class LocalRecorder(
 
     @Volatile private var writer: Writer? = null
 
-    /** Starts a writer for capture run [runId]; a previous writer finishes on its own thread. */
+    /**
+     * Starts a writer for capture run [runId]. A previous writer finishes on its own thread, and the
+     * new one opens no encoder until the old one has released its own (some phones have only one).
+     */
+    @Synchronized
     fun start(runId: Long, generation: Long, runUuid: String) {
         writer?.finish()
-        writer = Writer(runId, generation, runUuid).also { it.start() }
+        val w = Writer(runId, generation, runUuid)
+        w.previous = lastWriter.getAndSet(w)
+        writer = w
+        w.start()
     }
 
-    /** Non-blocking hand-off from the capture loop; drops (and records) the frame if the queue is full. */
-    fun offer(buf: ByteArray, n: Int) {
-        writer?.offer(buf, n)
+    /** Non-blocking hand-off from run [runId]'s capture loop; drops (and records) the frame if the queue is full. */
+    fun offer(runId: Long, buf: ByteArray, n: Int) {
+        writer?.takeIf { it.runId == runId }?.offer(buf, n)
     }
 
-    /** Non-blocking: the writer drains what it has, closes its segment, and exits. */
-    fun stop() {
-        writer?.finish()
+    /**
+     * Non-blocking: run [runId]'s writer drains what it has, closes its segment, and exits. Called by
+     * the capture loop once it can offer nothing more, so the last frame read before Stop is kept;
+     * a later run's writer is never touched.
+     */
+    @Synchronized
+    fun stop(runId: Long) {
+        val w = writer ?: return
+        if (w.runId != runId) return
+        w.finish()
         writer = null
     }
 
@@ -179,12 +205,14 @@ class LocalRecorder(
      * after the next run started can never change the new run's status.
      */
     private inner class Writer(
-        private val runId: Long,
+        val runId: Long,
         private val generation: Long,
         // Globally unique per capture run: segment names must never repeat across app restarts
         // (the numeric runId restarts at 1 with the process), because the edge stores by name.
         private val runUuid: String,
     ) : Thread("local-recorder-$runId") {
+        /** The writer started before this one, possibly by another service instance; joined before any encoder opens. */
+        @Volatile var previous: Thread? = null
         private val queue = ArrayBlockingQueue<Frame>(QUEUE_FRAMES)
         private val stopFrame = Frame(ByteArray(0), 0, 0)
         @Volatile private var finishing = false
@@ -242,6 +270,10 @@ class LocalRecorder(
             }
             renewWake()
             try {
+                // The previous run's writer is draining at most ~15 s of queued audio; frames for this
+                // run wait in our own queue meanwhile.
+                previous?.join(PREVIOUS_WRITER_WAIT_MS)
+                previous = null
                 try { purge(context) } catch (e: Exception) { Log.w(TAG, "retention purge failed", e) }
                 checkStorage(force = true)
                 while (true) {
@@ -310,9 +342,16 @@ class LocalRecorder(
                 }
                 if (segmentSamples >= SEGMENT_SAMPLES) {
                     when (closeSegment()) {
-                        Closed.OK -> Unit
+                        Closed.OK -> encoderFailures = 0
                         Closed.IO -> throw IOException("segment was not saved to storage")
-                        Closed.ENCODER -> throw IllegalStateException("encoder did not finish the segment")
+                        // The finished file lost its tail (reported in its last-file check); the next
+                        // frame opens a fresh encoder, so keep recording unless this keeps happening.
+                        Closed.ENCODER -> {
+                            encoderFailures += 1
+                            if (encoderFailures >= ENCODER_MAX_FAILURES) {
+                                throw IllegalStateException("encoder keeps failing to finish segments")
+                            }
+                        }
                     }
                 }
             } catch (e: IOException) {
