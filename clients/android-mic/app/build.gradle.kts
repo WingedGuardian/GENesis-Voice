@@ -39,8 +39,8 @@ android {
         applicationId = "com.genesis.meetingmic"
         minSdk = 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "0.5.0"
+        versionCode = 6
+        versionName = "0.6.0"
 
         // Surfaced to Kotlin as BuildConfig.MEETING_WS_URL / MEETING_TOKEN.
         buildConfigField("String", "MEETING_WS_URL", "\"$meetingWsUrl\"")
@@ -80,6 +80,11 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // Persistent, reboot-surviving retry for mirroring recordings to the edge.
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
 
     testImplementation("junit:junit:4.13.2")
+    // Android's org.json is a stub on the JVM; the real one lets receipt parsing be unit-tested.
+    testImplementation("org.json:json:20240303")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 }

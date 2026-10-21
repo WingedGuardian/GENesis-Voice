@@ -100,6 +100,12 @@ class MainActivity : AppCompatActivity() {
         // Retention runs on every app open as well as at each capture start, so old recordings are
         // removed even between meetings.
         refreshStorageSummary(purgeFirst = true)
+        // An install upgraded with a backlog has never saved a sync endpoint: use the configured one.
+        if (!SegmentSync.hasEndpoint(applicationContext)) {
+            SegmentSync.saveEndpoint(applicationContext, b.wsUrl.text.toString(), b.token.text.toString())
+        }
+        SyncWorker.schedule(applicationContext)
+        SyncWorker.kick(applicationContext)
         // Every failure alert is a notification; without this permission they are all silent.
         val notifOff = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
@@ -183,11 +189,31 @@ class MainActivity : AppCompatActivity() {
 
     private var lastPhase: MicStreamService.Companion.Phase? = null
 
+    private fun syncLine(s: SegmentSync.Status): String {
+        val hours = s.oldestWaitingMs / 3_600_000
+        val parts = mutableListOf(
+            when {
+                s.waiting == 0 && s.synced == 0 -> "Synced to Genesis: nothing waiting"
+                s.waiting == 0 -> "Synced to Genesis: all recordings ✓"
+                else -> "Waiting to sync to Genesis: ${s.waiting} file(s), oldest ${hours}h"
+            },
+        )
+        if (s.synced > 0) parts += "${s.synced} confirmed on Genesis (phone copy kept 7 days, then re-checked)"
+        if (s.rejected > 0) parts += "⚠ ${s.rejected} refused by Genesis, kept on phone"
+        if (s.expiredUnsynced > 0) parts += "⚠ ${s.expiredUnsynced} expired before syncing"
+        if (s.waiting > 0 && hours >= 24) parts += "⚠ Check Tailscale, and set battery to Unrestricted"
+        return parts.joinToString("\n")
+    }
+
     private fun refreshStorageSummary(purgeFirst: Boolean) {
         val app = applicationContext
         Thread({
             if (purgeFirst) try { LocalRecorder.purge(app) } catch (_: Exception) {}
-            val text = try { LocalRecorder.summary(app) } catch (e: Exception) { "On this phone: could not read recordings" }
+            val text = try {
+                LocalRecorder.summary(app) + "\n" + syncLine(SegmentSync.status(app))
+            } catch (e: Exception) {
+                "On this phone: could not read recordings"
+            }
             runOnUiThread { b.storageSummary.text = text }
         }, "storage-summary").start()
     }
