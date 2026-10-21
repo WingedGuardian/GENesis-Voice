@@ -18,6 +18,7 @@ Numpy-free (pure ``struct``) so the server imports and unit-tests without numpy.
 from __future__ import annotations
 
 import struct
+from collections import deque
 from dataclasses import dataclass
 
 
@@ -46,23 +47,54 @@ class SessionGate:
     server owns the actual session object; this class owns only the speech/silence decision. After
     the server acts on ``close`` (finalizes + drops its session), it calls :meth:`reset` so a
     continuing silence doesn't keep signaling close and the next speech opens a fresh session.
+
+    Opening hysteresis (``open_speech_s > 0``): with no speech run in progress, a run starts only
+    once at least ``open_speech_s`` of above-threshold audio has arrived within ``open_window_s``.
+    A lone click or cough at the room's noise floor therefore never opens a billed session (each
+    such open finalized with zero words and left an empty transcript). The frames that build up to
+    the open are NOT forwarded by the gate, so the server keeps a pre-roll of recent audio and
+    flushes it into the new session; nothing at the start of a sentence is lost. Durations are in
+    seconds of audio (from each frame's byte length), not frame counts, because clients frame
+    differently. ``open_speech_s <= 0`` opens on the first above-threshold frame (legacy).
     """
 
-    def __init__(self, *, threshold: int, hangover_s: float, silence_close_s: float) -> None:
+    def __init__(
+        self,
+        *,
+        threshold: int,
+        hangover_s: float,
+        silence_close_s: float,
+        open_speech_s: float = 0.0,
+        open_window_s: float = 1.5,
+    ) -> None:
         self._threshold = threshold
         self._hangover_s = hangover_s
         self._silence_close_s = silence_close_s
+        self._open_speech_s = open_speech_s
+        self._open_window_s = open_window_s
         self._last_speech: float | None = None  # monotonic ts of the last above-threshold frame
+        # (ts, seconds) of above-threshold frames seen while no speech run is in progress
+        self._candidates: deque[tuple[float, float]] = deque()
 
     @property
     def enabled(self) -> bool:
         """False when gating is disabled (threshold <= 0) → legacy single-session relay."""
         return self._threshold > 0
 
-    def observe(self, peak: int, now: float) -> tuple[bool, bool]:
-        """Return ``(forward, close)`` for a frame with energy ``peak`` at monotonic time ``now``."""
+    def observe(self, peak: int, now: float, frame_s: float = 0.1) -> tuple[bool, bool]:
+        """Return ``(forward, close)`` for a frame with energy ``peak`` at monotonic time ``now``.
+
+        ``frame_s`` is the frame's audio duration, used only by the opening hysteresis.
+        """
         is_speech = self._threshold <= 0 or peak >= self._threshold
         if is_speech:
+            if self._last_speech is None and self._threshold > 0 and self._open_speech_s > 0:
+                self._candidates.append((now, frame_s))
+                while self._candidates and now - self._candidates[0][0] > self._open_window_s:
+                    self._candidates.popleft()
+                if sum(d for _, d in self._candidates) + 1e-9 < self._open_speech_s:
+                    return False, False  # not yet sustained speech; the server pre-rolls it
+                self._candidates.clear()
             self._last_speech = now
             return True, False
         # Below threshold (silence).
@@ -73,9 +105,40 @@ class SessionGate:
             return True, False  # hangover tail — keep forwarding so word-ends aren't clipped
         return False, silence >= self._silence_close_s
 
+    def mark_speech(self, now: float) -> None:
+        """Treat a speech run as in progress (a session was opened by something other than the
+        gate, e.g. a user marker), so the next speech frames are forwarded instead of being held
+        back by the opening hysteresis."""
+        self._last_speech = now
+        self._candidates.clear()
+
     def reset(self) -> None:
         """Clear speech state — call after the server finalizes a session on ``close``."""
         self._last_speech = None
+        self._candidates.clear()
+
+
+class PreRoll:
+    """Bounded buffer of the most recent un-forwarded audio, flushed into a session as it opens."""
+
+    def __init__(self, max_s: float) -> None:
+        self._max_s = max_s
+        self._frames: deque[tuple[bytes, float]] = deque()
+        self._total_s = 0.0
+
+    def push(self, frame: bytes, frame_s: float) -> None:
+        if self._max_s <= 0:
+            return
+        self._frames.append((frame, frame_s))
+        self._total_s += frame_s
+        while self._frames and self._total_s - self._frames[0][1] >= self._max_s:
+            self._total_s -= self._frames.popleft()[1]
+
+    def drain(self) -> list[bytes]:
+        frames = [f for f, _ in self._frames]
+        self._frames.clear()
+        self._total_s = 0.0
+        return frames
 
 
 @dataclass(frozen=True)

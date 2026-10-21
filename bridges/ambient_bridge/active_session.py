@@ -101,6 +101,12 @@ class ActiveSession:
     def turns(self) -> int:
         return len(self._acc.committed)
 
+    @property
+    def cloud_connected(self) -> bool:
+        """True while a live cloud session exists (False before start, after finalize, or when the
+        session could not open, e.g. a missing key). Read by the meeting bridge's asr_status."""
+        return self._client is not None and not self._finalized
+
     async def start(self) -> None:
         try:
             key = open(self._cfg.active_sm_key_path).read().strip()

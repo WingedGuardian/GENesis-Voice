@@ -8,7 +8,8 @@ connection drives a VAD-gated session lifecycle (dependency-injected — default
 connection can span several sessions — one transcript per meeting. ``MEETING_VAD_THRESHOLD=0``
 (default) disables gating → a single session spans the whole connection (the legacy behavior).
 
-Runs behind the Tailscale Funnel (the one authenticated public door); binds loopback by default.
+Binds loopback by default, behind a local reverse proxy (typically tailnet-only `tailscale serve`,
+or Tailscale Funnel where a deployment chooses a public door).
 No ``genesis.*`` imports. The cloud SDK is imported lazily by the default factory, so the server
 imports (and unit-tests) without speechmatics-rt installed.
 """
@@ -29,7 +30,8 @@ from aiohttp import WSMsgType, web
 
 from .config import MeetingConfig, load_config
 from .session import default_session_factory
-from .vad import GateStats, SessionGate, peak_amplitude
+from .asr_status import asr_state
+from .vad import GateStats, PreRoll, SessionGate, peak_amplitude
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,10 @@ _TOKEN_PLACEHOLDER = "__MEETING_TOKEN__"  # replaced per-request with the valida
 # Speechmatics operating points the client may pick per session via ?model=. Anything else
 # (absent, typo, hostile) falls back to the configured default — the model is never trusted raw.
 _ALLOWED_MODELS = ("standard", "enhanced")
+# Optional client-negotiated extensions, offered in a hello reply only when the client asks.
+SUPPORTED_CAPABILITIES = ("audio_ack_v1", "asr_status_v1")
+# A transcript this small with zero turns is the bare header; anything larger is never removed.
+EMPTY_TRANSCRIPT_MAX_BYTES = 512
 
 
 def tracked_task(coro, *, name: str) -> asyncio.Task:
@@ -66,6 +72,7 @@ class MeetingServer:
         self._frames = 0  # frames forwarded to a cloud session
         self._frames_gated = 0  # frames dropped as silence / not billed (incl. noise while dormant)
         self._sessions_idle_closed = 0  # sessions finalized on transcript-idle (post-meeting noise tail)
+        self._empty_removed = 0  # header-only transcripts removed after a session heard nothing
         self._bytes = 0
         self._last_frame_ts: float | None = None
         self._capture_html: str | None = None
@@ -143,8 +150,15 @@ class MeetingServer:
         # continuously; a future client-side VAD (which would go silent on the wire) would instead
         # need a timer to close an idle session.
         gate = SessionGate(
-            threshold=cfg.vad_threshold, hangover_s=cfg.vad_hangover_s, silence_close_s=cfg.silence_close_s
+            threshold=cfg.vad_threshold,
+            hangover_s=cfg.vad_hangover_s,
+            silence_close_s=cfg.silence_close_s,
+            open_speech_s=cfg.vad_open_speech_s,
+            open_window_s=cfg.vad_open_window_s,
         )
+        # Audio the gate held back while deciding whether speech is real; flushed into the session
+        # it opens so the first words are not lost to the opening hysteresis.
+        preroll = PreRoll(cfg.vad_open_window_s if gate.enabled and cfg.vad_open_speech_s > 0 else 0.0)
         stats = GateStats(self._cfg.vad_log_interval_s)
         session = None
         opened = 0  # cloud sessions opened on THIS connection (for the close log)
@@ -163,6 +177,11 @@ class MeetingServer:
         ack_enabled = False
         received_bytes = 0
         last_ack_ts = 0.0
+        asr_enabled = False
+        last_status_ts = 0.0
+        session_opened_ts = 0.0
+        last_speech_sent_ts = 0.0
+        end_reason = "stream ended"
         self._active += 1
         logger.info(
             "meeting connection opening: %s model=%s vad_threshold=%d (active=%d)",
@@ -183,8 +202,21 @@ class MeetingServer:
                     if ack_enabled and (last_ack_ts == 0.0 or now - last_ack_ts >= 2.0):
                         await ws.send_json({"type": "audio_ack", "bytes": received_bytes})
                         last_ack_ts = now
+                    if asr_enabled and (last_status_ts == 0.0 or now - last_status_ts >= 2.0):
+                        state = asr_state(
+                            session=session,
+                            session_opened_ts=session_opened_ts,
+                            dormant=dormant,
+                            last_loud_ts=last_loud_ts,
+                            last_speech_sent_ts=last_speech_sent_ts,
+                            now=now,
+                            stall_s=cfg.asr_stall_s,
+                        )
+                        await ws.send_json({"type": "asr_status", "state": state})
+                        last_status_ts = now
                     peak = peak_amplitude(msg.data)
-                    forward, close = gate.observe(peak, now)
+                    frame_s = len(msg.data) / (2 * 16000)
+                    forward, close = gate.observe(peak, now, frame_s)
                     # Track strict above-threshold loudness (independent of the gate's hangover) so a
                     # dormant connection can measure a genuinely quiet room and re-arm.
                     if gate.enabled and peak >= cfg.vad_threshold:
@@ -194,6 +226,7 @@ class MeetingServer:
                     # while continuing room noise does not.
                     if dormant and gate.enabled and now - last_loud_ts >= cfg.silence_close_s:
                         dormant = False
+                        gate.reset()  # noise heard while dormant must not count as a speech run
                         logger.info("meeting re-armed after %.0fs silence: %s", now - last_loud_ts, source)
                     # Transcript-idle close: stop billing when the ASR stops producing SPEECH EVIDENCE
                     # even though the room hasn't gone quiet (the energy gate can't tell noise from
@@ -212,10 +245,7 @@ class MeetingServer:
                         if (
                             act is not None or turns is not None
                         ) and now - last_evidence_ts >= cfg.transcript_idle_close_s:
-                            try:
-                                await session.finalize()
-                            except Exception:
-                                logger.warning("meeting session idle-finalize failed for %s", source, exc_info=True)
+                            await self._finalize(session, source, "idle-finalize")
                             session = None
                             gate.reset()
                             dormant = True
@@ -234,20 +264,26 @@ class MeetingServer:
                             opened += 1
                             last_turns = getattr(session, "turns", 0) or 0
                             last_evidence_ts = now
+                            session_opened_ts = now
+                            for held in preroll.drain():
+                                await session.send_audio(held)
                         await session.send_audio(msg.data)
+                        if gate.enabled and peak >= cfg.vad_threshold:
+                            last_speech_sent_ts = now
                         self._frames += 1
                         self._bytes += len(msg.data)
                         self._last_frame_ts = time.time()
                     else:
                         self._frames_gated += 1
+                        if session is None:
+                            preroll.push(msg.data, frame_s)
+                            if close:
+                                gate.reset()
                         if close and session is not None:
-                            # Mirror the teardown finalize's containment: a pluggable backend whose
-                            # finalize() can raise must not kill the connection (and session=None
-                            # below prevents a double-finalize in the finally block).
-                            try:
-                                await session.finalize()
-                            except Exception:
-                                logger.warning("meeting session silence-finalize failed for %s", source, exc_info=True)
+                            # Containment lives in _finalize: a pluggable backend whose finalize()
+                            # can raise must not kill the connection (and session=None below
+                            # prevents a double-finalize in the finally block).
+                            await self._finalize(session, source, "silence-finalize")
                             session = None
                             gate.reset()
                             logger.info("meeting cloud session CLOSE (silence): %s", source)
@@ -264,9 +300,11 @@ class MeetingServer:
                             summary.avg_peak,
                         )
                 elif msg.type == WSMsgType.TEXT:
-                    if self._requests_audio_ack(msg.data):
-                        ack_enabled = True
-                        await ws.send_json({"type": "hello", "capabilities": ["audio_ack_v1"]})
+                    caps = self._hello_capabilities(msg.data)
+                    if caps is not None:
+                        ack_enabled = "audio_ack_v1" in caps
+                        asr_enabled = "asr_status_v1" in caps
+                        await ws.send_json({"type": "hello", "capabilities": caps})
                         continue
                     # A marker is an explicit "pay attention here" — never drop it into a silence
                     # gap, and it ends dormancy (an explicit "a new meeting starts here").
@@ -277,19 +315,32 @@ class MeetingServer:
                             opened += 1
                             last_turns = getattr(session, "turns", 0) or 0
                             last_evidence_ts = time.monotonic()
+                            session_opened_ts = last_evidence_ts
+                            for held in preroll.drain():
+                                await session.send_audio(held)
+                            gate.mark_speech(last_evidence_ts)
                         session.add_marker()
                 elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
                     break
-        except Exception:
+        except Exception as exc:
+            end_reason = f"handler error: {type(exc).__name__}"
             logger.warning("meeting ws handler error for %s", source, exc_info=True)
         finally:
             if session is not None:
-                try:
-                    await session.finalize()
-                except Exception:
-                    logger.warning("meeting session finalize failed for %s", source, exc_info=True)
+                await self._finalize(session, source, "finalize")
             self._active -= 1
-            logger.info("meeting connection closed: %s (meetings=%d, active=%d)", source, opened, self._active)
+            # Why the connection ended. aiohttp's message loop ends quietly on a client close, so
+            # the code and any transport error (e.g. a missed heartbeat) are read off the socket.
+            # Mid-meeting splits are otherwise undiagnosable.
+            if end_reason == "stream ended":
+                end_reason = self._end_reason(ws)
+            logger.info(
+                "meeting connection closed: %s (meetings=%d, active=%d, reason=%s)",
+                source,
+                opened,
+                self._active,
+                end_reason,
+            )
             if not ws.closed:
                 await ws.close()
         return ws
@@ -317,24 +368,64 @@ class MeetingServer:
             return False
 
     @staticmethod
-    def _requests_audio_ack(raw: str) -> bool:
-        """Whether a client hello opts into the receipt-ack extension."""
+    def _hello_capabilities(raw: str) -> list[str] | None:
+        """For a client hello, the supported subset of the capabilities it asked for; else None.
+
+        The reply lists only what was requested, so an older client that asks for audio_ack_v1
+        alone gets exactly the reply it always got.
+        """
         try:
             payload = json.loads(raw)
-            capabilities = payload.get("capabilities", [])
-            return (
-                payload.get("type") == "hello"
-                and isinstance(capabilities, list)
-                and "audio_ack_v1" in capabilities
-            )
         except (ValueError, TypeError):
-            return False
+            return None
+        if not isinstance(payload, dict) or payload.get("type") != "hello":
+            return None
+        requested = payload.get("capabilities", [])
+        if not isinstance(requested, list):
+            return None
+        return [c for c in SUPPORTED_CAPABILITIES if c in requested]
+
+    @staticmethod
+    def _end_reason(ws: web.WebSocketResponse) -> str:
+        exc = ws.exception()
+        if exc is not None:
+            return f"transport error: {type(exc).__name__}"
+        code = ws.close_code
+        if code is None:
+            return "stream ended without a close frame"
+        if code == 1000:
+            return "client closed normally (code 1000)"
+        return f"closed (code {code})"
+
+    async def _finalize(self, session, source: str, what: str) -> None:
+        """Finalize a session with containment, then drop its transcript if it heard nothing.
+
+        A session that committed no turns (markers and system notes count as turns) and never saw
+        ASR activity leaves a header-only file that only clutters the transcript folder. The size
+        cap is a second guard so a file with real content is never removed. Contract for pluggable
+        session factories: ``session.path`` must be a file the session itself created.
+        """
+        try:
+            await session.finalize()
+        except Exception:
+            logger.warning("meeting session %s failed for %s", what, source, exc_info=True)
+            return
+        if getattr(session, "turns", None) != 0 or getattr(session, "last_activity", 0.0) is not None:
+            return
+        path = getattr(session, "path", None)
+        try:
+            if path and os.path.isfile(path) and os.path.getsize(path) <= EMPTY_TRANSCRIPT_MAX_BYTES:
+                os.remove(path)
+                self._empty_removed += 1
+                logger.info("meeting removed empty transcript (no speech recognized): %s", path)
+        except OSError:
+            logger.warning("meeting empty-transcript cleanup failed for %s", path, exc_info=True)
 
     # ── health ───────────────────────────────────────────────────────────────
     async def _handle_health(self, _request: web.Request) -> web.Response:
         # Unauthenticated liveness ONLY — deliberately minimal (no session counts, activity
-        # timestamps, or pid) because this route is reachable through the public Funnel. Full
-        # operational metrics require the token: GET /health/<token>.
+        # timestamps, or pid) because this route may be reachable through a public door (Funnel)
+        # on some deployments. Full operational metrics require the token: GET /health/<token>.
         return web.json_response({"alive": True, "ts": time.time()})
 
     async def _handle_health_full(self, request: web.Request) -> web.Response:
@@ -350,6 +441,7 @@ class MeetingServer:
             "active_sessions": self._active,
             "sessions_total": self._sessions_total,
             "sessions_idle_closed": self._sessions_idle_closed,
+            "empty_transcripts_removed": self._empty_removed,
             "frames": self._frames,
             "frames_gated": self._frames_gated,
             "bytes": self._bytes,

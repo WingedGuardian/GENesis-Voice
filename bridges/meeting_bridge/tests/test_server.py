@@ -26,6 +26,9 @@ def _cfg(tmp_path, **over):
         ingest_token=TOKEN,
         output_dir=str(tmp_path / "sessions"),
         health_path=str(tmp_path / "meeting_health.json"),
+        # Most tests drive the lifecycle with one-sample frames; pin the legacy open-on-first-loud-
+        # frame rule here. The opening hysteresis has its own tests with realistic 100 ms frames.
+        vad_open_speech_s=0.0,
     )
     base.update(over)
     return MeetingConfig(**base)
@@ -608,6 +611,239 @@ async def test_partial_activity_prevents_idle_close(tmp_path):
             await asyncio.wait_for(done.wait(), timeout=2)
         assert server._sessions_idle_closed == 1
         assert box["sessions"][0].finalized is True
+        assert len(box["sessions"]) == 1
+    finally:
+        server.close()
+
+
+# ── opening hysteresis + pre-roll (realistic 100 ms frames) ─────────────────
+FRAME_100MS = 3200  # bytes of 16 kHz PCM16
+
+
+def _frame(peak: int) -> bytes:
+    """A 100 ms frame whose peak sample is ``peak`` (the rest silence)."""
+    return struct.pack("<h", peak) + b"\x00" * (FRAME_100MS - 2)
+
+
+@pytest.mark.asyncio
+async def test_lone_spike_does_not_open_a_session(tmp_path):
+    cfg = _cfg(tmp_path, vad_threshold=500, vad_open_speech_s=0.3, vad_open_window_s=1.5)
+    server, box, _done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_bytes(_frame(700))  # one click just over threshold
+            for _ in range(20):
+                await ws.send_bytes(_frame(300))  # room noise below threshold
+            await ws.close()
+        await asyncio.sleep(0.05)
+        assert box["sessions"] == []
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_sustained_speech_opens_with_preroll(tmp_path):
+    cfg = _cfg(tmp_path, vad_threshold=500, vad_open_speech_s=0.3, vad_open_window_s=1.5)
+    server, box, _done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            quiet = _frame(100)
+            words = [_frame(4000), _frame(4100), _frame(4200)]
+            await ws.send_bytes(quiet)
+            for w in words:
+                await ws.send_bytes(w)
+            session = await _wait_for_session(box)
+            await ws.close()
+        await asyncio.sleep(0.05)
+        # The held-back quiet lead-in and the first two speech frames are pre-rolled, then the
+        # frame that confirmed speech: nothing before the open is lost.
+        assert session.frames == [quiet, *words]
+    finally:
+        server.close()
+
+
+# ── capability negotiation + asr_status ──────────────────────────────────────
+@pytest.mark.asyncio
+async def test_hello_reply_lists_only_requested_supported_capabilities(tmp_path):
+    cfg = _cfg(tmp_path)
+    server, _box, _done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_str(json.dumps({"type": "hello", "capabilities": ["asr_status_v1", "future_x"]}))
+            hello = await asyncio.wait_for(ws.receive_json(), timeout=2)
+            assert hello == {"type": "hello", "capabilities": ["asr_status_v1"]}
+            await ws.close()
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_asr_status_idle_when_quiet_and_no_session(tmp_path):
+    cfg = _cfg(tmp_path, vad_threshold=500)
+    server, _box, _done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_str(json.dumps({"type": "hello", "capabilities": ["audio_ack_v1", "asr_status_v1"]}))
+            await asyncio.wait_for(ws.receive_json(), timeout=2)  # hello
+            await ws.send_bytes(_frame(100))
+            got = [await asyncio.wait_for(ws.receive_json(), timeout=2) for _ in range(2)]
+            assert {"type": "asr_status", "state": "idle"} in got
+            assert any(m.get("type") == "audio_ack" for m in got)
+            await ws.close()
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_asr_status_error_when_session_has_no_cloud_connection(tmp_path):
+    cfg = _cfg(tmp_path)  # gate off: the first frame opens a session
+    box = {"sessions": []}
+    done = asyncio.Event()
+
+    def factory(_cfg, _source):
+        s = FakeSession(done)
+        s.cloud_connected = False
+        box["sessions"].append(s)
+        return s
+
+    server = MeetingServer(cfg, session_factory=factory)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_str(json.dumps({"type": "hello", "capabilities": ["asr_status_v1"]}))
+            await asyncio.wait_for(ws.receive_json(), timeout=2)
+            await ws.send_bytes(_frame(4000))  # opens the session (status sent before it opens)
+            first = await asyncio.wait_for(ws.receive_json(), timeout=2)
+            assert first == {"type": "asr_status", "state": "idle"}
+            await asyncio.sleep(2.05)
+            await ws.send_bytes(_frame(4000))
+            second = await asyncio.wait_for(ws.receive_json(), timeout=2)
+            assert second == {"type": "asr_status", "state": "error"}
+            await ws.close()
+    finally:
+        server.close()
+
+
+# ── empty-transcript cleanup + close reasons ─────────────────────────────────
+class _FileSession(FakeSession):
+    """A fake that writes a real transcript header, like ActiveSession does on start."""
+
+    def __init__(self, done, path, turns=0, activity=None):
+        super().__init__(done)
+        self.path = str(path)
+        self.turns = turns
+        self.last_activity = activity
+
+    async def start(self):
+        await super().start()
+        with open(self.path, "w") as fh:
+            fh.write("# Active listen header\n")
+
+
+async def _run_one_session(tmp_path, **session_kw):
+    cfg = _cfg(tmp_path)
+    path = tmp_path / "t.md"
+    done = asyncio.Event()
+    server = MeetingServer(cfg, session_factory=lambda _c, _s: _FileSession(done, path, **session_kw))
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_bytes(_frame(4000))
+            await ws.close()
+        await asyncio.wait_for(done.wait(), timeout=2)
+        await asyncio.sleep(0.05)
+    finally:
+        server.close()
+    return server, path
+
+
+@pytest.mark.asyncio
+async def test_session_that_heard_nothing_leaves_no_file(tmp_path):
+    server, path = await _run_one_session(tmp_path)
+    assert not path.exists()
+    assert server._health_payload()["empty_transcripts_removed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_session_with_turns_keeps_its_file(tmp_path):
+    _server, path = await _run_one_session(tmp_path, turns=1)
+    assert path.exists()
+
+
+@pytest.mark.asyncio
+async def test_session_with_asr_activity_keeps_its_file(tmp_path):
+    _server, path = await _run_one_session(tmp_path, activity=123.0)
+    assert path.exists()
+
+
+@pytest.mark.asyncio
+async def test_close_reason_is_logged(tmp_path, caplog):
+    cfg = _cfg(tmp_path)
+    server, _box, _done = _server_with_fake(cfg)
+    caplog.set_level("INFO", logger="meeting_bridge.server")
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_bytes(_frame(4000))
+            await ws.close(code=1000, message=b"client stop")
+        await asyncio.sleep(0.1)
+    finally:
+        server.close()
+    closed = [r.getMessage() for r in caplog.records if "connection closed" in r.getMessage()]
+    assert closed and "reason=client closed normally (code 1000)" in closed[-1]
+
+
+@pytest.mark.asyncio
+async def test_marker_open_then_speech_is_forwarded_without_hysteresis_loss(tmp_path):
+    cfg = _cfg(tmp_path, vad_threshold=500, vad_open_speech_s=0.3, vad_open_window_s=1.5)
+    server, box, _done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_str(json.dumps({"type": "marker"}))
+            session = await _wait_for_session(box)
+            first_words = [_frame(4000), _frame(4100)]
+            for w in first_words:
+                await ws.send_bytes(w)
+            await ws.close()
+        await asyncio.sleep(0.05)
+        assert session.frames == first_words
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_noise_during_dormancy_cannot_bypass_hysteresis_after_rearm(tmp_path):
+    cfg = _cfg(
+        tmp_path,
+        vad_threshold=500,
+        vad_open_speech_s=0.3,
+        vad_open_window_s=1.5,
+        transcript_idle_close_s=0.05,
+        silence_close_s=0.2,
+        vad_hangover_s=0.0,
+    )
+    server, box, _done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            for _ in range(3):  # sustained speech opens session 0 (ASR never hears words)
+                await ws.send_bytes(_frame(4000))
+            await _wait_for_session(box)
+            await asyncio.sleep(0.1)
+            await ws.send_bytes(_frame(4000))  # idle-close fires → dormant
+            for _ in range(3):  # noise at the threshold while dormant arms the gate's run
+                await ws.send_bytes(_frame(600))
+            await asyncio.sleep(0.25)
+            await ws.send_bytes(_frame(100))  # quiet long enough → close (no session) + re-arm
+            await ws.send_bytes(_frame(100))
+            await ws.send_bytes(_frame(700))  # one click after re-arm must NOT open a session
+            await ws.close()
+        await asyncio.sleep(0.05)
         assert len(box["sessions"]) == 1
     finally:
         server.close()
