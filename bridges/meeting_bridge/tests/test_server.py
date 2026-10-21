@@ -891,8 +891,9 @@ async def test_preroll_advances_the_session_clock_for_markers(tmp_path):
             session = await _wait_for_session(box)
             await ws.close()
         await asyncio.sleep(0.05)
-        # three held frames (quiet + two speech) were pre-rolled: 0.3 s of audio
-        assert abs(session.advanced - 0.3) < 1e-6
+        # three held frames (quiet + two speech) pre-rolled, plus the frame that opened the session,
+        # all sent in one burst: 0.4 s of audio ahead of the wall clock
+        assert abs(session.advanced - 0.4) < 1e-6
         assert server._health_payload()["frames"] == 4  # pre-roll counted as forwarded
     finally:
         server.close()

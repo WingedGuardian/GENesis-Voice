@@ -19,6 +19,12 @@
          which otherwise "sleep" the service mid-meeting despite the foreground notification. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
+    <!-- Package visibility for Tailscale (API 30+), so the app can check it is installed, ask it to
+         connect (its exported CONNECT_VPN receiver) and open it when it won't start on its own. -->
+    <queries>
+        <package android:name="com.tailscale.ipn" />
+    </queries>
+
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"

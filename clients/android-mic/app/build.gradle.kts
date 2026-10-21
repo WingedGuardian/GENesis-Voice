@@ -1,3 +1,6 @@
+import java.time.ZoneOffset
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 import java.util.Properties
 
 plugins {
@@ -25,6 +28,8 @@ fun cfg(key: String, env: String, default: String): String =
 // build time or entered in-app. Kept as a compile-time string so a fresh clone builds.
 val meetingWsUrl = cfg("meetingWsUrl", "MEETING_WS_URL", "wss://EDITME.example.ts.net/meeting/")
 val meetingToken = cfg("meetingToken", "MEETING_TOKEN", "")
+val buildTime: String = ZonedDateTime.now(ZoneOffset.UTC)
+    .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm 'UTC'"))
 
 android {
     namespace = "com.genesis.meetingmic"
@@ -34,12 +39,14 @@ android {
         applicationId = "com.genesis.meetingmic"
         minSdk = 26
         targetSdk = 34
-        versionCode = 3
-        versionName = "0.3.0"
+        versionCode = 4
+        versionName = "0.4.0"
 
         // Surfaced to Kotlin as BuildConfig.MEETING_WS_URL / MEETING_TOKEN.
         buildConfigField("String", "MEETING_WS_URL", "\"$meetingWsUrl\"")
         buildConfigField("String", "MEETING_TOKEN", "\"$meetingToken\"")
+        // Shown beside the version so two sideloaded builds are never mistaken for each other.
+        buildConfigField("String", "BUILD_TIME", "\"$buildTime\"")
     }
 
     buildFeatures {
