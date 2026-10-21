@@ -11,7 +11,9 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
+import android.media.AudioRecordingConfiguration
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Handler
@@ -72,6 +74,14 @@ class MicStreamService : LifecycleService() {
         private const val NOTIF_ID = 1
         private const val FAILURE_NOTIF_ID = 2
 
+        // Re-judges the mic on a clock, not only per frame, so a stalled capture loop cannot hold
+        // the Mic signal green.
+        private const val TICK_MS = 200L
+        private const val NOTIF_REFRESH_MS = 1_000L
+        // How long Tailscale gets to come up after our CONNECT_VPN request before we ask the user.
+        private const val VPN_ESCALATE_MS = 20_000L
+        private const val MIC_ALERT_CLEAR_MS = 3_000L
+
         // Persisted so a START_STICKY restart (OS kills the process mid-meeting, redelivers a null
         // intent) can resume with the same endpoint/model instead of erroring out. App-private storage.
         private const val PREFS = "capture_creds"
@@ -109,6 +119,9 @@ class MicStreamService : LifecycleService() {
             val detail: String = "",
             val bytesConfirmed: Long = 0,
             val startedAtMs: Long = 0,
+            val mic: MicReading = MicReading(MicSignal.GREY, "mic off", 0f),
+            /** Network-side problem we can name (e.g. Tailscale off); empty when none. */
+            val netNote: String = "",
         )
 
         private val _state = MutableStateFlow(CaptureState())
@@ -125,6 +138,26 @@ class MicStreamService : LifecycleService() {
     private var wakeLock: PowerManager.WakeLock? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    private val mic = MicLevelMonitor()
+    private val tailscale by lazy { TailscaleLink(this) }
+    private val alerts by lazy { ProblemAlerts(this, FAILURE_CHANNEL_ID) { createChannel() } }
+    private var micReading = MicReading(MicSignal.GREY, "mic off", 0f)
+    private var netNote = ""
+    private var vpnRequestedAtMs = -1L
+    private var vpnEscalated = false
+    private var honestyActive = false
+    private var micAlertShown = false
+    private var micGreenSinceMs = -1L
+    private var deliveryNotifText = "Starting…"
+    private var lastNotifText = ""
+    private var lastNotifAtMs = 0L
+    private val tick = object : Runnable {
+        override fun run() {
+            onTick()
+            mainHandler.postDelayed(this, TICK_MS)
+        }
+    }
+
     private val http: OkHttpClient by lazy {
         // No read timeout: a WebSocket is long-lived. The bridge sends heartbeat pings and OkHttp
         // auto-answers them at the protocol level, so the server detects a dead peer; our own
@@ -137,23 +170,31 @@ class MicStreamService : LifecycleService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
-        when (intent?.action) {
+        if (intent == null) {
+            // A START_STICKY restart after the OS killed us mid-capture. Android 14+ refuses to open
+            // a microphone foreground service from the background, so don't try: tell the user. The
+            // notification opens the app, which restarts capture from the foreground through its
+            // normal validated Start path. Creds are only present if the user never pressed Stop.
+            val p = getSharedPreferences(PREFS, MODE_PRIVATE)
+            if (!p.getString(KEY_TOKEN, "").isNullOrEmpty()) alerts.showResume()
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        when (intent.action) {
             ACTION_STOP -> { stopCapture("stopped"); return START_NOT_STICKY }
             ACTION_MARK -> { sendMarker(); return START_STICKY }
-            ACTION_START, null -> {
-                var base = intent?.getStringExtra(EXTRA_WS_URL).orEmpty()
-                var token = intent?.getStringExtra(EXTRA_TOKEN).orEmpty()
-                var model = intent?.getStringExtra(EXTRA_MODEL).orEmpty()
+            ACTION_START -> {
+                var base = intent.getStringExtra(EXTRA_WS_URL).orEmpty()
+                var token = intent.getStringExtra(EXTRA_TOKEN).orEmpty()
+                var model = intent.getStringExtra(EXTRA_MODEL).orEmpty()
                 if (base.isEmpty() || token.isEmpty()) {
-                    // Null/empty intent == a START_STICKY restart after an OS kill. Restore the last
-                    // creds so capture actually resumes instead of erroring out. (Whether Android
-                    // permits re-opening a mic FGS from this background restart is device-dependent;
-                    // if it's blocked, startCapture surfaces an error rather than failing silently.)
+                    // Defensive: a start with no extras reuses the last creds.
                     val p = getSharedPreferences(PREFS, MODE_PRIVATE)
                     base = p.getString(KEY_URL, "").orEmpty()
                     token = p.getString(KEY_TOKEN, "").orEmpty()
                     model = p.getString(KEY_MODEL, "").orEmpty()
                 }
+                alerts.clear(ProblemAlerts.RESUME)
                 startCapture(base, token, model)
             }
         }
@@ -192,6 +233,13 @@ class MicStreamService : LifecycleService() {
         acquireWakeLock()
         applyDeliveryEffects(started, runId)
         startedAtMs = System.currentTimeMillis()
+        deliveryNotifText = "Starting…"
+        mic.start(SystemClock.elapsedRealtime())
+        micGreenSinceMs = -1L
+        ensureVpn()
+        honestyActive = true
+        mainHandler.removeCallbacks(tick)
+        mainHandler.post(tick)
         publish(Phase.CONNECTING, "connecting")
 
         captureJob = lifecycleScope.launch(Dispatchers.IO) {
@@ -225,7 +273,9 @@ class MicStreamService : LifecycleService() {
             return
         }
 
+        var silenceWatch: AudioManager.AudioRecordingCallback? = null
         try {
+            silenceWatch = try { watchSilencing(recorder.audioSessionId) } catch (_: Exception) { null }
             recorder.startRecording()
             val buf = ByteArray(FRAME_BYTES)
             withContext(Dispatchers.Main.immediate) { openSocket(url, runId) }
@@ -238,6 +288,7 @@ class MicStreamService : LifecycleService() {
                     throw IllegalStateException("microphone capture failed ($n)")
                 }
                 if (n <= 0) { delay(20); continue }
+                mic.onFrame(MicLevelMonitor.peakOf(buf, n), SystemClock.elapsedRealtime())
                 // Safety auto-stop after the max continuous duration (routed to the main thread so the
                 // FGS teardown runs there; break out of this loop immediately).
                 if (startedAtMs > 0 && System.currentTimeMillis() - startedAtMs >= MAX_SESSION_MS) {
@@ -264,6 +315,7 @@ class MicStreamService : LifecycleService() {
         } catch (e: Exception) {
             reportCaptureFailure(runId, e.message ?: "capture error")
         } finally {
+            silenceWatch?.let { getSystemService(AudioManager::class.java)?.unregisterAudioRecordingCallback(it) }
             try { recorder.stop() } catch (_: Exception) {}
             recorder.release()
         }
@@ -425,8 +477,97 @@ class MicStreamService : LifecycleService() {
                     return@postDelayed
                 }
             }
+            ensureVpn()
             openSocket(url, runId)
         }, delayMs)
+    }
+
+    // ── mic + network honesty ────────────────────────────────────────────────
+    /**
+     * Android silences a capture (delivers zeros) for the mic privacy toggle and for concurrent-capture
+     * policy; API 29+ reports it per recording. Match our own entry by audio session id. Below API 29
+     * the all-zero check in [MicLevelMonitor] still catches it, just a few seconds later.
+     */
+    private fun watchSilencing(sessionId: Int): AudioManager.AudioRecordingCallback? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
+        val am = getSystemService(AudioManager::class.java) ?: return null
+        val cb = object : AudioManager.AudioRecordingCallback() {
+            override fun onRecordingConfigChanged(configs: List<AudioRecordingConfiguration>) {
+                val mine = configs.firstOrNull { it.clientAudioSessionId == sessionId }
+                mic.setSilenced(mine?.isClientSilenced == true)
+            }
+        }
+        am.registerAudioRecordingCallback(cb, mainHandler)
+        return cb
+    }
+
+    /** If no VPN is up, ask Tailscale to connect (once per outage); [onTick] escalates if it doesn't. */
+    private fun ensureVpn() {
+        if (tailscale.isVpnUp()) {
+            clearVpnNote()
+            return
+        }
+        if (vpnRequestedAtMs >= 0) return
+        if (!tailscale.isInstalled()) {
+            netNote = "No VPN is up and Tailscale isn't installed"
+            return
+        }
+        tailscale.requestConnect()
+        vpnRequestedAtMs = SystemClock.elapsedRealtime()
+        vpnEscalated = false
+        netNote = "Tailscale is off — starting it…"
+    }
+
+    private fun clearVpnNote() {
+        vpnRequestedAtMs = -1L
+        vpnEscalated = false
+        netNote = ""
+        alerts.clear(ProblemAlerts.TAILSCALE)
+    }
+
+    private fun onTick() {
+        val now = SystemClock.elapsedRealtime()
+        val previous = micReading.signal
+        micReading = mic.read(now)
+        if (micReading.signal == MicSignal.RED && previous != MicSignal.RED) {
+            micAlertShown = true
+            alerts.showMic(micReading.reason)
+        }
+        // Clear the loud alert only after the mic has been green for a while, so a flapping mic
+        // buzzes once per incident instead of on every flap.
+        micGreenSinceMs = if (micReading.signal == MicSignal.GREEN) {
+            if (micGreenSinceMs < 0) now else micGreenSinceMs
+        } else -1L
+        if (micAlertShown && micGreenSinceMs >= 0 && now - micGreenSinceMs >= MIC_ALERT_CLEAR_MS) {
+            micAlertShown = false
+            alerts.clear(ProblemAlerts.MIC)
+        }
+
+        // A network note is only shown while delivery is actually failing: confirmed delivery is the
+        // evidence that outranks any guess about the VPN.
+        if (_state.value.phase == Phase.LIVE) {
+            if (netNote.isNotEmpty()) clearVpnNote()
+        } else if (netNote.isNotEmpty() && tailscale.isVpnUp()) {
+            clearVpnNote()
+        } else if (vpnRequestedAtMs >= 0) {
+            if (!vpnEscalated && now - vpnRequestedAtMs >= VPN_ESCALATE_MS) {
+                vpnEscalated = true
+                netNote = "Tailscale didn't start — tap to open it"
+                tailscale.launchIntent()?.let { alerts.showTailscale(it) }
+            }
+        }
+        publish(_state.value.phase)
+        renderNotif(force = false)
+    }
+
+    private fun stopHonesty() {
+        honestyActive = false
+        mainHandler.removeCallbacks(tick)
+        mic.stop()
+        micReading = mic.read(SystemClock.elapsedRealtime())
+        clearVpnNote()
+        micAlertShown = false
+        alerts.clear(ProblemAlerts.MIC)
     }
 
     private fun supportsAudioAck(message: JSONObject): Boolean {
@@ -452,6 +593,9 @@ class MicStreamService : LifecycleService() {
             val socket = synchronized(ws) {
                 val update = delivery.captureFailed(runId) ?: return@post
                 activeUrl = null
+                // Retire the mic/network signals BEFORE rendering, so the notification can never
+                // pair a dead recorder with a stale green meter.
+                stopHonesty()
                 ws.getAndSet(null).also {
                     publish(Phase.ERROR, "audio capture failed; not reaching bridge ($reason)")
                     updateNotif("Audio capture failed")
@@ -477,6 +621,8 @@ class MicStreamService : LifecycleService() {
             }
         }
         socket?.close(1000, "client stop")
+        stopHonesty()
+        alerts.clear(ProblemAlerts.RESUME)
         releaseWakeLock()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -496,6 +642,7 @@ class MicStreamService : LifecycleService() {
             ws.getAndSet(null)
         }
         socket?.cancel()
+        stopHonesty()
         releaseWakeLock()
         super.onDestroy()
     }
@@ -516,7 +663,7 @@ class MicStreamService : LifecycleService() {
 
     private fun publish(phase: Phase, detail: String = _state.value.detail) {
         val confirmed = delivery.snapshot().confirmedBytes
-        _state.value = CaptureState(phase, detail, confirmed, startedAtMs)
+        _state.value = CaptureState(phase, detail, confirmed, startedAtMs, micReading, netNote)
     }
 
     private fun acquireWakeLock() {
@@ -544,9 +691,31 @@ class MicStreamService : LifecycleService() {
         }
     }
 
+    /** Records the delivery line; the notification itself always leads with the worst signal. */
     private fun updateNotif(text: String) {
+        deliveryNotifText = text
+        renderNotif(force = true)
+    }
+
+    private fun renderNotif(force: Boolean) {
+        val text = when {
+            !honestyActive -> deliveryNotifText
+            micReading.signal == MicSignal.RED -> "⚠ Mic: ${micReading.reason} · $deliveryNotifText"
+            netNote.isNotEmpty() -> "⚠ $netNote · $deliveryNotifText"
+            micReading.signal == MicSignal.GREEN -> "Mic ${meterBar(micReading.level)} · $deliveryNotifText"
+            else -> "Mic: ${micReading.reason} · $deliveryNotifText"
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (!force && (text == lastNotifText || now - lastNotifAtMs < NOTIF_REFRESH_MS)) return
+        lastNotifText = text
+        lastNotifAtMs = now
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(NOTIF_ID, buildNotif(text))
+    }
+
+    private fun meterBar(level: Float): String {
+        val filled = (level * 5).toInt().coerceIn(0, 5)
+        return "▮".repeat(filled) + "▯".repeat(5 - filled)
     }
 
     private fun liveNotifText(snapshot: CaptureDeliverySnapshot): String {
