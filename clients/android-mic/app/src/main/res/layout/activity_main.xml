@@ -82,13 +82,45 @@
                 android:text="@string/btn_stop" />
         </LinearLayout>
 
+        <!-- Mic: is the microphone actually hearing anything? Green only on fresh evidence. -->
+        <TextView
+            android:id="@+id/micStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:padding="4dp"
+            android:textSize="16sp"
+            android:text="@string/mic_off" />
+
+        <ProgressBar
+            android:id="@+id/micMeter"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="14dp"
+            android:layout_marginTop="4dp"
+            android:max="100"
+            android:progress="0" />
+
+        <!-- Delivery: did the bridge confirm the audio arrived? -->
         <TextView
             android:id="@+id/status"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="20dp"
+            android:layout_marginTop="12dp"
+            android:padding="4dp"
             android:textSize="16sp"
             android:text="@string/status_idle" />
+
+        <!-- Network: a named cause (e.g. Tailscale off) while delivery is failing. -->
+        <TextView
+            android:id="@+id/netStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:padding="4dp"
+            android:textSize="15sp"
+            android:background="#33D32F2F"
+            android:visibility="gone" />
 
         <TextView
             android:id="@+id/versionLabel"
@@ -98,6 +130,16 @@
             android:textSize="12sp"
             android:alpha="0.55"
             android:text="version" />
+
+        <TextView
+            android:id="@+id/notifBanner"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:padding="12dp"
+            android:background="#33D32F2F"
+            android:text="@string/notif_hint"
+            android:visibility="gone" />
 
         <TextView
             android:id="@+id/batteryBanner"
@@ -116,6 +158,27 @@
             android:layout_marginTop="8dp"
             android:text="@string/btn_battery"
             android:visibility="gone" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="28dp"
+            android:text="@string/setup_title"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="@string/setup_steps"
+            android:textSize="13.5sp" />
+
+        <Button
+            android:id="@+id/vpnSettingsBtn"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/btn_vpn_settings" />
 
     </LinearLayout>
 </ScrollView>
