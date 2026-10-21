@@ -95,4 +95,29 @@ class SegmentSyncTest {
             dir.deleteRecursively()
         }
     }
+
+    @Test
+    fun syncUsesOnlyAnEncryptedAddress() {
+        assertEquals("https://bridge.example.com/meeting/t0k", SegmentSync.httpBase("wss://bridge.example.com/meeting/", "t0k"))
+        assertEquals(null, SegmentSync.httpBase("ws://bridge.example.com/meeting/", "t0k"))
+        assertEquals(null, SegmentSync.httpBase("wss://bridge.example.com/meeting/", " "))
+    }
+
+    @Test
+    fun anInterruptedMigrationReunitesTheSidecarNextTime() {
+        val dir = createTempDir()
+        try {
+            val old = "seg_20261021T182322_r1_s0"
+            val fresh = SegmentSync.migratedBase(old)!!
+            // The audio was renamed, then the app stopped before the sidecar followed.
+            File(dir, "$fresh.synced.aac").writeBytes(byteArrayOf(1))
+            File(dir, "$old.json").writeText("{\"utc_start_ms\":1}")
+            SegmentSync.migrateLegacyNames(dir)
+            assertEquals(listOf("$fresh.json", "$fresh.synced.aac"), dir.list()!!.sorted())
+            assertEquals(fresh, SegmentSync.migratedBase(old))  // the same name every time
+            assertEquals(null, SegmentSync.migratedBase(fresh))  // a migrated name is never renamed again
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
 }

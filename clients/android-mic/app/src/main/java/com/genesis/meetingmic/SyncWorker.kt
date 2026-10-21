@@ -57,7 +57,9 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val text = "${s.waiting} recording file(s) have not reached Genesis for over a day. " +
-            "They are safe on this phone. Check Tailscale, and set battery use to Unrestricted."
+            "They are safe on this phone. " +
+            if (s.hasEndpoint) "Check Tailscale, and set battery use to Unrestricted."
+            else "No secure (wss://) bridge address is saved: open the app and start a capture with one."
         nm.notify(
             NOTIF_ID,
             NotificationCompat.Builder(context, CHANNEL)
@@ -92,6 +94,14 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
                 .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
                 .build()
             WorkManager.getInstance(context).enqueueUniqueWork(NOW, ExistingWorkPolicy.REPLACE, req)
+        }
+
+        /** Calls [onChange] whenever a sync job (the kick or the hourly one) changes state. */
+        fun observe(context: Context, owner: androidx.lifecycle.LifecycleOwner, onChange: () -> Unit) {
+            val wm = WorkManager.getInstance(context)
+            for (name in listOf(NOW, PERIODIC)) {
+                wm.getWorkInfosForUniqueWorkLiveData(name).observe(owner) { onChange() }
+            }
         }
 
         /** The hourly catch-up that survives restarts and reboots. Idempotent. */

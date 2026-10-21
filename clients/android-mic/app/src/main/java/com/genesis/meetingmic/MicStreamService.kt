@@ -71,7 +71,7 @@ class MicStreamService : LifecycleService() {
         const val EXTRA_MODEL = "model"     // "standard" | "enhanced" (fixed per session)
 
         private const val CHANNEL_ID = "capture"
-        private const val FAILURE_CHANNEL_ID = "capture_delivery_failure"
+        const val FAILURE_CHANNEL_ID = "capture_delivery_failure"
         private const val NOTIF_ID = 1
         private const val FAILURE_NOTIF_ID = 2
 
@@ -85,10 +85,10 @@ class MicStreamService : LifecycleService() {
 
         // Persisted so a START_STICKY restart (OS kills the process mid-meeting, redelivers a null
         // intent) can resume with the same endpoint/model instead of erroring out. App-private storage.
-        private const val PREFS = "capture_creds"
-        private const val KEY_URL = "ws_url"
-        private const val KEY_TOKEN = "token"
-        private const val KEY_MODEL = "model"
+        const val PREFS = "capture_creds"
+        const val KEY_URL = "ws_url"
+        const val KEY_TOKEN = "token"
+        const val KEY_MODEL = "model"
 
         // Runaway backstop: cap a single continuous capture so a forgotten/left-running stream can't
         // stream forever. Sized for a full workday of capture (out-of-house use, ~8 h + commute +
@@ -513,7 +513,7 @@ class MicStreamService : LifecycleService() {
 
     /** If no VPN is up, ask Tailscale to connect (once per outage); [onTick] escalates if it doesn't. */
     private fun ensureVpn() {
-        if (tailscale.isVpnUp()) {
+        if (tailscale.isTailnetUp()) {
             clearVpnNote()
             return
         }
@@ -565,7 +565,7 @@ class MicStreamService : LifecycleService() {
         // evidence that outranks any guess about the VPN.
         if (_state.value.phase == Phase.LIVE) {
             if (netNote.isNotEmpty()) clearVpnNote()
-        } else if (netNote.isNotEmpty() && tailscale.isVpnUp()) {
+        } else if (netNote.isNotEmpty() && tailscale.isTailnetUp()) {
             clearVpnNote()
         } else if (vpnRequestedAtMs >= 0) {
             if (!vpnEscalated && now - vpnRequestedAtMs >= VPN_ESCALATE_MS) {
@@ -632,6 +632,9 @@ class MicStreamService : LifecycleService() {
     private fun stopCapture(reason: String) {
         // Explicit stop → forget creds so a later sticky restart doesn't silently resume capture.
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().clear().apply()
+        // Retire the mic/network signals first, so the STOPPED state published below carries no
+        // stale warning (nothing publishes after it).
+        stopHonesty()
         val socket = synchronized(ws) {
             captureJob?.cancel()
             captureJob = null
@@ -643,7 +646,6 @@ class MicStreamService : LifecycleService() {
             }
         }
         socket?.close(1000, "client stop")
-        stopHonesty()
         alerts.clear(ProblemAlerts.RESUME)
         releaseWakeLock()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {

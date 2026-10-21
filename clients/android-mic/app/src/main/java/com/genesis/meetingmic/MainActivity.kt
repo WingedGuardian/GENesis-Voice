@@ -60,6 +60,8 @@ class MainActivity : AppCompatActivity() {
         b.token.setText(BuildConfig.MEETING_TOKEN)
         b.versionLabel.text =
             "v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) · built ${BuildConfig.BUILD_TIME}"
+        // A sync pass that finishes while this screen is open updates the sync line at once.
+        SyncWorker.observe(applicationContext, this) { refreshStorageSummary(purgeFirst = false) }
 
         // Restore the last model choice (default = Enhanced/on); persist on toggle.
         val prefs = getSharedPreferences("ui", MODE_PRIVATE)
@@ -91,6 +93,19 @@ class MainActivity : AppCompatActivity() {
         intent.removeExtra(EXTRA_RESUME)
         (getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager)
             .cancel(ProblemAlerts.RESUME)
+        // Resume with what was actually recording, not the build defaults a fresh activity shows.
+        val p = getSharedPreferences(MicStreamService.PREFS, MODE_PRIVATE)
+        val url = p.getString(MicStreamService.KEY_URL, "").orEmpty()
+        val token = p.getString(MicStreamService.KEY_TOKEN, "").orEmpty()
+        if (url.isNotEmpty() && token.isNotEmpty()) {
+            b.wsUrl.setText(url)
+            b.token.setText(token)
+            b.modelSwitch.isChecked = p.getString(MicStreamService.KEY_MODEL, "enhanced") != "standard"
+        } else {
+            // Nothing recorded to resume: never silently start with the build defaults instead.
+            b.status.text = getString(R.string.status_bad_config)
+            return
+        }
         requestThenStart()
     }
 
@@ -100,16 +115,30 @@ class MainActivity : AppCompatActivity() {
         // Retention runs on every app open as well as at each capture start, so old recordings are
         // removed even between meetings.
         refreshStorageSummary(purgeFirst = true)
-        // An install upgraded with a backlog has never saved a sync endpoint: use the configured one.
+        // An install upgraded with a backlog has never saved a sync endpoint: use the last capture's
+        // settings, else the configured ones.
         if (!SegmentSync.hasEndpoint(applicationContext)) {
-            SegmentSync.saveEndpoint(applicationContext, b.wsUrl.text.toString(), b.token.text.toString())
+            val p = getSharedPreferences(MicStreamService.PREFS, MODE_PRIVATE)
+            val candidates = listOf(
+                p.getString(MicStreamService.KEY_URL, "").orEmpty() to p.getString(MicStreamService.KEY_TOKEN, "").orEmpty(),
+                b.wsUrl.text.toString() to b.token.text.toString(),
+            )
+            candidates.firstOrNull { (url, token) -> SegmentSync.httpBase(url, token) != null }
+                ?.let { (url, token) -> SegmentSync.saveEndpoint(applicationContext, url, token) }
         }
         SyncWorker.schedule(applicationContext)
         SyncWorker.kick(applicationContext)
-        // Every failure alert is a notification; without this permission they are all silent.
-        val notifOff = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
-            android.content.pm.PackageManager.PERMISSION_GRANTED
+        // Every failure alert is a notification: warn if they are off in any way (the runtime
+        // permission, the app-level switch, or the failure channel muted).
+        val nm = getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
+        val channelMuted = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            nm.getNotificationChannel(MicStreamService.FAILURE_CHANNEL_ID)?.importance ==
+            android.app.NotificationManager.IMPORTANCE_NONE
+        val notifOff = !androidx.core.app.NotificationManagerCompat.from(this).areNotificationsEnabled() ||
+            channelMuted ||
+            (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED)
         b.notifBanner.visibility = if (notifOff) android.view.View.VISIBLE else android.view.View.GONE
     }
 
@@ -201,7 +230,8 @@ class MainActivity : AppCompatActivity() {
         if (s.synced > 0) parts += "${s.synced} confirmed on Genesis (phone copy kept 7 days, then re-checked)"
         if (s.rejected > 0) parts += "⚠ ${s.rejected} refused by Genesis, kept on phone"
         if (s.expiredUnsynced > 0) parts += "⚠ ${s.expiredUnsynced} expired before syncing"
-        if (s.waiting > 0 && hours >= 24) parts += "⚠ Check Tailscale, and set battery to Unrestricted"
+        if (s.waiting > 0 && !s.hasEndpoint) parts += "⚠ No secure (wss://) bridge address saved: files wait on this phone"
+        if (s.waiting > 0 && hours >= 24 && s.hasEndpoint) parts += "⚠ Check Tailscale, and set battery to Unrestricted"
         return parts.joinToString("\n")
     }
 
@@ -221,7 +251,9 @@ class MainActivity : AppCompatActivity() {
     private fun renderLocal(s: MicStreamService.Companion.CaptureState) {
         if (s.phase != lastPhase && s.phase == MicStreamService.Companion.Phase.STOPPED) {
             // The last file closes just after Stop: re-read the folder once it has.
+            // The writer can still be draining its queue: look again once it surely has.
             b.storageSummary.postDelayed({ refreshStorageSummary(purgeFirst = false) }, 2_000)
+            b.storageSummary.postDelayed({ refreshStorageSummary(purgeFirst = false) }, 20_000)
         }
         lastPhase = s.phase
         val mb = s.local.bytesWritten / (1024.0 * 1024.0)

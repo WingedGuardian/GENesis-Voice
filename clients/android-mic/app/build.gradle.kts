@@ -37,7 +37,9 @@ android {
 
     defaultConfig {
         applicationId = "com.genesis.meetingmic"
-        minSdk = 26
+        // 30: from Android 11 no other app can read this app's external files folder, where
+        // recordings live; on older releases an app with storage permission could.
+        minSdk = 30
         targetSdk = 34
         versionCode = 6
         versionName = "0.6.0"

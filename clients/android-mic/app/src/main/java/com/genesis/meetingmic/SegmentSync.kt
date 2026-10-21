@@ -53,6 +53,7 @@ object SegmentSync {
         val rejected: Int,
         val expiredUnsynced: Int,
         val lastSuccessUtcMs: Long,
+        val hasEndpoint: Boolean = true,
     )
 
     /** Small persisted counters/timestamps; SharedPreferences in the app, a map in tests. */
@@ -96,12 +97,16 @@ object SegmentSync {
             .connectTimeout(15, TimeUnit.SECONDS)
             .writeTimeout(60, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
+            // A redirect could point the recording at a plain http address: never follow one.
+            .followRedirects(false)
+            .followSslRedirects(false)
             .build()
     }
 
     /** Saved whenever an endpoint is known (and kept after Stop) so sync can always finish. */
     fun saveEndpoint(context: Context, wsBase: String, token: String) {
-        if (token.isBlank() || !(wsBase.startsWith("wss://") || wsBase.startsWith("ws://"))) return
+        // Only an encrypted address is kept: sync carries whole recordings and the token.
+        if (token.isBlank() || !wsBase.trim().startsWith("wss://")) return
         context.getSharedPreferences(CREDS, Context.MODE_PRIVATE).edit()
             .putString("ws_base", wsBase.trim()).putString("token", token.trim()).apply()
     }
@@ -113,17 +118,15 @@ object SegmentSync {
         return httpBase(p.getString("ws_base", "").orEmpty(), p.getString("token", "").orEmpty())
     }
 
-    /** `wss://host/meeting/` + token → `https://host/meeting/<token>`; null when unusable. */
+    /**
+     * `wss://host/meeting/` + token → `https://host/meeting/<token>`; null when unusable. A plain
+     * `ws://` address is unusable: recordings never leave the phone unencrypted, they wait instead.
+     */
     fun httpBase(wsBase: String, token: String): String? {
         val b = wsBase.trim()
         val t = token.trim()
-        if (t.isEmpty()) return null
-        val https = when {
-            b.startsWith("wss://") -> "https://" + b.removePrefix("wss://")
-            b.startsWith("ws://") -> "http://" + b.removePrefix("ws://")
-            else -> return null
-        }
-        return https.trimEnd('/') + "/" + t
+        if (t.isEmpty() || !b.startsWith("wss://")) return null
+        return ("https://" + b.removePrefix("wss://")).trimEnd('/') + "/" + t
     }
 
     private fun prefsState(context: Context): State {
@@ -229,20 +232,38 @@ object SegmentSync {
      * Files from builds before 0.6.0 were named with the process-local run counter, which repeats
      * after every app restart, so the edge (which stores by name) refuses them. Give each one a unique
      * id once, sidecar included; the audio bytes are untouched.
+     *
+     * The new name is derived from the old one, so a migration interrupted between the two renames
+     * is finished by the next call: a sidecar left under its old name follows its audio.
      */
     fun migrateLegacyNames(dir: File) {
         folderLock.withLock {
             for (f in dir.listFiles { x -> x.name.endsWith(".aac") }.orEmpty()) {
                 val base = baseOf(f)
-                val m = LEGACY.matchEntire(base) ?: continue
+                val fresh = migratedBase(base) ?: continue
                 if (LocalRecorder.isOpen(base)) continue
-                val fresh = "${m.groupValues[1]}_${UUID.randomUUID()}_${m.groupValues[2]}"
+                val target = File(dir, fresh + (if (isSynced(f)) ".synced.aac" else ".aac"))
+                if (target.exists()) continue  // never overwrite a recording
                 // Audio first: if that rename fails, nothing moved and the next pass tries again.
-                if (f.renameTo(File(dir, fresh + (if (isSynced(f)) ".synced.aac" else ".aac")))) {
+                if (f.renameTo(target)) {
                     File(dir, "$base.json").takeIf { it.exists() }?.renameTo(File(dir, "$fresh.json"))
                 }
             }
+            for (side in dir.listFiles { x -> x.name.endsWith(".json") }.orEmpty()) {
+                val fresh = migratedBase(side.nameWithoutExtension) ?: continue
+                if (File(dir, "$fresh.json").exists()) continue
+                if (File(dir, "$fresh.aac").exists() || File(dir, "$fresh.synced.aac").exists()) {
+                    side.renameTo(File(dir, "$fresh.json"))
+                }
+            }
         }
+    }
+
+    /** The unique name a legacy segment migrates to; null when [base] is not a legacy name. */
+    fun migratedBase(base: String): String? {
+        val m = LEGACY.matchEntire(base) ?: return null
+        val id = UUID.nameUUIDFromBytes("legacy-segment:$base".toByteArray())
+        return "${m.groupValues[1]}_${id}_${m.groupValues[2]}"
     }
 
     private fun upload(http: OkHttpClient, ep: String, dir: File, f: File, nowMs: Long): Outcome {
@@ -308,6 +329,7 @@ object SegmentSync {
             rejected = waitingFiles.count { state.getLong("rejected:" + it.name) > 0 },
             expiredUnsynced = state.getLong("expired_unsynced").toInt(),
             lastSuccessUtcMs = state.getLong("last_success"),
+            hasEndpoint = endpoint(context) != null,
         )
     }
 
