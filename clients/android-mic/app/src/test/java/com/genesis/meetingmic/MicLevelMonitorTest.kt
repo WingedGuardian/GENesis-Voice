@@ -197,4 +197,13 @@ class MicLevelMonitorTest {
         val after = m.read(100).level
         assertTrue(after < loud && after > MicLevelMonitor.levelFor(100))
     }
+
+    @Test
+    fun meterDropsToZeroOnceSoundIsNoLongerFresh() {
+        val m = MicLevelMonitor()
+        m.start(0)
+        m.onFrame(30_000, 0)
+        assertTrue(m.read(100).level > 0.5f)
+        assertEquals(0f, m.read(3_000).level)  // grey: no fresh frame
+    }
 }

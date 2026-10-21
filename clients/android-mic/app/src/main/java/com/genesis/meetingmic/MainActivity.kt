@@ -91,6 +91,19 @@ class MainActivity : AppCompatActivity() {
         intent.removeExtra(EXTRA_RESUME)
         (getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager)
             .cancel(ProblemAlerts.RESUME)
+        // Resume with what was actually recording, not the build defaults a fresh activity shows.
+        val p = getSharedPreferences(MicStreamService.PREFS, MODE_PRIVATE)
+        val url = p.getString(MicStreamService.KEY_URL, "").orEmpty()
+        val token = p.getString(MicStreamService.KEY_TOKEN, "").orEmpty()
+        if (url.isNotEmpty() && token.isNotEmpty()) {
+            b.wsUrl.setText(url)
+            b.token.setText(token)
+            b.modelSwitch.isChecked = p.getString(MicStreamService.KEY_MODEL, "enhanced") != "standard"
+        } else {
+            // Nothing recorded to resume: never silently start with the build defaults instead.
+            b.status.text = getString(R.string.status_bad_config)
+            return
+        }
         requestThenStart()
     }
 
@@ -100,10 +113,17 @@ class MainActivity : AppCompatActivity() {
         // Retention runs on every app open as well as at each capture start, so old recordings are
         // removed even between meetings.
         refreshStorageSummary(purgeFirst = true)
-        // Every failure alert is a notification; without this permission they are all silent.
-        val notifOff = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
-            android.content.pm.PackageManager.PERMISSION_GRANTED
+        // Every failure alert is a notification: warn if they are off in any way (the runtime
+        // permission, the app-level switch, or the failure channel muted).
+        val nm = getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
+        val channelMuted = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            nm.getNotificationChannel(MicStreamService.FAILURE_CHANNEL_ID)?.importance ==
+            android.app.NotificationManager.IMPORTANCE_NONE
+        val notifOff = !androidx.core.app.NotificationManagerCompat.from(this).areNotificationsEnabled() ||
+            channelMuted ||
+            (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED)
         b.notifBanner.visibility = if (notifOff) android.view.View.VISIBLE else android.view.View.GONE
     }
 
