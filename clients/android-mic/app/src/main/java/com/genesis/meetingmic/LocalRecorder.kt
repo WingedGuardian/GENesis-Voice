@@ -57,10 +57,18 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
         private const val ENCODER_RETRY_MS = 30_000L
         private const val ENCODER_MAX_FAILURES = 3
         private const val WAKE_LEASE_MS = 60_000L
+        private const val PREVIOUS_WRITER_WAIT_MS = 10_000L
         private const val MIME = MediaFormat.MIMETYPE_AUDIO_AAC
 
         /** Segments a writer currently has open; retention never touches them. */
         private val openBases: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap())
+
+        /**
+         * The most recently started writer in this process, whichever service instance started it: a
+         * Stop ends the service, so the next Start has a new recorder but must still wait for the old
+         * writer to release its encoder.
+         */
+        private val lastWriter = java.util.concurrent.atomic.AtomicReference<Thread?>(null)
 
         fun dir(context: Context): File =
             (context.getExternalFilesDir("recordings") ?: File(context.filesDir, "recordings"))
@@ -87,16 +95,22 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
                 .map { RetentionPolicy.Segment(it.nameWithoutExtension, segmentStartMs(it)) }
                 .filter { it.startUtcMs <= nowUtcMs + RetentionPolicy.DAY_MS }
             val doomed = RetentionPolicy.toDelete(segments, nowUtcMs, low)
+            var removed = 0
             for (s in doomed) {
-                File(d, "${s.id}.aac").delete()
-                File(d, "${s.id}.json").delete()
+                // The sidecar goes only once the audio is really gone: a recording that survives a
+                // failed delete keeps its timing.
+                val aac = File(d, "${s.id}.aac")
+                if (aac.delete() || !aac.exists()) {
+                    File(d, "${s.id}.json").delete()
+                    removed += 1
+                }
             }
             d.listFiles { f -> f.name.endsWith(".json") }.orEmpty()
                 .filter { it.nameWithoutExtension !in openBases }
                 .filter { !File(d, it.nameWithoutExtension + ".aac").exists() }
                 .filter { nowUtcMs - it.lastModified() > 60 * 60 * 1000L }
                 .forEach { it.delete() }
-            return doomed.size
+            return removed
         }
 
         /** One line describing what is stored on this phone, read straight from the folder. */
@@ -127,20 +141,34 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
 
     @Volatile private var writer: Writer? = null
 
-    /** Starts a writer for capture run [runId]; a previous writer finishes on its own thread. */
+    /**
+     * Starts a writer for capture run [runId]. A previous writer finishes on its own thread, and the
+     * new one opens no encoder until the old one has released its own (some phones have only one).
+     */
+    @Synchronized
     fun start(runId: Long, generation: Long) {
         writer?.finish()
-        writer = Writer(runId, generation).also { it.start() }
+        val w = Writer(runId, generation)
+        w.previous = lastWriter.getAndSet(w)
+        writer = w
+        w.start()
     }
 
-    /** Non-blocking hand-off from the capture loop; drops (and records) the frame if the queue is full. */
-    fun offer(buf: ByteArray, n: Int) {
-        writer?.offer(buf, n)
+    /** Non-blocking hand-off from run [runId]'s capture loop; drops (and records) the frame if the queue is full. */
+    fun offer(runId: Long, buf: ByteArray, n: Int) {
+        writer?.takeIf { it.runId == runId }?.offer(buf, n)
     }
 
-    /** Non-blocking: the writer drains what it has, closes its segment, and exits. */
-    fun stop() {
-        writer?.finish()
+    /**
+     * Non-blocking: run [runId]'s writer drains what it has, closes its segment, and exits. Called by
+     * the capture loop once it can offer nothing more, so the last frame read before Stop is kept;
+     * a later run's writer is never touched.
+     */
+    @Synchronized
+    fun stop(runId: Long) {
+        val w = writer ?: return
+        if (w.runId != runId) return
+        w.finish()
         writer = null
     }
 
@@ -153,8 +181,10 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
      * One capture run's writer. Every monitor call carries [generation], so a writer still draining
      * after the next run started can never change the new run's status.
      */
-    private inner class Writer(private val runId: Long, private val generation: Long) :
+    private inner class Writer(val runId: Long, private val generation: Long) :
         Thread("local-recorder-$runId") {
+        /** The writer started before this one, possibly by another service instance; joined before any encoder opens. */
+        @Volatile var previous: Thread? = null
         private val queue = ArrayBlockingQueue<Frame>(QUEUE_FRAMES)
         private val stopFrame = Frame(ByteArray(0), 0, 0)
         @Volatile private var finishing = false
@@ -212,6 +242,10 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
             }
             renewWake()
             try {
+                // The previous run's writer is draining at most ~15 s of queued audio; frames for this
+                // run wait in our own queue meanwhile.
+                previous?.join(PREVIOUS_WRITER_WAIT_MS)
+                previous = null
                 try { purge(context) } catch (e: Exception) { Log.w(TAG, "retention purge failed", e) }
                 checkStorage(force = true)
                 while (true) {
@@ -280,9 +314,16 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
                 }
                 if (segmentSamples >= SEGMENT_SAMPLES) {
                     when (closeSegment()) {
-                        Closed.OK -> Unit
+                        Closed.OK -> encoderFailures = 0
                         Closed.IO -> throw IOException("segment was not saved to storage")
-                        Closed.ENCODER -> throw IllegalStateException("encoder did not finish the segment")
+                        // The finished file lost its tail (reported in its last-file check); the next
+                        // frame opens a fresh encoder, so keep recording unless this keeps happening.
+                        Closed.ENCODER -> {
+                            encoderFailures += 1
+                            if (encoderFailures >= ENCODER_MAX_FAILURES) {
+                                throw IllegalStateException("encoder keeps failing to finish segments")
+                            }
+                        }
                     }
                 }
             } catch (e: IOException) {
@@ -310,7 +351,13 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
             val utc = capturedUtcMs  // when this audio was captured, not when it was encoded
             val stamp = SimpleDateFormat("yyyyMMdd'T'HHmmss", Locale.US)
                 .apply { timeZone = TimeZone.getTimeZone("UTC") }.format(Date(utc))
-            val base = "seg_${stamp}_r${runId}_s$runSamples"
+            var base = "seg_${stamp}_r${runId}_s$runSamples"
+            // Run ids restart with each service instance: never open over an existing recording.
+            var n = 1
+            while (File(d, "$base.aac").exists() || File(d, "$base.json").exists()) {
+                base = "seg_${stamp}_r${runId}_s${runSamples}_$n"
+                n += 1
+            }
             openBases.add(base)
             currentBase = base
             FileOutputStream(File(d, "$base.json")).use { side ->

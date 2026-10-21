@@ -250,6 +250,10 @@ class MicStreamService : LifecycleService() {
 
         captureJob = lifecycleScope.launch(Dispatchers.IO) {
             connectAndStream(url, runId)
+        }.also { job ->
+            // Runs once this run can offer no more frames (so the read in flight at Stop is kept), and
+            // also when the job is cancelled before it ever started (so the writer never leaks).
+            job.invokeOnCompletion { localRecorder.stop(runId) }
         }
     }
 
@@ -295,7 +299,7 @@ class MicStreamService : LifecycleService() {
                 }
                 if (n <= 0) { delay(20); continue }
                 mic.onFrame(MicLevelMonitor.peakOf(buf, n), SystemClock.elapsedRealtime())
-                localRecorder.offer(buf, n)
+                localRecorder.offer(runId, buf, n)
                 // Safety auto-stop after the max continuous duration (routed to the main thread so the
                 // FGS teardown runs there; break out of this loop immediately).
                 if (startedAtMs > 0 && System.currentTimeMillis() - startedAtMs >= MAX_SESSION_MS) {
@@ -580,7 +584,7 @@ class MicStreamService : LifecycleService() {
         mainHandler.removeCallbacks(tick)
         mic.stop()
         micReading = mic.read(SystemClock.elapsedRealtime())
-        localRecorder.stop()
+        // The local writer is finished by the capture loop itself as it exits (see startCapture).
         localMonitor.stop()
         localReading = localMonitor.read(SystemClock.elapsedRealtime())
         alerts.clear(ProblemAlerts.LOCAL)
