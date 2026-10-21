@@ -139,6 +139,19 @@ class MeetingConfig:
         default_factory=lambda: _env("MEETING_OUTPUT_DIR", os.path.expanduser("~/meeting-sessions"))
     )
 
+    # --- phone segment uploads (the phone's local copy, mirrored here) ---
+    # Empty = <output_dir>/phone. The phone deletes its copy only after this store proves it holds
+    # the exact bytes, so the store refuses uploads below a free-space floor instead of half-writing.
+    upload_dir: str = field(default_factory=lambda: _env("MEETING_UPLOAD_DIR", ""))
+    upload_max_bytes: int = field(default_factory=lambda: int(_env("MEETING_UPLOAD_MAX_BYTES", str(4 << 20))))
+    upload_min_free_bytes: int = field(
+        default_factory=lambda: int(_env("MEETING_UPLOAD_MIN_FREE_BYTES", str(2 << 30)))
+    )
+
+    @property
+    def upload_root(self) -> str:
+        return self.upload_dir or os.path.join(self.output_dir, "phone")
+
     # --- health / observability ---
     health_path: str = field(
         default_factory=lambda: _env("MEETING_HEALTH", os.path.expanduser("~/meeting_health.json"))

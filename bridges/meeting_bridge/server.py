@@ -30,6 +30,7 @@ from aiohttp import WSMsgType, web
 
 from .config import MeetingConfig, load_config
 from .session import default_session_factory
+from . import upload_store
 from .asr_status import asr_state
 from .vad import GateStats, PreRoll, SessionGate, peak_amplitude
 
@@ -44,6 +45,9 @@ _ALLOWED_MODELS = ("standard", "enhanced")
 SUPPORTED_CAPABILITIES = ("audio_ack_v1", "asr_status_v1")
 # A transcript this small with zero turns is the bare header; anything larger is never removed.
 EMPTY_TRANSCRIPT_MAX_BYTES = 512
+# Phone uploads: at most this many at once, and a body that stops arriving for this long is dropped.
+UPLOAD_CONCURRENCY = 4
+UPLOAD_READ_TIMEOUT_S = 30.0
 
 
 def tracked_task(coro, *, name: str) -> asyncio.Task:
@@ -73,6 +77,10 @@ class MeetingServer:
         self._frames_gated = 0  # frames dropped as silence / not billed (incl. noise while dormant)
         self._sessions_idle_closed = 0  # sessions finalized on transcript-idle (post-meeting noise tail)
         self._empty_removed = 0  # header-only transcripts removed after a session heard nothing
+        self._uploads_stored = 0  # phone segments newly stored (identical re-uploads not counted)
+        self._uploads_rejected = 0
+        self._upload_locks: dict[str, asyncio.Lock] = {}
+        self._upload_slots = asyncio.Semaphore(UPLOAD_CONCURRENCY)
         self._bytes = 0
         self._last_frame_ts: float | None = None
         self._capture_html: str | None = None
@@ -84,6 +92,8 @@ class MeetingServer:
             [
                 web.get("/capture/{token}", self._handle_capture),
                 web.get("/meeting/{token}", self._handle_ws),
+                web.post("/meeting/{token}/upload", self._handle_upload),
+                web.get("/meeting/{token}/have", self._handle_have),
                 web.get("/health", self._handle_health),
                 web.get("/health/{token}", self._handle_health_full),
             ]
@@ -421,6 +431,93 @@ class MeetingServer:
         except OSError:
             logger.warning("meeting empty-transcript cleanup failed for %s", path, exc_info=True)
 
+    # ── phone segment uploads ──────────────────────────────────────────────
+    def _upload_rejected(self, status: int, reason: str, name: str = "") -> web.Response:
+        self._uploads_rejected += 1
+        logger.warning("meeting upload rejected (%d): %s %s", status, reason, name)
+        return web.json_response({"status": "rejected", "reason": reason}, status=status)
+
+    async def _handle_upload(self, request: web.Request) -> web.Response:
+        """Store one phone segment; answer ``stored`` only once it is durably on disk and re-read.
+
+        Query: ``name`` (validated segment name), ``sha256`` (hex), ``bytes`` (length), optional
+        ``meta`` (the segment's sidecar JSON, <= 4 KB). Body: the raw ADTS bytes. The phone deletes
+        its copy only when the returned sha256 and length equal its own, so nothing here answers
+        ``stored`` on anything less than a re-read from disk. 4xx = this upload can never succeed
+        as sent; 5xx = try again later.
+        """
+        if not self._authenticate(request.match_info.get("token", "")):
+            return web.Response(status=403, text="forbidden")
+        q = request.query
+        name, sha = q.get("name", ""), q.get("sha256", "").lower()
+        try:
+            size = int(q.get("bytes", ""))
+        except ValueError:
+            return self._upload_rejected(400, "bad length")
+        if not upload_store.valid_name(name) or not upload_store.valid_sha(sha):
+            return self._upload_rejected(400, "bad name or sha256")
+        if size <= 0 or size > self._cfg.upload_max_bytes:
+            return self._upload_rejected(413, "length out of range", name)
+        sidecar = None
+        meta = q.get("meta")
+        if meta:
+            try:
+                sidecar = json.loads(meta) if len(meta) <= 4096 else None
+            except (ValueError, RecursionError):
+                sidecar = None
+            if not isinstance(sidecar, dict):
+                return self._upload_rejected(400, "bad sidecar", name)
+        root = self._cfg.upload_root
+        async with self._upload_slots:
+            # Body into memory (capped) with a per-read timeout, OUTSIDE any lock: a stalled client
+            # can never hold up a retry of the same file, and no disk I/O runs on the event loop.
+            body = bytearray()
+            try:
+                while True:
+                    chunk = await asyncio.wait_for(request.content.readany(), UPLOAD_READ_TIMEOUT_S)
+                    if not chunk:
+                        break
+                    body += chunk
+                    if len(body) > self._cfg.upload_max_bytes:
+                        return self._upload_rejected(413, "upload too large", name)
+            except (TimeoutError, asyncio.TimeoutError):
+                return self._upload_rejected(408, "upload stalled", name)
+            except ConnectionError:
+                return self._upload_rejected(400, "upload interrupted", name)
+            if await asyncio.to_thread(upload_store.free_bytes, root) < self._cfg.upload_min_free_bytes:
+                return self._upload_rejected(507, "edge storage below its free-space floor", name)
+            # One writer per NAME (the name is what a file is stored under).
+            lock = self._upload_locks.setdefault(name, asyncio.Lock())
+            try:
+                async with lock:
+                    stored = await asyncio.to_thread(
+                        upload_store.store, root, name, bytes(body), sha256=sha, size=size, sidecar=sidecar
+                    )
+            except upload_store.UploadError as exc:
+                return self._upload_rejected(exc.status, str(exc), name)
+            finally:
+                if not lock.locked() and self._upload_locks.get(name) is lock:
+                    self._upload_locks.pop(name, None)
+        if stored.created:
+            self._uploads_stored += 1
+        logger.info(
+            "meeting upload stored: %s (%d bytes, %s)", name, stored.size, "new" if stored.created else "already held"
+        )
+        return web.json_response(
+            {"status": "stored", "sha256": stored.sha256, "bytes": stored.size, "created": stored.created}
+        )
+
+    async def _handle_have(self, request: web.Request) -> web.Response:
+        """Does the edge still hold these exact bytes? Re-hashed from disk on every call."""
+        if not self._authenticate(request.match_info.get("token", "")):
+            return web.Response(status=403, text="forbidden")
+        name, sha = request.query.get("name", ""), request.query.get("sha256", "").lower()
+        if not upload_store.valid_name(name) or not upload_store.valid_sha(sha):
+            return web.json_response({"have": False, "reason": "bad name or sha256"}, status=400)
+        async with self._upload_slots:
+            have = await asyncio.to_thread(upload_store.verify, self._cfg.upload_root, name, sha)
+        return web.json_response({"have": have})
+
     # ── health ───────────────────────────────────────────────────────────────
     async def _handle_health(self, _request: web.Request) -> web.Response:
         # Unauthenticated liveness ONLY — deliberately minimal (no session counts, activity
@@ -442,6 +539,8 @@ class MeetingServer:
             "sessions_total": self._sessions_total,
             "sessions_idle_closed": self._sessions_idle_closed,
             "empty_transcripts_removed": self._empty_removed,
+            "uploads_stored": self._uploads_stored,
+            "uploads_rejected": self._uploads_rejected,
             "frames": self._frames,
             "frames_gated": self._frames_gated,
             "bytes": self._bytes,
@@ -466,6 +565,9 @@ class MeetingServer:
     # ── lifecycle ──────────────────────────────────────────────────────────
     async def serve(self) -> None:
         os.makedirs(self._cfg.output_dir, exist_ok=True)
+        swept = upload_store.sweep_temps(self._cfg.upload_root)
+        if swept:
+            logger.info("removed %d unfinished upload temp file(s) from a previous run", swept)
         # access_log=None: the secret token rides the URL PATH (a browser can't send auth headers),
         # so aiohttp's default access log would write the token to disk on every request.
         runner = web.AppRunner(self.build_app(), access_log=None)
