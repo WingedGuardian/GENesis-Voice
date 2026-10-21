@@ -512,3 +512,34 @@ def test_a_stale_proof_never_lets_one_recording_displace_another(tmp_path):
         _store(root, AUDIO)
     assert e.value.status == 409
     assert open(final, "rb").read() == other
+
+
+def test_every_newly_created_directory_is_persisted_in_its_parent(tmp_path, monkeypatch):
+    synced = []
+    real = upload_store._fsync_dir
+    monkeypatch.setattr(upload_store, "_fsync_dir", lambda p: (synced.append(os.path.abspath(p)), real(p)))
+    root = tmp_path / "out" / "phone"  # neither exists yet
+    upload_store.free_bytes(str(root))
+    _store(str(root), AUDIO)
+    day = os.path.dirname(upload_store.final_path(str(root), NAME))
+    for created in (tmp_path / "out", root, day):
+        assert os.path.dirname(os.path.abspath(created)) in synced
+
+
+@pytest.mark.parametrize("second", ["new_name", "identical_reupload"])
+def test_every_stored_answer_persists_the_whole_folder_chain(tmp_path, monkeypatch, second):
+    root = tmp_path / "out" / "phone"
+    _store(str(root), AUDIO)  # the folders now already exist
+    synced = []
+    real = upload_store._fsync_dir
+    monkeypatch.setattr(upload_store, "_fsync_dir", lambda p: (synced.append(os.path.abspath(p)), real(p)))
+    if second == "new_name":
+        name = NAME.replace("_s0", "_s1")
+        upload_store.store(
+            str(root), name, AUDIO, sha256=hashlib.sha256(AUDIO).hexdigest(), size=len(AUDIO), sidecar=None
+        )
+    else:
+        _store(str(root), AUDIO)
+    day = os.path.dirname(upload_store.final_path(str(root), NAME))
+    for d in (day, root, tmp_path / "out"):
+        assert os.path.abspath(d) in synced

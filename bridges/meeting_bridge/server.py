@@ -623,7 +623,7 @@ class MeetingServer:
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     async def serve(self) -> None:
-        os.makedirs(self._cfg.output_dir, exist_ok=True)
+        upload_store.makedirs_durable(self._cfg.output_dir)
         swept = upload_store.sweep_temps(self._cfg.upload_root)
         if swept:
             logger.info("removed %d unfinished upload temp file(s) from a previous run", swept)

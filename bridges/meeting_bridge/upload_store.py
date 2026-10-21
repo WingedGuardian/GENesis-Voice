@@ -128,8 +128,42 @@ def _write_durable(path: str, data: bytes) -> None:
         os.fsync(f.fileno())
 
 
+def makedirs_durable(path: str) -> None:
+    """Create ``path`` and any missing ancestors, persisting each new entry in its parent.
+
+    A directory entry is only as durable as its parent's metadata: without this, a power loss
+    after a receipt could drop a just-created directory together with every file in it.
+    """
+    missing = []
+    p = os.path.abspath(path)
+    while not os.path.isdir(p):
+        missing.append(p)
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    for d in reversed(missing):
+        try:
+            os.mkdir(d)
+        except FileExistsError:
+            pass
+        _fsync_dir(os.path.dirname(d))
+
+
+def _persist_chain(directory: str) -> None:
+    """Fsync the file's directory, the upload root and the root's parent, unconditionally.
+
+    Called right before every ``stored`` answer. A directory that already exists is not proof that
+    its entry is durable: another upload may have created it and not yet fsynced its parent, or a
+    crash may have landed between a mkdir and that fsync.
+    """
+    root = os.path.dirname(directory)
+    for d in (directory, root, os.path.dirname(root)):
+        _fsync_dir(d)
+
+
 def free_bytes(root: str) -> int:
-    os.makedirs(root, exist_ok=True)
+    makedirs_durable(root)
     return shutil.disk_usage(root).free
 
 
@@ -183,7 +217,7 @@ def _quarantine(final: str) -> None:
     """Move a damaged held file aside (never deleted) so the good bytes can take its name."""
     directory = os.path.dirname(final)
     damaged = os.path.join(directory, "damaged")
-    os.makedirs(damaged, exist_ok=True)
+    makedirs_durable(damaged)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     os.replace(final, os.path.join(damaged, f"{os.path.basename(final)}.{stamp}-{uuid.uuid4().hex[:8]}"))
     _fsync_dir(damaged)
@@ -218,11 +252,9 @@ def store(root: str, name: str, data: bytes, *, sha256: str, size: int, sidecar:
 
 def _store_checked(final: str, data: bytes, *, sha256: str, size: int, sidecar: dict | None) -> Stored:
     directory = os.path.dirname(final)
-    if not os.path.isdir(directory):
-        os.makedirs(directory, exist_ok=True)
-        # A new day directory is itself a directory entry: persist it in its parent too, or a power
-        # loss after the receipt could lose the whole directory with the file in it.
-        _fsync_dir(os.path.dirname(directory))
+    # A new day directory (and the upload root, on the first upload) is itself a directory entry:
+    # each is persisted in its parent, or a power loss after the receipt could lose it with the file.
+    makedirs_durable(directory)
     repairing = False
     if os.path.exists(final):
         held, held_size = file_sha256(final)
@@ -240,8 +272,8 @@ def _store_checked(final: str, data: bytes, *, sha256: str, size: int, sidecar: 
             if _read_proof(final) != (held, held_size):
                 _write_proof(final, held, held_size)
             # An earlier attempt may have linked this file and crashed before its directory fsync:
-            # make the entry durable before this answer lets the phone delete its copy.
-            _fsync_dir(directory)
+            # make the entry (and its folders) durable before this answer lets the phone delete.
+            _persist_chain(directory)
             return Stored(sha256=held, size=held_size, created=False)
 
     side = _sidecar_path(final)
@@ -270,7 +302,7 @@ def _store_checked(final: str, data: bytes, *, sha256: str, size: int, sidecar: 
             held, held_size = file_sha256(final)
             if held != sha256 or held_size != size:
                 raise UploadError(409, "a different file already holds this name") from None
-            _fsync_dir(directory)
+            _persist_chain(directory)
             proven = True
             return Stored(sha256=held, size=held_size, created=False)
         linked = True
@@ -281,6 +313,7 @@ def _store_checked(final: str, data: bytes, *, sha256: str, size: int, sidecar: 
         linked = False  # proven: keep it
         proven = True
         _write_proof(final, held, held_size)
+        _persist_chain(directory)
         return Stored(sha256=held, size=held_size, created=True)
     finally:
         if os.path.exists(temp):
