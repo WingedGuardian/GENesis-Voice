@@ -41,10 +41,11 @@ def _env_float_or_none(name: str, default: float | None) -> float | None:
 @dataclass(frozen=True)
 class MeetingConfig:
     # --- HTTP/WS ingress ---
-    # Loopback by default: only the Tailscale Funnel (localhost) should reach this, never the LAN
-    # directly. The public door is Funnel, terminated on the edge. One aiohttp app serves both the
-    # capture page (GET /capture/<token>) and the audio WebSocket (GET /meeting/<token>) so the
-    # phone opens a same-origin wss (no CORS / mixed-content) through a single Funnel port.
+    # Loopback by default: only a local reverse proxy should reach this, never the LAN directly.
+    # Typically `tailscale serve` (tailnet-only), or Tailscale Funnel if the deployment chooses a
+    # public door. One aiohttp app serves both the capture page (GET /capture/<token>) and the audio
+    # WebSocket (GET /meeting/<token>) so the phone opens a same-origin wss (no CORS / mixed-content)
+    # through a single proxied port.
     host: str = field(default_factory=lambda: _env("MEETING_HTTP_HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: int(_env("MEETING_HTTP_PORT", "8790")))
     # Reject a single binary audio frame larger than this. Phone frames are a few KB of PCM;
@@ -100,6 +101,15 @@ class MeetingConfig:
     # Keep forwarding this long after the last above-threshold frame, so a mid-utterance dip or the
     # tail of a word isn't clipped by the gate.
     vad_hangover_s: float = field(default_factory=lambda: float(_env("MEETING_VAD_HANGOVER_S", "0.4")))
+    # Opening hysteresis: with the gate armed, a session opens only after this much above-threshold
+    # audio within `vad_open_window_s` (a lone click at the noise floor never opens a billed, empty
+    # session). The window's audio is pre-rolled into the session, so first words are kept.
+    # 0 = open on the first above-threshold frame (the previous behavior).
+    vad_open_speech_s: float = field(default_factory=lambda: float(_env("MEETING_VAD_OPEN_SPEECH_S", "0.3")))
+    vad_open_window_s: float = field(default_factory=lambda: float(_env("MEETING_VAD_OPEN_WINDOW_S", "1.5")))
+    # Reported to clients that negotiate asr_status_v1: a session with speech flowing but no ASR
+    # output for this long reads as "stalled".
+    asr_stall_s: float = field(default_factory=lambda: float(_env("MEETING_ASR_STALL_S", "20")))
     # Finalize the open cloud session after this much continuous silence (one meeting ends). MUST stay
     # below Speechmatics' real-time idle/no-audio timeout (measured at E2E) so we close deliberately
     # rather than the cloud dropping us. Small = more files (a long pause splits a meeting); large =

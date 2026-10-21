@@ -27,6 +27,11 @@ jobs:
         run: python -m compileall -q bridges firmware
       - name: Codex voice relay tests
         run: python -m unittest discover -s bridges/codex_voice/tests -v
+      - name: Meeting bridge tests
+        working-directory: bridges
+        run: |
+          pip install aiohttp==3.14.5 pytest==9.0.2 pytest-asyncio==1.3.0
+          PYTHONPATH=. python -m pytest -q meeting_bridge/tests
 
   shell:
     name: Shell scripts
