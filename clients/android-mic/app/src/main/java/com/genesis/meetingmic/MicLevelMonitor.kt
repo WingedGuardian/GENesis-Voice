@@ -85,7 +85,8 @@ class MicLevelMonitor(
         if (zeroRunStartMs >= 0 && nowMs - zeroRunStartMs >= redAfterMs) {
             return MicReading(MicSignal.RED, "mic is getting no sound (all-zero audio)", 0f)
         }
-        return MicReading(MicSignal.GREY, "waiting for mic audio", level)
+        // No fresh sound: the meter must not keep showing the last loud moment.
+        return MicReading(MicSignal.GREY, "waiting for mic audio", 0f)
     }
 
     companion object {
