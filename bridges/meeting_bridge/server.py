@@ -255,7 +255,7 @@ class MeetingServer:
                             last_turns = getattr(session, "turns", 0) or 0
                             last_evidence_ts = now
                             session_opened_ts = now
-                            await self._send_preroll(session, preroll)
+                            await self._send_preroll(session, preroll, also_s=frame_s)
                         await session.send_audio(msg.data)
                         # With the gate off every frame is forwarded, so use a fixed loudness as "speech
                         # is flowing" for stall detection only.
@@ -391,10 +391,11 @@ class MeetingServer:
             return None
         return [c for c in SUPPORTED_CAPABILITIES if c in requested]
 
-    async def _send_preroll(self, session, preroll) -> None:
+    async def _send_preroll(self, session, preroll, also_s: float = 0.0) -> None:
         """Flush held-back audio into a just-opened session: counted as forwarded (it was counted as
         gated when it arrived), and the session clock advanced so later markers line up with the
-        cloud's timestamps, which include this audio."""
+        cloud's timestamps, which include this audio. ``also_s`` is audio sent in the same burst right
+        after (the frame that triggered the open)."""
         held = preroll.drain()
         for frame in held:
             await session.send_audio(frame)
@@ -402,8 +403,9 @@ class MeetingServer:
             self._frames_gated -= 1
             self._bytes += len(frame)
         advance = getattr(session, "advance_clock", None)
-        if held and callable(advance):
-            advance(sum(len(f) for f in held) / (2 * 16000))
+        seconds = sum(len(f) for f in held) / (2 * 16000) + also_s
+        if seconds > 0 and callable(advance):
+            advance(seconds)
 
     @staticmethod
     def _end_reason(ws: web.WebSocketResponse) -> str:
