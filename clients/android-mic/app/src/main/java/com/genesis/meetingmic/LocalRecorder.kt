@@ -4,6 +4,7 @@ import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.os.PowerManager
 import android.os.SystemClock
 import android.os.storage.StorageManager
 import android.util.Log
@@ -55,6 +56,7 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
         private const val FEED_DEADLINE_MS = 2_000L
         private const val ENCODER_RETRY_MS = 30_000L
         private const val ENCODER_MAX_FAILURES = 3
+        private const val WAKE_LEASE_MS = 60_000L
         private const val MIME = MediaFormat.MIMETYPE_AUDIO_AAC
 
         /** Segments a writer currently has open; retention never touches them. */
@@ -120,7 +122,8 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
         }
     }
 
-    private class Frame(val data: ByteArray, val droppedBefore: Long)
+    /** One captured frame, with its capture wall time (the writer may run up to ~15 s behind). */
+    private class Frame(val data: ByteArray, val droppedBefore: Long, val capturedUtcMs: Long)
 
     @Volatile private var writer: Writer? = null
 
@@ -150,7 +153,7 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
     private inner class Writer(private val runId: Long, private val generation: Long) :
         Thread("local-recorder-$runId") {
         private val queue = ArrayBlockingQueue<Frame>(QUEUE_FRAMES)
-        private val stopFrame = Frame(ByteArray(0), 0)
+        private val stopFrame = Frame(ByteArray(0), 0, 0)
         @Volatile private var finishing = false
         private var pendingDropped = 0L  // touched only by the capture thread
 
@@ -170,7 +173,7 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
 
         fun offer(buf: ByteArray, n: Int) {
             if (finishing) return
-            if (queue.offer(Frame(buf.copyOf(n), pendingDropped))) {
+            if (queue.offer(Frame(buf.copyOf(n), pendingDropped, System.currentTimeMillis()))) {
                 pendingDropped = 0
             } else {
                 pendingDropped += n / 2
@@ -183,16 +186,36 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
         }
 
         override fun run() {
+            // Hold our own wake lock: after Stop the service lets go of its lock right away, but
+            // the queued audio still has to be encoded, written and fsynced.
+            // Renewed in short leases for as long as the writer runs (a single long lease would expire in
+            // a long meeting, exactly when the final drain needs it).
+            var wake: PowerManager.WakeLock? = null
+            var leasedAt = 0L
+            fun renewWake() {
+                try {
+                    val w = wake ?: (context.getSystemService(Context.POWER_SERVICE) as PowerManager)
+                        .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "GenesisMeetingMic::local-writer")
+                        .apply { setReferenceCounted(false) }
+                        .also { wake = it }
+                    w.acquire(WAKE_LEASE_MS)
+                    leasedAt = SystemClock.elapsedRealtime()
+                } catch (_: Throwable) {
+                    // No wake lock is a degraded backup, never a reason to stop writing.
+                }
+            }
+            renewWake()
             try {
                 try { purge(context) } catch (e: Exception) { Log.w(TAG, "retention purge failed", e) }
                 checkStorage(force = true)
                 while (true) {
                     val f = queue.poll(500, TimeUnit.MILLISECONDS)
+                    if (SystemClock.elapsedRealtime() - leasedAt > WAKE_LEASE_MS / 2) renewWake()
                     if (f === stopFrame || (f == null && finishing)) break
                     checkStorage(force = false)
                     if (f == null) continue
-                    if (f.droppedBefore > 0) fillDropped(f.droppedBefore)
-                    if (writable()) write(f.data)
+                    if (f.droppedBefore > 0) fillDropped(f.droppedBefore, f.capturedUtcMs)
+                    if (writable()) write(f.data, f.capturedUtcMs)
                     runSamples += f.data.size / 2
                 }
             } catch (e: InterruptedException) {
@@ -203,6 +226,7 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
                 monitor.setFailure(generation, "Local backup OFF: recorder error")
             } finally {
                 try { closeSegment() } catch (_: Throwable) {}
+                try { wake?.let { if (it.isHeld) it.release() } } catch (_: Throwable) {}
             }
         }
 
@@ -213,7 +237,7 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
         }
 
         /** Keeps sample positions true after a queue overflow: silence in place, or a new file. */
-        private fun fillDropped(samples: Long) {
+        private fun fillDropped(samples: Long, nextFrameUtcMs: Long) {
             Log.w(TAG, "local backup queue overflowed; $samples samples dropped")
             if (samples > MAX_SILENCE_FILL_SAMPLES || !writable()) {
                 closeSegment()
@@ -222,16 +246,20 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
             }
             var left = samples
             while (left > 0) {
+                if (!writable()) {  // the writer went off mid-fill: account for the rest, stop
+                    runSamples += left
+                    return
+                }
                 val n = minOf(left, (silence.size / 2).toLong()).toInt()
-                write(silence.copyOf(n * 2))
+                write(silence.copyOf(n * 2), nextFrameUtcMs - left * 1000 / SAMPLE_RATE)
                 runSamples += n
                 left -= n
             }
         }
 
-        private fun write(frame: ByteArray) {
+        private fun write(frame: ByteArray, capturedUtcMs: Long) {
             try {
-                if (out == null) openSegment()
+                if (out == null) openSegment(capturedUtcMs)
                 feed(frame)
                 segmentSamples += frame.size / 2
                 if (off == Off.ENCODER) {
@@ -260,9 +288,9 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
             }
         }
 
-        private fun openSegment() {
+        private fun openSegment(capturedUtcMs: Long) {
             val d = dir(context)
-            val utc = System.currentTimeMillis()
+            val utc = capturedUtcMs  // when this audio was captured, not when it was encoded
             val stamp = SimpleDateFormat("yyyyMMdd'T'HHmmss", Locale.US)
                 .apply { timeZone = TimeZone.getTimeZone("UTC") }.format(Date(utc))
             val base = "seg_${stamp}_r${runId}_s$runSamples"
@@ -290,10 +318,20 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
                 setInteger(MediaFormat.KEY_BIT_RATE, BIT_RATE)
                 setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16 * 1024)
             }
-            codec = MediaCodec.createEncoderByType(MIME).apply {
-                configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                start()
+            // A missing encoder is an encoder failure, never a storage failure (IOException here).
+            val c = try {
+                MediaCodec.createEncoderByType(MIME)
+            } catch (e: IOException) {
+                throw IllegalStateException("no AAC encoder", e)
             }
+            try {
+                c.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                c.start()
+            } catch (e: Exception) {
+                c.release()  // allocated but never usable: release it before the retry path
+                throw e
+            }
+            codec = c
             segmentSamples = 0
         }
 
@@ -434,7 +472,7 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
                     off = Off.STORAGE
                     monitor.setFailure(generation, "Local backup OFF: phone storage is full — the live stream continues")
                 }
-                (off == Off.STORAGE || off == Off.IO) && free >= RESUME_BYTES -> {
+                (off == Off.STORAGE && free >= RESUME_BYTES) || (off == Off.IO && free >= FLOOR_BYTES) -> {
                     off = null
                     monitor.setFailure(generation, null)
                 }

@@ -215,7 +215,9 @@ class MainActivity : AppCompatActivity() {
     private fun renderLocal(s: MicStreamService.Companion.CaptureState) {
         if (s.phase != lastPhase && s.phase == MicStreamService.Companion.Phase.STOPPED) {
             // The last file closes just after Stop: re-read the folder once it has.
+            // The writer can still be draining its queue: look again once it surely has.
             b.storageSummary.postDelayed({ refreshStorageSummary(purgeFirst = false) }, 2_000)
+            b.storageSummary.postDelayed({ refreshStorageSummary(purgeFirst = false) }, 20_000)
         }
         lastPhase = s.phase
         val mb = s.local.bytesWritten / (1024.0 * 1024.0)
