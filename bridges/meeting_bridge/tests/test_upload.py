@@ -1,5 +1,6 @@
 """Phone segment upload: the receipt must never claim bytes the edge does not hold."""
 
+import asyncio
 import hashlib
 import json
 import os
@@ -218,7 +219,7 @@ async def test_two_identical_uploads_racing_store_exactly_once(tmp_path):
     assert {r1.status, r2.status} == {200}
     assert sorted(b["created"] for b in bodies) == [False, True]
     day = os.path.dirname(upload_store.final_path(cfg.upload_root, NAME))
-    assert sorted(os.listdir(day)) == [NAME + ".aac"]
+    assert sorted(os.listdir(day)) == [NAME + ".aac", NAME + ".sha256"]  # one copy and its proof
 
 
 @pytest.mark.parametrize(
@@ -393,3 +394,121 @@ async def test_cancelled_request_still_waits_for_its_disk_work():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert done.is_set()  # the cancellation surfaced only after the thread finished
+
+
+def _store(root, data, sidecar=None):
+    return upload_store.store(
+        root, NAME, data, sha256=hashlib.sha256(data).hexdigest(), size=len(data), sidecar=sidecar
+    )
+
+
+def test_a_copy_damaged_after_its_receipt_is_repaired_by_the_phones_retry(tmp_path):
+    root = str(tmp_path / "up")
+    _store(root, AUDIO, sidecar={"start_sample": 0})
+    final = upload_store.final_path(root, NAME)
+    with open(final, "r+b") as f:  # damage on disk after the receipt
+        f.truncate(len(AUDIO) - 50)
+    assert not upload_store.verify(root, NAME, hashlib.sha256(AUDIO).hexdigest())
+    got = _store(root, AUDIO)  # the phone re-sends what it still holds, without a sidecar this time
+    assert got.created is True
+    assert open(final, "rb").read() == AUDIO
+    assert json.load(open(final[:-4] + ".json"))["start_sample"] == 0  # timing kept
+    damaged = os.listdir(os.path.join(os.path.dirname(final), "damaged"))
+    assert len(damaged) == 1 and damaged[0].startswith(NAME + ".aac.")  # kept aside, not deleted
+
+
+def test_an_intact_held_file_is_never_replaced_by_different_bytes(tmp_path):
+    root = str(tmp_path / "up")
+    _store(root, AUDIO)
+    other = _frame(90) + _frame(91)
+    with pytest.raises(upload_store.UploadError) as e:
+        _store(root, other)
+    assert e.value.status == 409
+    assert open(upload_store.final_path(root, NAME), "rb").read() == AUDIO
+
+
+def test_a_damaged_copy_is_not_replaced_by_bytes_it_never_held(tmp_path):
+    root = str(tmp_path / "up")
+    _store(root, AUDIO)
+    final = upload_store.final_path(root, NAME)
+    with open(final, "r+b") as f:
+        f.truncate(len(AUDIO) - 50)
+    other = _frame(90) + _frame(91)
+    with pytest.raises(upload_store.UploadError) as e:
+        _store(root, other)
+    assert e.value.status == 409
+    assert not os.path.exists(os.path.join(os.path.dirname(final), "damaged"))
+
+
+def test_without_a_recorded_proof_a_mismatch_stays_refused(tmp_path):
+    root = str(tmp_path / "up")
+    _store(root, AUDIO)
+    final = upload_store.final_path(root, NAME)
+    os.remove(final[:-4] + ".sha256")  # held before proofs were recorded
+    with open(final, "r+b") as f:
+        f.truncate(len(AUDIO) - 50)
+    with pytest.raises(upload_store.UploadError) as e:
+        _store(root, AUDIO)
+    assert e.value.status == 409
+
+
+def test_an_identical_reupload_records_a_missing_proof(tmp_path):
+    root = str(tmp_path / "up")
+    _store(root, AUDIO)
+    final = upload_store.final_path(root, NAME)
+    os.remove(final[:-4] + ".sha256")
+    _store(root, AUDIO)
+    assert open(final[:-4] + ".sha256").read().split() == [hashlib.sha256(AUDIO).hexdigest(), str(len(AUDIO))]
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_upload_is_retryable(tmp_path, monkeypatch):
+    from meeting_bridge import server
+
+    monkeypatch.setattr(server, "UPLOAD_READ_TIMEOUT_S", 0.05)
+    cfg = _cfg(tmp_path)
+    async with await _client(cfg) as c:
+
+        async def slow():
+            yield AUDIO[:10]
+            await asyncio.sleep(0.5)
+            yield AUDIO[10:]
+
+        r = await c.post(f"/meeting/{TOKEN}/upload?{_q(AUDIO)}", data=slow())
+    assert r.status == 503
+
+
+@pytest.mark.parametrize("retry_meta", [None, {"start_sample": 9}])
+def test_a_repair_that_fails_midway_keeps_the_timing_for_its_retry(tmp_path, monkeypatch, retry_meta):
+    import errno as _errno
+
+    root = str(tmp_path / "up")
+    _store(root, AUDIO, sidecar={"start_sample": 0})
+    final = upload_store.final_path(root, NAME)
+    with open(final, "r+b") as f:
+        f.truncate(len(AUDIO) - 50)
+    real_link = upload_store.os.link
+
+    def full(*_a, **_k):
+        raise OSError(_errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(upload_store.os, "link", full)
+    with pytest.raises(upload_store.UploadError):
+        _store(root, AUDIO, sidecar=retry_meta)  # damaged copy moved aside, then the store fails
+    monkeypatch.setattr(upload_store.os, "link", real_link)
+    assert _store(root, AUDIO, sidecar=retry_meta).created is True
+    assert open(final, "rb").read() == AUDIO
+    assert json.load(open(final[:-4] + ".json"))["start_sample"] == 0  # the original timing survives
+
+
+def test_a_stale_proof_never_lets_one_recording_displace_another(tmp_path):
+    root = str(tmp_path / "up")
+    _store(root, AUDIO)
+    final = upload_store.final_path(root, NAME)
+    os.remove(final)  # audio gone, its proof left behind
+    other = _frame(90) + _frame(91)
+    _store(root, other)  # a different recording now holds the name, with its own proof
+    with pytest.raises(upload_store.UploadError) as e:
+        _store(root, AUDIO)
+    assert e.value.status == 409
+    assert open(final, "rb").read() == other

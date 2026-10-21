@@ -13,7 +13,11 @@ upload, :func:`store`:
 6. re-reads the final file from disk and re-hashes it, and only then reports ``stored``.
 
 If anything fails after the link, the link is undone, so a failed attempt never leaves a final
-file that would block or falsely satisfy a retry. :func:`verify` answers "do you still hold this
+file that would block or falsely satisfy a retry. Once proven, the hash is recorded beside the file
+(``<name>.sha256``). If the held file later stops matching that record (damaged on disk, which
+:func:`verify` reports so the phone sends it again), an upload of exactly the recorded bytes moves
+the damaged copy into ``damaged/`` (never deleted) and stores the good one; any other mismatch is a
+different recording under the same name and is refused. :func:`verify` answers "do you still hold this
 exact file?" by re-hashing from disk; the phone asks again right before it deletes. The re-read can
 be served from the page cache: it proves what the filesystem holds, not the platter, which is why
 the phone also waits out a grace period and re-asks before deleting.
@@ -29,7 +33,7 @@ import re
 import shutil
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 # seg_<UTC yyyyMMddTHHmmss>_<run uuid>_s<sample position>  (ASCII digits only, full match)
 NAME_RE = re.compile(
@@ -149,6 +153,43 @@ def _sidecar_path(final: str) -> str:
     return final[: -len(".aac")] + ".json"
 
 
+def _proof_path(final: str) -> str:
+    return final[: -len(".aac")] + ".sha256"
+
+
+def _write_proof(final: str, sha256: str, size: int) -> None:
+    """Record the hash this store proved for ``final``, durably (it decides a later repair)."""
+    proof = _proof_path(final)
+    tmp = f"{proof}.tmp-{uuid.uuid4().hex}"
+    try:
+        _write_durable(tmp, f"{sha256} {size}\n".encode())
+        os.replace(tmp, proof)
+        _fsync_dir(os.path.dirname(final))
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _read_proof(final: str) -> tuple[str, int] | None:
+    try:
+        with open(_proof_path(final), encoding="ascii") as f:
+            sha, size = f.read().split()
+        return (sha, int(size)) if valid_sha(sha) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _quarantine(final: str) -> None:
+    """Move a damaged held file aside (never deleted) so the good bytes can take its name."""
+    directory = os.path.dirname(final)
+    damaged = os.path.join(directory, "damaged")
+    os.makedirs(damaged, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    os.replace(final, os.path.join(damaged, f"{os.path.basename(final)}.{stamp}-{uuid.uuid4().hex[:8]}"))
+    _fsync_dir(damaged)
+    _fsync_dir(directory)
+
+
 def _write_sidecar(final: str, sidecar: dict) -> None:
     side = _sidecar_path(final)
     tmp = f"{side}.tmp-{uuid.uuid4().hex}"
@@ -182,23 +223,39 @@ def _store_checked(final: str, data: bytes, *, sha256: str, size: int, sidecar: 
         # A new day directory is itself a directory entry: persist it in its parent too, or a power
         # loss after the receipt could lose the whole directory with the file in it.
         _fsync_dir(os.path.dirname(directory))
+    repairing = False
     if os.path.exists(final):
         held, held_size = file_sha256(final)
         if held != sha256 or held_size != size:
-            raise UploadError(409, "a different file already holds this name")
-        if sidecar is not None and not os.path.exists(_sidecar_path(final)):
-            _write_sidecar(final, sidecar)
-        # An earlier attempt may have linked this file and crashed before its directory fsync:
-        # make the entry durable before this answer lets the phone delete its copy.
-        _fsync_dir(directory)
-        return Stored(sha256=held, size=held_size, created=False)
+            proof = _read_proof(final)
+            if proof != (sha256, size) or proof == (held, held_size):
+                raise UploadError(409, "a different file already holds this name")
+            # We once proved exactly these bytes and the held copy no longer matches: it was damaged
+            # after the receipt. Keep it aside and store the good copy the phone still has.
+            _quarantine(final)
+            repairing = True
+        else:
+            if sidecar is not None and not os.path.exists(_sidecar_path(final)):
+                _write_sidecar(final, sidecar)
+            if _read_proof(final) != (held, held_size):
+                _write_proof(final, held, held_size)
+            # An earlier attempt may have linked this file and crashed before its directory fsync:
+            # make the entry durable before this answer lets the phone delete its copy.
+            _fsync_dir(directory)
+            return Stored(sha256=held, size=held_size, created=False)
 
     side = _sidecar_path(final)
-    if os.path.exists(side):
-        # A sidecar with no audio is left over from a failed attempt: never let it describe new bytes.
-        os.remove(side)
+    # With no audio held, a proof equal to these bytes means this recording was proven here before
+    # (a repair, possibly retried after it failed midway): its sidecar still describes these bytes.
+    # Anything else left without audio is from a failed attempt or another recording: never let it
+    # describe new bytes, and never let a stale proof license a later repair.
+    keep_side = repairing or _read_proof(final) == (sha256, size)
+    if not keep_side:
+        for stale in (side, _proof_path(final)):
+            if os.path.exists(stale):
+                os.remove(stale)
     wrote_sidecar = False
-    if sidecar is not None:
+    if sidecar is not None and not (keep_side and os.path.exists(side)):
         _write_sidecar(final, sidecar)
         wrote_sidecar = True
     temp = f"{final}.tmp-{uuid.uuid4().hex}"
@@ -223,6 +280,7 @@ def _store_checked(final: str, data: bytes, *, sha256: str, size: int, sidecar: 
             raise UploadError(500, "stored file does not read back identically")
         linked = False  # proven: keep it
         proven = True
+        _write_proof(final, held, held_size)
         return Stored(sha256=held, size=held_size, created=True)
     finally:
         if os.path.exists(temp):

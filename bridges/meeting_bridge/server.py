@@ -524,7 +524,8 @@ class MeetingServer:
                     if len(body) > self._cfg.upload_max_bytes:
                         return self._upload_rejected(413, "upload too large", name)
             except (TimeoutError, asyncio.TimeoutError):
-                return self._upload_rejected(408, "upload stalled", name)
+                # A stalled mobile link says nothing about the bytes either: retryable (5xx).
+                return self._upload_rejected(503, "upload stalled", name)
             except (ConnectionError, aiohttp.ClientPayloadError, aiohttp.http_exceptions.HttpProcessingError):
                 # Says nothing about the bytes: a retry can succeed, so this is retryable (5xx).
                 return self._upload_rejected(503, "upload interrupted", name)
