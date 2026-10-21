@@ -17,6 +17,7 @@ imports (and unit-tests) without speechmatics-rt installed.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import hmac
 import json
@@ -26,6 +27,8 @@ import signal
 import time
 from pathlib import Path
 
+import aiohttp
+import aiohttp.http_exceptions
 from aiohttp import WSMsgType, web
 
 from .config import MeetingConfig, load_config
@@ -50,6 +53,21 @@ UPLOAD_CONCURRENCY = 4
 UPLOAD_READ_TIMEOUT_S = 30.0
 # With the VAD gate off, a frame at least this loud counts as "speech flowing" for stall reporting.
 LEGACY_SPEECH_PEAK = 1000
+
+
+async def _finish_in_thread(fn, *args, **kwargs):
+    """Run blocking disk work in a thread and wait for it to finish even if this request is
+    cancelled: the per-name lock must not be released while a store is still proving (or rolling
+    back) its file, or a /have or a retry could see that unproven file."""
+    fut = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        try:
+            await fut
+        except Exception:
+            pass
+        raise
 
 
 def tracked_task(coro, *, name: str) -> asyncio.Task:
@@ -81,7 +99,7 @@ class MeetingServer:
         self._empty_removed = 0  # header-only transcripts removed after a session heard nothing
         self._uploads_stored = 0  # phone segments newly stored (identical re-uploads not counted)
         self._uploads_rejected = 0
-        self._upload_locks: dict[str, asyncio.Lock] = {}
+        self._upload_locks: dict[str, list] = {}  # name -> [lock, holders + waiters]
         self._upload_slots = asyncio.Semaphore(UPLOAD_CONCURRENCY)
         self._bytes = 0
         self._last_frame_ts: float | None = None
@@ -483,6 +501,9 @@ class MeetingServer:
         if meta:
             try:
                 sidecar = json.loads(meta) if len(meta) <= 4096 else None
+                # Bound what lands on disk too: escapes can expand once parsed.
+                if isinstance(sidecar, dict) and len(json.dumps(sidecar)) > 8192:
+                    sidecar = None
             except (ValueError, RecursionError):
                 sidecar = None
             if not isinstance(sidecar, dict):
@@ -502,22 +523,18 @@ class MeetingServer:
                         return self._upload_rejected(413, "upload too large", name)
             except (TimeoutError, asyncio.TimeoutError):
                 return self._upload_rejected(408, "upload stalled", name)
-            except ConnectionError:
-                return self._upload_rejected(400, "upload interrupted", name)
+            except (ConnectionError, aiohttp.ClientPayloadError, aiohttp.http_exceptions.HttpProcessingError):
+                # Says nothing about the bytes: a retry can succeed, so this is retryable (5xx).
+                return self._upload_rejected(503, "upload interrupted", name)
             if await asyncio.to_thread(upload_store.free_bytes, root) < self._cfg.upload_min_free_bytes:
                 return self._upload_rejected(507, "edge storage below its free-space floor", name)
-            # One writer per NAME (the name is what a file is stored under).
-            lock = self._upload_locks.setdefault(name, asyncio.Lock())
             try:
-                async with lock:
-                    stored = await asyncio.to_thread(
+                async with self._name_lock(name):
+                    stored = await _finish_in_thread(
                         upload_store.store, root, name, bytes(body), sha256=sha, size=size, sidecar=sidecar
                     )
             except upload_store.UploadError as exc:
                 return self._upload_rejected(exc.status, str(exc), name)
-            finally:
-                if not lock.locked() and self._upload_locks.get(name) is lock:
-                    self._upload_locks.pop(name, None)
         if stored.created:
             self._uploads_stored += 1
         logger.info(
@@ -534,9 +551,28 @@ class MeetingServer:
         name, sha = request.query.get("name", ""), request.query.get("sha256", "").lower()
         if not upload_store.valid_name(name) or not upload_store.valid_sha(sha):
             return web.json_response({"have": False, "reason": "bad name or sha256"}, status=400)
-        async with self._upload_slots:
-            have = await asyncio.to_thread(upload_store.verify, self._cfg.upload_root, name, sha)
+        # Same per-name lock as uploads: never answer while a store of this name is still proving
+        # (or rolling back) its file.
+        async with self._upload_slots, self._name_lock(name):
+            have = await _finish_in_thread(upload_store.verify, self._cfg.upload_root, name, sha)
         return web.json_response({"have": have})
+
+    @contextlib.asynccontextmanager
+    async def _name_lock(self, name: str):
+        """One store or verify per segment name at a time. The lock is dropped from the table only
+        when nobody holds it AND nobody is waiting for it, so a waiter can never be bypassed by a
+        newcomer that would otherwise create a second lock for the same name."""
+        entry = self._upload_locks.get(name)
+        if entry is None:
+            entry = self._upload_locks[name] = [asyncio.Lock(), 0]
+        entry[1] += 1
+        try:
+            async with entry[0]:
+                yield
+        finally:
+            entry[1] -= 1
+            if entry[1] == 0 and self._upload_locks.get(name) is entry:
+                del self._upload_locks[name]
 
     # ── health ───────────────────────────────────────────────────────────────
     async def _handle_health(self, _request: web.Request) -> web.Response:

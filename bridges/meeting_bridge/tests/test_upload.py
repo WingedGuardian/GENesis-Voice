@@ -273,3 +273,123 @@ def test_sidecar_missing_on_an_identical_reupload_is_written(tmp_path):
     assert again.created is False
     side = upload_store.final_path(str(tmp_path), NAME)[:-4] + ".json"
     assert json.load(open(side)) == {"v": 1}
+
+
+def test_a_few_junk_bytes_after_the_frames_are_rejected():
+    assert not upload_store.adts_ok(AUDIO + b"\x00\x00\x00")
+    assert upload_store.adts_ok(AUDIO + b"\xff\xf1\x60")  # a torn header still looks like a frame
+
+
+def test_a_sidecar_left_by_a_failed_attempt_never_describes_new_bytes(tmp_path, monkeypatch):
+    sha = hashlib.sha256(AUDIO).hexdigest()
+    real_link = upload_store.os.link
+
+    def boom(*_a, **_k):
+        raise OSError(5, "I/O error")
+
+    monkeypatch.setattr(upload_store.os, "link", boom)
+    with pytest.raises(upload_store.UploadError):
+        upload_store.store(str(tmp_path), NAME, AUDIO, sha256=sha, size=len(AUDIO), sidecar={"stale": True})
+    side = upload_store.final_path(str(tmp_path), NAME)[:-4] + ".json"
+    assert not os.path.exists(side)  # removed with the failed attempt
+    # And a leftover from an older build is cleared before a fresh store without meta.
+    open(side, "w").write('{"stale": true}')
+    monkeypatch.setattr(upload_store.os, "link", real_link)
+    upload_store.store(str(tmp_path), NAME, AUDIO, sha256=sha, size=len(AUDIO), sidecar=None)
+    assert not os.path.exists(side)
+
+
+@pytest.mark.asyncio
+async def test_an_interrupted_body_is_retryable_not_rejected(tmp_path):
+    cfg = _cfg(tmp_path)
+    server = MeetingServer(cfg)
+
+    class _Broken:
+        async def readany(self):
+            raise ConnectionResetError("peer went away")
+
+    class _Req:
+        match_info = {"token": TOKEN}
+        query = {"name": NAME, "sha256": hashlib.sha256(AUDIO).hexdigest(), "bytes": str(len(AUDIO))}
+        content = _Broken()
+
+    resp = await server._handle_upload(_Req())
+    assert resp.status == 503
+
+
+@pytest.mark.asyncio
+async def test_inflated_sidecar_is_refused(tmp_path):
+    from urllib.parse import quote
+
+    cfg = _cfg(tmp_path)
+    big = json.dumps({"x": "\u00e9" * 3000}, ensure_ascii=False)  # ~3 KB of text, ~18 KB once re-encoded
+    assert len(big) <= 4096
+    async with await _client(cfg) as c:
+        r = await c.post(f"/meeting/{TOKEN}/upload?{_q(AUDIO)}&meta={quote(big)}", data=AUDIO)
+    assert r.status == 400
+    assert not os.path.exists(upload_store.final_path(cfg.upload_root, NAME))
+
+
+@pytest.mark.asyncio
+async def test_a_waiter_is_never_bypassed_by_a_newcomer(tmp_path):
+    import asyncio
+
+    server = MeetingServer(_cfg(tmp_path))
+    order = []
+    release = asyncio.Event()
+
+    async def holder():
+        async with server._name_lock(NAME):
+            order.append("holder in")
+            await release.wait()
+            order.append("holder out")
+        # Same task, no yield: a waiter is still queued, so its lock must still be in the table
+        # (dropping it here is what let a newcomer create a second lock for the same name).
+        order.append(NAME in server._upload_locks)
+
+    async def waiter(tag):
+        async with server._name_lock(NAME):
+            order.append(tag)
+
+    h = asyncio.create_task(holder())
+    await asyncio.sleep(0.01)
+    w1 = asyncio.create_task(waiter("waiter"))
+    await asyncio.sleep(0.01)
+    release.set()
+    await asyncio.sleep(0)  # holder releases; the waiter has not run yet
+    w2 = asyncio.create_task(waiter("newcomer"))
+    await asyncio.gather(h, w1, w2)
+    assert order == ["holder in", "holder out", True, "waiter", "newcomer"]
+    assert server._upload_locks == {}  # dropped only when nobody holds or waits
+
+
+def test_a_failure_after_the_link_also_removes_its_sidecar(tmp_path, monkeypatch):
+    sha = hashlib.sha256(AUDIO).hexdigest()
+    monkeypatch.setattr(upload_store, "file_sha256", lambda p: ("0" * 64, len(AUDIO)))
+    with pytest.raises(upload_store.UploadError):
+        upload_store.store(str(tmp_path), NAME, AUDIO, sha256=sha, size=len(AUDIO), sidecar={"v": 1})
+    final = upload_store.final_path(str(tmp_path), NAME)
+    assert not os.path.exists(final)
+    assert not os.path.exists(final[:-4] + ".json")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_request_still_waits_for_its_disk_work():
+    import asyncio
+    import threading
+    import time as _time
+
+    from meeting_bridge.server import _finish_in_thread
+
+    done = threading.Event()
+
+    def slow():
+        _time.sleep(0.2)
+        done.set()
+
+    task = asyncio.create_task(_finish_in_thread(slow))
+    await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert done.is_set()  # the cancellation surfaced only after the thread finished

@@ -91,6 +91,11 @@ def adts_ok(data: bytes) -> bool:
             break  # torn last frame
         frames += 1
         i += length
+    tail = n - i
+    if 0 < tail < ADTS_HEADER:
+        # A torn header must still look like the start of a frame, not arbitrary trailing bytes.
+        if data[i] != 0xFF or (tail >= 2 and (data[i + 1] & 0xF6) != 0xF0):
+            return False
     return frames > 0
 
 
@@ -172,20 +177,33 @@ def store(root: str, name: str, data: bytes, *, sha256: str, size: int, sidecar:
 
 def _store_checked(final: str, data: bytes, *, sha256: str, size: int, sidecar: dict | None) -> Stored:
     directory = os.path.dirname(final)
-    os.makedirs(directory, exist_ok=True)
+    if not os.path.isdir(directory):
+        os.makedirs(directory, exist_ok=True)
+        # A new day directory is itself a directory entry: persist it in its parent too, or a power
+        # loss after the receipt could lose the whole directory with the file in it.
+        _fsync_dir(os.path.dirname(directory))
     if os.path.exists(final):
         held, held_size = file_sha256(final)
         if held != sha256 or held_size != size:
             raise UploadError(409, "a different file already holds this name")
         if sidecar is not None and not os.path.exists(_sidecar_path(final)):
             _write_sidecar(final, sidecar)
-            _fsync_dir(directory)
+        # An earlier attempt may have linked this file and crashed before its directory fsync:
+        # make the entry durable before this answer lets the phone delete its copy.
+        _fsync_dir(directory)
         return Stored(sha256=held, size=held_size, created=False)
 
+    side = _sidecar_path(final)
+    if os.path.exists(side):
+        # A sidecar with no audio is left over from a failed attempt: never let it describe new bytes.
+        os.remove(side)
+    wrote_sidecar = False
     if sidecar is not None:
         _write_sidecar(final, sidecar)
+        wrote_sidecar = True
     temp = f"{final}.tmp-{uuid.uuid4().hex}"
     linked = False
+    proven = False
     try:
         _write_durable(temp, data)
         try:
@@ -195,6 +213,8 @@ def _store_checked(final: str, data: bytes, *, sha256: str, size: int, sidecar: 
             held, held_size = file_sha256(final)
             if held != sha256 or held_size != size:
                 raise UploadError(409, "a different file already holds this name") from None
+            _fsync_dir(directory)
+            proven = True
             return Stored(sha256=held, size=held_size, created=False)
         linked = True
         _fsync_dir(directory)
@@ -202,6 +222,7 @@ def _store_checked(final: str, data: bytes, *, sha256: str, size: int, sidecar: 
         if held != sha256 or held_size != size:
             raise UploadError(500, "stored file does not read back identically")
         linked = False  # proven: keep it
+        proven = True
         return Stored(sha256=held, size=held_size, created=True)
     finally:
         if os.path.exists(temp):
@@ -211,6 +232,11 @@ def _store_checked(final: str, data: bytes, *, sha256: str, size: int, sidecar: 
             try:
                 os.remove(final)
                 _fsync_dir(directory)
+            except OSError:
+                pass
+        if wrote_sidecar and not proven and not os.path.exists(final):
+            try:
+                os.remove(side)
             except OSError:
                 pass
 
