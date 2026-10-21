@@ -48,6 +48,8 @@ EMPTY_TRANSCRIPT_MAX_BYTES = 512
 # Phone uploads: at most this many at once, and a body that stops arriving for this long is dropped.
 UPLOAD_CONCURRENCY = 4
 UPLOAD_READ_TIMEOUT_S = 30.0
+# With the VAD gate off, a frame at least this loud counts as "speech flowing" for stall reporting.
+LEGACY_SPEECH_PEAK = 1000
 
 
 def tracked_task(coro, *, name: str) -> asyncio.Task:
@@ -212,18 +214,6 @@ class MeetingServer:
                     if ack_enabled and (last_ack_ts == 0.0 or now - last_ack_ts >= 2.0):
                         await ws.send_json({"type": "audio_ack", "bytes": received_bytes})
                         last_ack_ts = now
-                    if asr_enabled and (last_status_ts == 0.0 or now - last_status_ts >= 2.0):
-                        state = asr_state(
-                            session=session,
-                            session_opened_ts=session_opened_ts,
-                            dormant=dormant,
-                            last_loud_ts=last_loud_ts,
-                            last_speech_sent_ts=last_speech_sent_ts,
-                            now=now,
-                            stall_s=cfg.asr_stall_s,
-                        )
-                        await ws.send_json({"type": "asr_status", "state": state})
-                        last_status_ts = now
                     peak = peak_amplitude(msg.data)
                     frame_s = len(msg.data) / (2 * 16000)
                     forward, close = gate.observe(peak, now, frame_s)
@@ -275,17 +265,19 @@ class MeetingServer:
                             last_turns = getattr(session, "turns", 0) or 0
                             last_evidence_ts = now
                             session_opened_ts = now
-                            for held in preroll.drain():
-                                await session.send_audio(held)
+                            await self._send_preroll(session, preroll)
                         await session.send_audio(msg.data)
-                        if gate.enabled and peak >= cfg.vad_threshold:
+                        # With the gate off every frame is forwarded, so use a fixed loudness as "speech
+                        # is flowing" for stall detection only.
+                        if peak >= (cfg.vad_threshold if gate.enabled else LEGACY_SPEECH_PEAK):
                             last_speech_sent_ts = now
                         self._frames += 1
                         self._bytes += len(msg.data)
                         self._last_frame_ts = time.time()
                     else:
                         self._frames_gated += 1
-                        if session is None:
+                        if session is None and not dormant:
+                            # Noise heard while dormant is not a lead-in to anything: never hold it.
                             preroll.push(msg.data, frame_s)
                             if close:
                                 gate.reset()
@@ -309,11 +301,26 @@ class MeetingServer:
                             summary.max_peak,
                             summary.avg_peak,
                         )
+                    # Status after the frame was acted on, so the first speech frame reports the session
+                    # it just opened rather than the idle state before it.
+                    if asr_enabled and (last_status_ts == 0.0 or now - last_status_ts >= 2.0):
+                        state = asr_state(
+                            session=session,
+                            session_opened_ts=session_opened_ts,
+                            dormant=dormant,
+                            last_loud_ts=last_loud_ts,
+                            last_speech_sent_ts=last_speech_sent_ts,
+                            now=now,
+                            stall_s=cfg.asr_stall_s,
+                        )
+                        await ws.send_json({"type": "asr_status", "state": state})
+                        last_status_ts = now
                 elif msg.type == WSMsgType.TEXT:
                     caps = self._hello_capabilities(msg.data)
                     if caps is not None:
-                        ack_enabled = "audio_ack_v1" in caps
-                        asr_enabled = "asr_status_v1" in caps
+                        # A later hello can add capabilities but never silently drop one already granted.
+                        ack_enabled = ack_enabled or "audio_ack_v1" in caps
+                        asr_enabled = asr_enabled or "asr_status_v1" in caps
                         await ws.send_json({"type": "hello", "capabilities": caps})
                         continue
                     # A marker is an explicit "pay attention here" — never drop it into a silence
@@ -326,8 +333,7 @@ class MeetingServer:
                             last_turns = getattr(session, "turns", 0) or 0
                             last_evidence_ts = time.monotonic()
                             session_opened_ts = last_evidence_ts
-                            for held in preroll.drain():
-                                await session.send_audio(held)
+                            await self._send_preroll(session, preroll)
                             gate.mark_speech(last_evidence_ts)
                         session.add_marker()
                 elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
@@ -394,6 +400,20 @@ class MeetingServer:
         if not isinstance(requested, list):
             return None
         return [c for c in SUPPORTED_CAPABILITIES if c in requested]
+
+    async def _send_preroll(self, session, preroll) -> None:
+        """Flush held-back audio into a just-opened session: counted as forwarded (it was counted as
+        gated when it arrived), and the session clock advanced so later markers line up with the
+        cloud's timestamps, which include this audio."""
+        held = preroll.drain()
+        for frame in held:
+            await session.send_audio(frame)
+            self._frames += 1
+            self._frames_gated -= 1
+            self._bytes += len(frame)
+        advance = getattr(session, "advance_clock", None)
+        if held and callable(advance):
+            advance(sum(len(f) for f in held) / (2 * 16000))
 
     @staticmethod
     def _end_reason(ws: web.WebSocketResponse) -> str:

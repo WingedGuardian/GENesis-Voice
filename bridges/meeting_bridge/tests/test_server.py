@@ -716,13 +716,9 @@ async def test_asr_status_error_when_session_has_no_cloud_connection(tmp_path):
             ws = await c.ws_connect(f"/meeting/{TOKEN}")
             await ws.send_str(json.dumps({"type": "hello", "capabilities": ["asr_status_v1"]}))
             await asyncio.wait_for(ws.receive_json(), timeout=2)
-            await ws.send_bytes(_frame(4000))  # opens the session (status sent before it opens)
+            await ws.send_bytes(_frame(4000))  # opens the session; status reflects it immediately
             first = await asyncio.wait_for(ws.receive_json(), timeout=2)
-            assert first == {"type": "asr_status", "state": "idle"}
-            await asyncio.sleep(2.05)
-            await ws.send_bytes(_frame(4000))
-            second = await asyncio.wait_for(ws.receive_json(), timeout=2)
-            assert second == {"type": "asr_status", "state": "error"}
+            assert first == {"type": "asr_status", "state": "error"}
             await ws.close()
     finally:
         server.close()
@@ -845,5 +841,78 @@ async def test_noise_during_dormancy_cannot_bypass_hysteresis_after_rearm(tmp_pa
             await ws.close()
         await asyncio.sleep(0.05)
         assert len(box["sessions"]) == 1
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_a_second_hello_never_drops_receipts(tmp_path):
+    cfg = _cfg(tmp_path)
+    server, _box, _done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_str(json.dumps({"type": "hello", "capabilities": ["audio_ack_v1"]}))
+            await asyncio.wait_for(ws.receive_json(), timeout=2)
+            await ws.send_str(json.dumps({"type": "hello", "capabilities": ["asr_status_v1"]}))
+            await asyncio.wait_for(ws.receive_json(), timeout=2)
+            await ws.send_bytes(_frame(100))
+            got = [await asyncio.wait_for(ws.receive_json(), timeout=2) for _ in range(2)]
+            assert any(m.get("type") == "audio_ack" for m in got)
+            await ws.close()
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_preroll_advances_the_session_clock_for_markers(tmp_path):
+    cfg = _cfg(tmp_path, vad_threshold=500, vad_open_speech_s=0.3, vad_open_window_s=1.5)
+    box = {"sessions": []}
+    done = asyncio.Event()
+
+    class ClockSession(FakeSession):
+        advanced = 0.0
+
+        def advance_clock(self, seconds):
+            self.advanced += seconds
+
+    def factory(_cfg, _source):
+        s = ClockSession(done)
+        box["sessions"].append(s)
+        box["session"] = s
+        return s
+
+    server = MeetingServer(cfg, session_factory=factory)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            for p in (100, 4000, 4000, 4000):
+                await ws.send_bytes(_frame(p))
+            session = await _wait_for_session(box)
+            await ws.close()
+        await asyncio.sleep(0.05)
+        # three held frames (quiet + two speech) were pre-rolled: 0.3 s of audio
+        assert abs(session.advanced - 0.3) < 1e-6
+        assert server._health_payload()["frames"] == 4  # pre-roll counted as forwarded
+    finally:
+        server.close()
+
+
+@pytest.mark.asyncio
+async def test_stall_is_reported_even_with_the_gate_off(tmp_path):
+    cfg = _cfg(tmp_path, asr_stall_s=0.05)  # gate off (legacy)
+    server, _box, _done = _server_with_fake(cfg)
+    try:
+        async with await _client(server) as c:
+            ws = await c.ws_connect(f"/meeting/{TOKEN}")
+            await ws.send_str(json.dumps({"type": "hello", "capabilities": ["asr_status_v1"]}))
+            await asyncio.wait_for(ws.receive_json(), timeout=2)
+            await ws.send_bytes(_frame(4000))
+            await asyncio.wait_for(ws.receive_json(), timeout=2)  # transcribing (fresh session)
+            await asyncio.sleep(2.05)
+            await ws.send_bytes(_frame(4000))
+            later = await asyncio.wait_for(ws.receive_json(), timeout=2)
+            assert later == {"type": "asr_status", "state": "stalled"}
+            await ws.close()
     finally:
         server.close()
