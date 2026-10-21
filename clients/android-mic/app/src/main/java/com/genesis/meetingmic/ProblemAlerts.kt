@@ -29,6 +29,16 @@ class ProblemAlerts(
         ),
     )
 
+    fun showLocal(reason: String) = post(
+        LOCAL,
+        "Meeting audio is not being saved on this phone",
+        "$reason.",
+        PendingIntent.getActivity(
+            context, 18, Intent(context, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        ),
+    )
+
     fun showTailscale(launch: Intent) = post(
         TAILSCALE,
         "Tailscale is off — meeting audio can't reach Genesis",
@@ -81,5 +91,6 @@ class ProblemAlerts(
         const val MIC = 3
         const val TAILSCALE = 4
         const val RESUME = 5
+        const val LOCAL = 6
     }
 }

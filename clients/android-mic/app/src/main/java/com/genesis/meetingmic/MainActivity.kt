@@ -97,6 +97,9 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         refreshBatteryBanner()
+        // Retention runs on every app open as well as at each capture start, so old recordings are
+        // removed even between meetings.
+        refreshStorageSummary(purgeFirst = true)
         // Every failure alert is a notification; without this permission they are all silent.
         val notifOff = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
@@ -163,6 +166,7 @@ class MainActivity : AppCompatActivity() {
                         else -> Color.TRANSPARENT
                     })
                     renderMic(s)
+                    renderLocal(s)
                     b.netStatus.text = "✕ ${s.netNote}"
                     b.netStatus.visibility =
                         if (s.netNote.isEmpty()) android.view.View.GONE else android.view.View.VISIBLE
@@ -173,6 +177,42 @@ class MainActivity : AppCompatActivity() {
                     b.startBtn.isEnabled = !live
                     b.stopBtn.isEnabled = live
                 }
+            }
+        }
+    }
+
+    private var lastPhase: MicStreamService.Companion.Phase? = null
+
+    private fun refreshStorageSummary(purgeFirst: Boolean) {
+        val app = applicationContext
+        Thread({
+            if (purgeFirst) try { LocalRecorder.purge(app) } catch (_: Exception) {}
+            val text = try { LocalRecorder.summary(app) } catch (e: Exception) { "On this phone: could not read recordings" }
+            runOnUiThread { b.storageSummary.text = text }
+        }, "storage-summary").start()
+    }
+
+    private fun renderLocal(s: MicStreamService.Companion.CaptureState) {
+        if (s.phase != lastPhase && s.phase == MicStreamService.Companion.Phase.STOPPED) {
+            // The last file closes just after Stop: re-read the folder once it has.
+            b.storageSummary.postDelayed({ refreshStorageSummary(purgeFirst = false) }, 2_000)
+        }
+        lastPhase = s.phase
+        val mb = s.local.bytesWritten / (1024.0 * 1024.0)
+        when (s.local.signal) {
+            MicSignal.GREEN -> {
+                val check = if (s.local.lastCheck.isEmpty()) "" else " · ${s.local.lastCheck}"
+                b.localStatus.text = "● Local backup saving on this phone — %.1f MB%s".format(mb, check)
+                b.localStatus.setBackgroundColor(Color.TRANSPARENT)
+            }
+            MicSignal.GREY -> {
+                b.localStatus.text = if (s.local.reason == "off") getString(R.string.local_off)
+                else "◌ Local backup: ${s.local.reason}"
+                b.localStatus.setBackgroundColor(Color.TRANSPARENT)
+            }
+            MicSignal.RED -> {
+                b.localStatus.text = "✕ ${s.local.reason}"
+                b.localStatus.setBackgroundColor(Color.parseColor("#33FF9800"))
             }
         }
     }

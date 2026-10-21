@@ -111,6 +111,24 @@
             android:textSize="16sp"
             android:text="@string/status_idle" />
 
+        <!-- Local backup: is a copy being written on this phone, independent of the network? -->
+        <TextView
+            android:id="@+id/localStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:padding="4dp"
+            android:textSize="16sp"
+            android:text="@string/local_off" />
+
+        <TextView
+            android:id="@+id/storageSummary"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:textSize="13sp"
+            android:alpha="0.75" />
+
         <!-- Network: a named cause (e.g. Tailscale off) while delivery is failing. -->
         <TextView
             android:id="@+id/netStatus"
