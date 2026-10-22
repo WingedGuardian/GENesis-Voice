@@ -157,6 +157,7 @@ def _persist_chain(directory: str) -> None:
     its entry is durable: another upload may have created it and not yet fsynced its parent, or a
     crash may have landed between a mkdir and that fsync.
     """
+    directory = os.path.abspath(directory)  # a relative upload root has no parent to name otherwise
     root = os.path.dirname(directory)
     for d in (directory, root, os.path.dirname(root)):
         _fsync_dir(d)

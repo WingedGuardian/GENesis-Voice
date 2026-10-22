@@ -543,3 +543,42 @@ def test_every_stored_answer_persists_the_whole_folder_chain(tmp_path, monkeypat
     day = os.path.dirname(upload_store.final_path(str(root), NAME))
     for d in (day, root, tmp_path / "out"):
         assert os.path.abspath(d) in synced
+
+
+@pytest.mark.asyncio
+async def test_a_retry_of_held_bytes_gets_its_receipt_below_the_free_space_floor(tmp_path):
+    cfg = _cfg(tmp_path)
+    upload_store.free_bytes(cfg.upload_root)
+    _store(cfg.upload_root, AUDIO)  # stored earlier; the receipt was lost
+    async with await _client(_cfg(tmp_path, upload_min_free_bytes=1 << 62)) as c:
+        r = await c.post(f"/meeting/{TOKEN}/upload?{_q(AUDIO)}", data=AUDIO)
+        body = await r.json()
+        other = _frame(90) + _frame(91)
+        r2 = await c.post(f"/meeting/{TOKEN}/upload?{_q(other, name=NAME.replace('_s0', '_s1'))}", data=other)
+    assert r.status == 200 and body["created"] is False
+    assert r2.status == 507  # new bytes still respect the floor
+
+
+@pytest.mark.asyncio
+async def test_receipts_and_possession_checks_are_never_cacheable(tmp_path):
+    cfg = _cfg(tmp_path)
+    sha = hashlib.sha256(AUDIO).hexdigest()
+    async with await _client(cfg) as c:
+        up = await c.post(f"/meeting/{TOKEN}/upload?{_q(AUDIO)}", data=AUDIO)
+        have = await c.get(f"/meeting/{TOKEN}/have?name={NAME}&sha256={sha}")
+        bad = await c.post(f"/meeting/{TOKEN}/upload?{_q(AUDIO, sha='0' * 64)}", data=AUDIO)
+        denied = await c.get(f"/meeting/wrong-token/have?name={NAME}&sha256={sha}")
+    for r in (up, have, bad, denied):  # every path, including ones no handler shaped
+        assert r.headers.get("Cache-Control") == "no-store"
+
+
+def test_a_relative_upload_root_still_gets_its_receipt(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    upload_store.free_bytes("uploads")
+    assert _store("uploads", AUDIO).created is True
+    assert _store("uploads", AUDIO).created is False
+
+
+def test_the_upload_root_is_absolute_even_when_configured_relative(tmp_path):
+    assert os.path.isabs(_cfg(tmp_path, upload_dir="uploads").upload_root)
+    assert os.path.isabs(_cfg(tmp_path).upload_root)

@@ -144,13 +144,13 @@ class MeetingConfig:
     # the exact bytes, so the store refuses uploads below a free-space floor instead of half-writing.
     upload_dir: str = field(default_factory=lambda: _env("MEETING_UPLOAD_DIR", ""))
     upload_max_bytes: int = field(default_factory=lambda: int(_env("MEETING_UPLOAD_MAX_BYTES", str(4 << 20))))
-    upload_min_free_bytes: int = field(
-        default_factory=lambda: int(_env("MEETING_UPLOAD_MIN_FREE_BYTES", str(2 << 30)))
-    )
+    upload_min_free_bytes: int = field(default_factory=lambda: int(_env("MEETING_UPLOAD_MIN_FREE_BYTES", str(2 << 30))))
 
     @property
     def upload_root(self) -> str:
-        return self.upload_dir or os.path.join(self.output_dir, "phone")
+        # Absolute once, here at the boundary: every fsync of a folder and its parents below relies
+        # on real parents, which a relative path does not name.
+        return os.path.abspath(self.upload_dir or os.path.join(self.output_dir, "phone"))
 
     # --- health / observability ---
     health_path: str = field(

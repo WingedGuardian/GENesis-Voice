@@ -85,6 +85,16 @@ def tracked_task(coro, *, name: str) -> asyncio.Task:
     return t
 
 
+async def _never_cache_receipts(request: web.Request, response: web.StreamResponse) -> None:
+    """Every answer from the upload and possession-check routes is uncacheable, whatever the path.
+
+    These answers decide whether the phone deletes audio, so no cache on the way may ever answer one
+    in the edge's place. Set here, once, so no response path can forget it.
+    """
+    if request.path.endswith(("/upload", "/have")):
+        response.headers["Cache-Control"] = "no-store"
+
+
 class MeetingServer:
     def __init__(self, cfg: MeetingConfig, *, session_factory=default_session_factory):
         self._cfg = cfg
@@ -108,6 +118,7 @@ class MeetingServer:
     # ── app wiring ─────────────────────────────────────────────────────────
     def build_app(self) -> web.Application:
         app = web.Application()
+        app.on_response_prepare.append(_never_cache_receipts)
         app.add_routes(
             [
                 web.get("/capture/{token}", self._handle_capture),
@@ -472,6 +483,7 @@ class MeetingServer:
             logger.warning("meeting empty-transcript cleanup failed for %s", path, exc_info=True)
 
     # ── phone segment uploads ──────────────────────────────────────────────
+
     def _upload_rejected(self, status: int, reason: str, name: str = "") -> web.Response:
         self._uploads_rejected += 1
         logger.warning("meeting upload rejected (%d): %s %s", status, reason, name)
@@ -529,10 +541,16 @@ class MeetingServer:
             except (ConnectionError, aiohttp.ClientPayloadError, aiohttp.http_exceptions.HttpProcessingError):
                 # Says nothing about the bytes: a retry can succeed, so this is retryable (5xx).
                 return self._upload_rejected(503, "upload interrupted", name)
-            if await asyncio.to_thread(upload_store.free_bytes, root) < self._cfg.upload_min_free_bytes:
-                return self._upload_rejected(507, "edge storage below its free-space floor", name)
             try:
                 async with self._name_lock(name):
+                    # The floor guards new writes only: a retry of bytes already held needs no space
+                    # and must still get its receipt.
+                    if await asyncio.to_thread(
+                        upload_store.free_bytes, root
+                    ) < self._cfg.upload_min_free_bytes and not await asyncio.to_thread(
+                        upload_store.verify, root, name, sha
+                    ):
+                        return self._upload_rejected(507, "edge storage below its free-space floor", name)
                     stored = await _finish_in_thread(
                         upload_store.store, root, name, bytes(body), sha256=sha, size=size, sidecar=sidecar
                     )
