@@ -377,4 +377,20 @@ class SegmentSyncPassTest {
         assertTrue(File(dir, "$a.synced.aac").exists())
         assertFalse(server.takeRequest().path!!.contains("meta="))
     }
+
+    @Test
+    fun aRecordingIsClaimedAgainstPurgeWhileTheEdgeIsAsked() {
+        segment(a, byteArrayOf(5), synced = true, ageMs = SegmentSync.RECHECK_MS + 1)
+        var claimedDuringAsk = false
+        server.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+            override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
+                claimedDuringAsk = a in SegmentSync.verifying
+                return MockResponse().setBody("""{"have":false}""")
+            }
+        }
+        assertFalse(pass())
+        assertTrue(claimedDuringAsk)
+        assertFalse(a in SegmentSync.verifying)  // released once the answer is acted on
+        assertTrue(File(dir, "$a.aac").exists())  // the "no" re-queued it
+    }
 }

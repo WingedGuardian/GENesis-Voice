@@ -141,6 +141,21 @@ class LocalBackupTest {
     }
 
     @Test
+    fun purgeLeavesARecordingAloneWhileItsEdgeCopyIsBeingRechecked() {
+        val dir = java.nio.file.Files.createTempDirectory("purge").toFile()
+        try {
+            recording(dir, "seg_v", ageDays = 3, synced = true)
+            SegmentSync.verifying.add("seg_v")
+            val r = LocalRecorder.purgeDir(dir, System.currentTimeMillis()) { false }
+            assertEquals(0, r.removed)
+            assertTrue(java.io.File(dir, "seg_v.synced.aac").exists())
+        } finally {
+            SegmentSync.verifying.remove("seg_v")
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
     fun anExpiredUnsyncedRecordingIsCountedAsLost() {
         val dir = java.nio.file.Files.createTempDirectory("purge").toFile()
         try {

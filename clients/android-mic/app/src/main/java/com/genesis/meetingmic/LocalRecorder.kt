@@ -127,6 +127,8 @@ class LocalRecorder(
                     // Renamed by sync since the listing (or already gone): judged next time. This is what
                     // keeps a copy the edge disowned (renamed back to X.aac) from going as a held one.
                     if (!f.exists()) return@sweep
+                    // Its edge copy is being re-checked: a "no" would make this the only copy.
+                    if (SegmentSync.baseOf(f) in SegmentSync.verifying) return@sweep
                     // The sidecar goes only once the audio is really gone: a recording that survives a
                     // failed delete keeps its timing.
                     if (!f.delete() && f.exists()) return@sweep

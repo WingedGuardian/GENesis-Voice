@@ -54,6 +54,12 @@ object SegmentSync {
     /** Guards every rename/delete in the recordings folder (sync and retention). */
     val folderLock = ReentrantLock()
 
+    /**
+     * Recordings whose edge copy is being re-checked right now. Retention never deletes one: if the
+     * edge answers "no", the phone copy is the only one left.
+     */
+    val verifying: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
     /** One pass at a time in this process, whichever job or kick started it. */
     private val passLock = ReentrantLock()
 
@@ -171,6 +177,9 @@ object SegmentSync {
             .connectTimeout(15, TimeUnit.SECONDS)
             .writeTimeout(60, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
+            // Bounds a whole call, so an edge that trickles bytes can never hold a re-check claim (or
+            // a pass) open indefinitely; generous enough for a segment upload on a slow link.
+            .callTimeout(10, TimeUnit.MINUTES)
             // A redirect could point the recording at a plain http address: never follow one.
             .followRedirects(false)
             .followSslRedirects(false)
@@ -331,18 +340,27 @@ object SegmentSync {
                 allDone = false
                 continue
             }
-            when (stillHeld(http, ep, f)) {
-                true -> folderLock.withLock {
-                    // Only beside audio that is still there, so no mark outlives its recording. A mark
-                    // that cannot be written just means asking again on a later pass.
-                    if (f.exists()) try { mark.createNewFile() } catch (e: IOException) {}
+            // Claimed under the lock: a purge either removed the file first (it is skipped here) or sees
+            // the claim and leaves the file alone until the answer has been acted on.
+            val base = baseOf(f)
+            val claimed = folderLock.withLock { f.exists() && verifying.add(base) }
+            if (!claimed) continue
+            try {
+                when (stillHeld(http, ep, f)) {
+                    true -> folderLock.withLock {
+                        // Only beside audio that is still there, so no mark outlives its recording. A mark
+                        // that cannot be written just means asking again on a later pass.
+                        if (f.exists()) try { mark.createNewFile() } catch (e: IOException) {}
+                    }
+                    false -> folderLock.withLock {
+                        // The edge no longer holds these bytes: back into the queue.
+                        if (f.exists()) f.renameTo(File(dir, baseOf(f) + ".aac"))
+                        allDone = false
+                    }
+                    null -> allDone = false
                 }
-                false -> folderLock.withLock {
-                    // The edge no longer holds these bytes: back into the queue.
-                    if (f.exists()) f.renameTo(File(dir, baseOf(f) + ".aac"))
-                    allDone = false
-                }
-                null -> allDone = false
+            } finally {
+                verifying.remove(base)
             }
         }
         // Not done while ANY closed file is unsynced, including one too fresh to touch this pass (the
