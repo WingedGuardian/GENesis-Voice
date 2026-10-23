@@ -122,6 +122,7 @@ class MicStreamService : LifecycleService() {
             val mic: MicReading = MicReading(MicSignal.GREY, "mic off", 0f),
             /** Network-side problem we can name (e.g. Tailscale off); empty when none. */
             val netNote: String = "",
+            val local: LocalReading = LocalReading(MicSignal.GREY, "off"),
         )
 
         private val _state = MutableStateFlow(CaptureState())
@@ -148,6 +149,9 @@ class MicStreamService : LifecycleService() {
     private var honestyActive = false
     private var micAlertShown = false
     private var micGreenSinceMs = -1L
+    private val localMonitor = LocalBackupMonitor()
+    private val localRecorder by lazy { LocalRecorder(this, localMonitor) }
+    private var localReading = LocalReading(MicSignal.GREY, "off")
     private var deliveryNotifText = "Starting…"
     private var lastNotifText = ""
     private var lastNotifAtMs = 0L
@@ -236,6 +240,8 @@ class MicStreamService : LifecycleService() {
         deliveryNotifText = "Starting…"
         mic.start(SystemClock.elapsedRealtime())
         micGreenSinceMs = -1L
+        // The local copy starts with capture and is independent of the connection.
+        localRecorder.start(runId, localMonitor.start(SystemClock.elapsedRealtime()))
         ensureVpn()
         honestyActive = true
         mainHandler.removeCallbacks(tick)
@@ -244,6 +250,10 @@ class MicStreamService : LifecycleService() {
 
         captureJob = lifecycleScope.launch(Dispatchers.IO) {
             connectAndStream(url, runId)
+        }.also { job ->
+            // Runs once this run can offer no more frames (so the read in flight at Stop is kept), and
+            // also when the job is cancelled before it ever started (so the writer never leaks).
+            job.invokeOnCompletion { localRecorder.stop(runId) }
         }
     }
 
@@ -289,6 +299,7 @@ class MicStreamService : LifecycleService() {
                 }
                 if (n <= 0) { delay(20); continue }
                 mic.onFrame(MicLevelMonitor.peakOf(buf, n), SystemClock.elapsedRealtime())
+                localRecorder.offer(runId, buf, n)
                 // Safety auto-stop after the max continuous duration (routed to the main thread so the
                 // FGS teardown runs there; break out of this loop immediately).
                 if (startedAtMs > 0 && System.currentTimeMillis() - startedAtMs >= MAX_SESSION_MS) {
@@ -529,6 +540,14 @@ class MicStreamService : LifecycleService() {
         val now = SystemClock.elapsedRealtime()
         val previous = micReading.signal
         micReading = mic.read(now)
+        val previousLocal = localReading.signal
+        localReading = localMonitor.read(now)
+        // The backup going off is as important as the mic going quiet: one loud alert per incident.
+        if (localReading.signal == MicSignal.RED && previousLocal != MicSignal.RED) {
+            alerts.showLocal(localReading.reason)
+        } else if (localReading.signal == MicSignal.GREEN && previousLocal != MicSignal.GREEN) {
+            alerts.clear(ProblemAlerts.LOCAL)
+        }
         if (micReading.signal == MicSignal.RED && previous != MicSignal.RED) {
             micAlertShown = true
             alerts.showMic(micReading.reason)
@@ -565,6 +584,10 @@ class MicStreamService : LifecycleService() {
         mainHandler.removeCallbacks(tick)
         mic.stop()
         micReading = mic.read(SystemClock.elapsedRealtime())
+        // The local writer is finished by the capture loop itself as it exits (see startCapture).
+        localMonitor.stop()
+        localReading = localMonitor.read(SystemClock.elapsedRealtime())
+        alerts.clear(ProblemAlerts.LOCAL)
         clearVpnNote()
         micAlertShown = false
         alerts.clear(ProblemAlerts.MIC)
@@ -665,7 +688,7 @@ class MicStreamService : LifecycleService() {
 
     private fun publish(phase: Phase, detail: String = _state.value.detail) {
         val confirmed = delivery.snapshot().confirmedBytes
-        _state.value = CaptureState(phase, detail, confirmed, startedAtMs, micReading, netNote)
+        _state.value = CaptureState(phase, detail, confirmed, startedAtMs, micReading, netNote, localReading)
     }
 
     private fun acquireWakeLock() {
@@ -704,6 +727,7 @@ class MicStreamService : LifecycleService() {
             !honestyActive -> deliveryNotifText
             micReading.signal == MicSignal.RED -> "⚠ Mic: ${micReading.reason} · $deliveryNotifText"
             netNote.isNotEmpty() -> "⚠ $netNote · $deliveryNotifText"
+            localReading.signal == MicSignal.RED -> "⚠ ${localReading.reason} · $deliveryNotifText"
             micReading.signal == MicSignal.GREEN -> "Mic ${meterBar(micReading.level)} · $deliveryNotifText"
             else -> "Mic: ${micReading.reason} · $deliveryNotifText"
         }

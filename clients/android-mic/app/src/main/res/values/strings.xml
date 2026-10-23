@@ -15,6 +15,7 @@
     <string name="status_bad_config">✕ Enter a wss:// URL and a token</string>
     <string name="battery_hint">This phone may stop the capture when the screen locks. Tap below to allow background running, and on Samsung also exclude this app from Device Care → Sleeping apps.</string>
     <string name="notif_hint">Notifications are off for this app, so mic and connection problems cannot alert you. Turn them on in Settings → Apps → Genesis Meeting Mic → Notifications.</string>
+    <string name="local_off">○ Local backup off</string>
     <string name="mic_off">○ Mic off</string>
     <string name="btn_vpn_settings">Open VPN settings (Always-on VPN)</string>
     <string name="setup_title">One-time setup for reliable recording</string>

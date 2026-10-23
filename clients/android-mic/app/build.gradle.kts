@@ -37,10 +37,12 @@ android {
 
     defaultConfig {
         applicationId = "com.genesis.meetingmic"
-        minSdk = 26
+        // 30: from Android 11 no other app can read this app's external files folder, where
+        // recordings live; on older releases an app with storage permission could.
+        minSdk = 30
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.4.0"
+        versionCode = 5
+        versionName = "0.5.0"
 
         // Surfaced to Kotlin as BuildConfig.MEETING_WS_URL / MEETING_TOKEN.
         buildConfigField("String", "MEETING_WS_URL", "\"$meetingWsUrl\"")
