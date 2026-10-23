@@ -343,4 +343,30 @@ class SegmentSyncPassTest {
         assertFalse(head.contains("✓") || head.contains("nothing waiting"))
         assertEquals("Synced to Genesis: all recordings ✓", syncLine(onlyUnroutable.copy(unroutable = 0)).lineSequence().first())
     }
+
+    @Test
+    fun anUnreadableSidecarHoldsBackOnlyItsOwnFile() {
+        val two = byteArrayOf(2, 2)
+        segment(a, byteArrayOf(1))
+        File(dir, "$a.json").delete()
+        File(dir, "$a.json").mkdir()  // exists, but reading it throws
+        segment(b, two)
+        server.enqueue(stored(two))
+        assertFalse(pass())
+        assertTrue(File(dir, "$a.aac").exists())
+        assertTrue(File(dir, "$b.synced.aac").exists())
+        assertTrue(state.getLong("retry:$a.aac") > 0)
+    }
+
+    @Test
+    fun aRecordingWithAnUnreadableSidecarStillUploadsAfterADay() {
+        val one = byteArrayOf(1)
+        segment(a, one, ageMs = 24L * 60 * 60 * 1000 + 1)
+        File(dir, "$a.json").delete()
+        File(dir, "$a.json").mkdir()
+        server.enqueue(stored(one))
+        assertTrue(pass())
+        assertTrue(File(dir, "$a.synced.aac").exists())
+        assertFalse(server.takeRequest().path!!.contains("meta="))
+    }
 }

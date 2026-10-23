@@ -540,7 +540,9 @@ class LocalRecorder(
                 else -> {
                     verify(aac)
                     openBases.remove(base)
-                    onSegmentClosed()  // a closed file is ready to mirror to the edge
+                    // A closed file is ready to mirror to the edge. Scheduling that must never be
+                    // mistaken for an encoder failure: the recording itself is already safe.
+                    try { onSegmentClosed() } catch (e: Exception) { Log.w(TAG, "sync kick failed", e) }
                 }
             }
             openBases.remove(base)
