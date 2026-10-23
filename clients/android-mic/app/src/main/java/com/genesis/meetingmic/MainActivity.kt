@@ -323,7 +323,7 @@ internal fun syncLine(s: SegmentSync.Status): String {
             else -> "Synced to Genesis: all recordings ✓"
         },
     )
-    if (s.synced > 0) parts += "${s.synced} confirmed on Genesis (phone copy kept 7 days, then re-checked)"
+    if (s.synced > 0) parts += "${s.synced} confirmed on Genesis (phone copy kept 90 days unless storage runs low)"
     if (s.rejected > 0) parts += "⚠ ${s.rejected} refused by Genesis, kept on phone"
     if (s.expiredUnsynced > 0) parts += "⚠ ${s.expiredUnsynced} expired before syncing"
     if (s.unroutable > 0) {
