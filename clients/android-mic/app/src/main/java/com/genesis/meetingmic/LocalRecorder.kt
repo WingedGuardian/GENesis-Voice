@@ -117,10 +117,10 @@ class LocalRecorder(
                     // failed delete keeps its timing.
                     if (!f.delete() && f.exists()) continue
                     if (!SegmentSync.isSynced(f)) expiredUnsynced += 1
-                    File(d, SegmentSync.baseOf(f) + ".json").delete()
+                    SegmentSync.deleteCompanions(d, SegmentSync.baseOf(f))
                     removed += 1
                 }
-                d.listFiles { f -> f.name.endsWith(".json") }.orEmpty()
+                d.listFiles { f -> f.name.endsWith(".json") || f.name.endsWith(".dest") }.orEmpty()
                     .filter { it.nameWithoutExtension !in openBases }
                     .filter {
                         !File(d, it.nameWithoutExtension + ".aac").exists() &&
@@ -169,9 +169,9 @@ class LocalRecorder(
      * new one opens no encoder until the old one has released its own (some phones have only one).
      */
     @Synchronized
-    fun start(runId: Long, generation: Long, runUuid: String) {
+    fun start(runId: Long, generation: Long, runUuid: String, dest: String) {
         writer?.finish()
-        val w = Writer(runId, generation, runUuid)
+        val w = Writer(runId, generation, runUuid, dest)
         w.previous = lastWriter.getAndSet(w)
         writer = w
         w.start()
@@ -210,6 +210,9 @@ class LocalRecorder(
         // Globally unique per capture run: segment names must never repeat across app restarts
         // (the numeric runId restarts at 1 with the process), because the edge stores by name.
         private val runUuid: String,
+        // Where this run's recordings sync to (an endpoint id, or SegmentSync.DEST_NONE), fixed at
+        // capture so a later change of bridge or token cannot redirect them.
+        private val dest: String,
     ) : Thread("local-recorder-$runId") {
         /** The writer started before this one, possibly by another service instance; joined before any encoder opens. */
         @Volatile var previous: Thread? = null
@@ -382,6 +385,7 @@ class LocalRecorder(
             val base = "seg_${stamp}_${runUuid}_s$runSamples"
             openBases.add(base)
             currentBase = base
+            SegmentSync.writeDest(File(d, "$base.dest"), dest)
             FileOutputStream(File(d, "$base.json")).use { side ->
                 side.write(
                     JSONObject()
@@ -531,7 +535,7 @@ class LocalRecorder(
                 aac.length() == 0L -> {
                     // A segment that never received a frame is noise in the folder; drop it with its sidecar.
                     aac.delete()
-                    File(d, "$base.json").delete()
+                    SegmentSync.deleteCompanions(d, base)
                 }
                 else -> {
                     verify(aac)

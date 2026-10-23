@@ -29,6 +29,12 @@ import kotlin.concurrent.withLock
  *    back in the queue; no answer leaves it alone.
  *
  * The owner's rule: when there is any doubt, keep the file (the 90-day retention still applies).
+ *
+ * Each recording goes to the bridge it was captured for, never to whatever is configured later: the
+ * capture run registers its endpoint and every segment gets a `X.dest` file naming it (see
+ * [registerEndpoint]). A recording captured over plain `ws://` is marked [DEST_NONE] and stays on the
+ * phone. Recordings from builds that wrote no `X.dest` are bound once, on first sight, to the
+ * endpoint saved first after the upgrade.
  */
 object SegmentSync {
     const val GRACE_MS = 7L * 24 * 60 * 60 * 1000
@@ -36,6 +42,11 @@ object SegmentSync {
     private const val REJECT_RETRY_MS = 24L * 60 * 60 * 1000
     private const val FILE_RETRY_MS = 10L * 60 * 1000  // a file the edge could not take right now
     const val CREDS = "sync_creds"
+    /** A recording with no encrypted destination (captured over `ws://`): it never leaves the phone. */
+    const val DEST_NONE = "none"
+    private const val DEFAULT_KEY = "default"
+    /** Recordings made before this moment, with no `X.dest`, may take the default; later ones never. */
+    private const val CUTOFF_KEY = "default_cutoff_ms"
     private const val STATE = "sync_state"
 
     /** Guards every rename/delete in the recordings folder (sync and retention). */
@@ -54,6 +65,9 @@ object SegmentSync {
         val expiredUnsynced: Int,
         val lastSuccessUtcMs: Long,
         val hasEndpoint: Boolean = true,
+        /** Captured with no encrypted destination: kept on the phone, never uploaded. */
+        val unroutable: Int = 0,
+        val oldestUnroutableMs: Long = 0,
     )
 
     /** Small persisted counters/timestamps; SharedPreferences in the app, a map in tests. */
@@ -88,6 +102,58 @@ object SegmentSync {
 
     fun isSynced(file: File): Boolean = file.name.endsWith(".synced.aac")
 
+    /** The small files that belong to a recording and go wherever it goes. */
+    private val COMPANIONS = listOf(".json", ".dest")
+
+    /** Deletes a recording's companions; call only once its audio is gone. */
+    fun deleteCompanions(dir: File, base: String) {
+        for (ext in COMPANIONS) File(dir, base + ext).delete()
+    }
+
+    /** Stable id of an endpoint: never the token itself, so `X.dest` files hold no secret. */
+    fun endpointId(wsBase: String, token: String): String =
+        sha256("${wsBase.trim()}\n${token.trim()}".toByteArray()).take(16)
+
+    /**
+     * The destination id recorded for [file]. A recording with none takes [legacyDefault] only if it
+     * was recorded before [legacyCutoffMs] (made by a build that wrote no `X.dest`); with [bind] the
+     * choice is written once and never changes. A newer recording that has lost its `X.dest` gets
+     * nothing: it waits rather than go to a bridge it may not have been captured for. Null = no
+     * usable destination.
+     */
+    fun destinationOf(
+        dir: File,
+        file: File,
+        legacyDefault: String?,
+        legacyCutoffMs: Long = Long.MAX_VALUE,
+        bind: Boolean = true,
+    ): String? {
+        val dest = File(dir, baseOf(file) + ".dest")
+        val id = try {
+            if (dest.exists()) dest.readText().trim() else null
+        } catch (e: IOException) {
+            return null
+        }
+        if (id != null) return id.takeIf { it.isNotEmpty() && it != DEST_NONE }
+        if (legacyDefault == null || recordedAtMs(dir, file) >= legacyCutoffMs) return null
+        if (bind) writeDest(dest, legacyDefault)
+        return legacyDefault
+    }
+
+    /** When a recording started: its sidecar's `utc_start_ms`, else the file's modification time. */
+    private fun recordedAtMs(dir: File, file: File): Long = try {
+        JSONObject(File(dir, baseOf(file) + ".json").readText()).getLong("utc_start_ms")
+    } catch (e: Exception) {
+        file.lastModified()
+    }
+
+    /** Writes and syncs a destination file; one write per recording, before any upload. */
+    fun writeDest(dest: File, id: String) {
+        java.io.FileOutputStream(dest).use { out ->
+            out.write(id.toByteArray())
+            out.fd.sync()
+        }
+    }
     fun sha256(data: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(data).joinToString("") { "%02x".format(it) }
 
@@ -103,19 +169,61 @@ object SegmentSync {
             .build()
     }
 
-    /** Saved whenever an endpoint is known (and kept after Stop) so sync can always finish. */
-    fun saveEndpoint(context: Context, wsBase: String, token: String) {
-        // Only an encrypted address is kept: sync carries whole recordings and the token.
-        if (token.isBlank() || !wsBase.trim().startsWith("wss://")) return
-        context.getSharedPreferences(CREDS, Context.MODE_PRIVATE).edit()
-            .putString("ws_base", wsBase.trim()).putString("token", token.trim()).apply()
+    /**
+     * Registers the endpoint a capture run streams to and returns the id its recordings are bound to,
+     * or [DEST_NONE] when it is not encrypted (recordings never leave the phone over `ws://`). The
+     * first endpoint registered after an upgrade also becomes the destination of older recordings
+     * that have none; it never changes after that, so a later address change cannot capture them.
+     */
+    fun registerEndpoint(context: Context, wsBase: String, token: String): String =
+        registerEndpoint(context.getSharedPreferences(CREDS, Context.MODE_PRIVATE), wsBase, token)
+
+    /** [registerEndpoint] against the credentials store itself (tests pass an in-memory one). */
+    fun registerEndpoint(p: android.content.SharedPreferences, wsBase: String, token: String): String {
+        adoptLegacyEndpoint(p)
+        val ep = httpBase(wsBase, token) ?: return DEST_NONE
+        val id = endpointId(wsBase, token)
+        val edit = p.edit().putString("ep:$id", ep)
+        if (p.getString(DEFAULT_KEY, null) == null) {
+            edit.putString(DEFAULT_KEY, id).putLong(CUTOFF_KEY, System.currentTimeMillis())
+        }
+        // Durable before any recording names it. Callers run on the main thread (onResume and
+        // startCapture), which is also what makes the check-then-set of the default race-free.
+        edit.commit()
+        return id
     }
 
-    fun hasEndpoint(context: Context): Boolean = endpoint(context) != null
+    /**
+     * Builds before per-recording destinations kept ONE endpoint (`ws_base` + `token`): that is where
+     * their recordings were going, so it becomes the default for them, ahead of anything newer. The
+     * old keys are then removed. Idempotent.
+     */
+    fun adoptLegacyEndpoint(p: android.content.SharedPreferences) {
+        val base = p.getString("ws_base", null) ?: return
+        val token = p.getString("token", null).orEmpty()
+        val edit = p.edit().remove("ws_base").remove("token")
+        val ep = httpBase(base, token)
+        if (ep != null && p.getString(DEFAULT_KEY, null) == null) {
+            val id = endpointId(base, token)
+            edit.putString("ep:$id", ep).putString(DEFAULT_KEY, id).putLong(CUTOFF_KEY, System.currentTimeMillis())
+        }
+        edit.commit()
+    }
 
-    private fun endpoint(context: Context): String? {
+    /** True once any encrypted endpoint is known (capture streams to one, or an older build saved one). */
+    fun hasEndpoint(context: Context): Boolean =
+        context.getSharedPreferences(CREDS, Context.MODE_PRIVATE).all.keys.any { it.startsWith("ep:") || it == "ws_base" }
+
+    /**
+     * Maps each recording to the https base of ITS destination; null = cannot be sent. With
+     * [bind] false (status reads) nothing is written.
+     */
+    private fun router(context: Context, dir: File, bind: Boolean = true): (File) -> String? {
         val p = context.getSharedPreferences(CREDS, Context.MODE_PRIVATE)
-        return httpBase(p.getString("ws_base", "").orEmpty(), p.getString("token", "").orEmpty())
+        if (bind) adoptLegacyEndpoint(p)
+        val legacyDefault = p.getString(DEFAULT_KEY, null)
+        val cutoff = p.getLong(CUTOFF_KEY, Long.MAX_VALUE)
+        return { f -> destinationOf(dir, f, legacyDefault, cutoff, bind)?.let { p.getString("ep:$it", null) } }
     }
 
     /**
@@ -142,16 +250,14 @@ object SegmentSync {
     /** One sync pass for the app. Returns true only when nothing closed is left unsynced. */
     fun runOnce(context: Context): Boolean {
         val dir = LocalRecorder.dir(context)
-        val ep = endpoint(context)
-        if (ep == null) return unsyncedClosed(dir).isEmpty()  // files waiting with no endpoint = not done
         val low = LocalRecorder.allocatableBytes(context, dir) < LocalRecorder.LOW_STORAGE_BYTES
-        return runPass(dir, ep, prefsState(context), low, defaultHttp, System::currentTimeMillis)
+        return runPass(dir, router(context, dir), prefsState(context), low, defaultHttp, System::currentTimeMillis)
     }
 
     // ── the pass (Context-free, tested against a fake edge) ─────────────────
     fun runPass(
         dir: File,
-        ep: String,
+        route: (File) -> String?,
         state: State,
         lowStorage: Boolean,
         http: OkHttpClient,
@@ -159,14 +265,20 @@ object SegmentSync {
     ): Boolean = passLock.withLock {
         migrateLegacyNames(dir)
         forgetStaleKeys(dir, state)
+        // An endpoint that gave no answer is skipped for the rest of the pass; the others go on.
+        val unreachable = HashSet<String>()
         var uploadedAny: Boolean
         do {  // files can close while we run; loop until a pass uploads nothing new
             uploadedAny = false
             for (f in waiting(dir, now())) {
                 if (f.length() == 0L) {
-                    folderLock.withLock { f.delete(); File(dir, baseOf(f) + ".json").delete() }
+                    folderLock.withLock { if (f.delete() || !f.exists()) deleteCompanions(dir, baseOf(f)) }
                     continue
                 }
+                val ep = route(f)
+                // No destination of its own: it waits. Never sent to whatever is configured now.
+                if (ep == null) continue
+                if (ep in unreachable) continue
                 val rejectedAt = state.getLong("rejected:" + f.name)
                 if (rejectedAt > 0 && now() - rejectedAt < REJECT_RETRY_MS) continue
                 val retryAt = state.getLong("retry:" + f.name)
@@ -181,8 +293,8 @@ object SegmentSync {
                     Outcome.REJECTED -> state.putLong("rejected:" + f.name, now())
                     // The edge answered but could not take this file now: skip it, keep going.
                     Outcome.RETRY_FILE -> state.putLong("retry:" + f.name, now() + FILE_RETRY_MS)
-                    // No answer at all (network, VPN, edge down): stop the pass, retry later.
-                    Outcome.RETRY_ALL -> return@withLock false
+                    // No answer at all (network, VPN, edge down): skip that edge, retry later.
+                    Outcome.RETRY_ALL -> unreachable.add(ep)
                 }
             }
         } while (uploadedAny)
@@ -191,12 +303,18 @@ object SegmentSync {
         var allDone = true
         for (f in dir.listFiles { x -> isSynced(x) }.orEmpty()) {
             if (!deleteDue(f.lastModified(), now(), lowStorage)) continue
+            // Asked only of the edge it was sent to: another edge's "yes" proves nothing.
+            val ep = route(f)
+            // No destination: nothing a retry can do, so it alone does not keep the job retrying;
+            // the copy stays under the 90-day rule. An edge that did not answer is worth a retry.
+            if (ep == null) continue
+            if (ep in unreachable) {
+                allDone = false
+                continue
+            }
             when (stillHeld(http, ep, f)) {
                 true -> folderLock.withLock {
-                    if (f.exists()) {
-                        f.delete()
-                        File(dir, baseOf(f) + ".json").delete()
-                    }
+                    if (f.exists() && f.delete()) deleteCompanions(dir, baseOf(f))
                 }
                 false -> folderLock.withLock {
                     // The edge no longer holds these bytes: back into the queue.
@@ -208,7 +326,8 @@ object SegmentSync {
         }
         // Not done while ANY closed file is unsynced, including one too fresh to touch this pass (the
         // final file at Stop): the caller retries shortly instead of waiting for the hourly pass.
-        allDone && unsyncedClosed(dir).isEmpty()
+        // A recording with no destination never can be, so it alone does not keep the job retrying.
+        allDone && unreachable.isEmpty() && unsyncedClosed(dir).all { route(it) == null }
     }
 
     private fun unsyncedClosed(dir: File): List<File> =
@@ -246,14 +365,17 @@ object SegmentSync {
                 if (target.exists()) continue  // never overwrite a recording
                 // Audio first: if that rename fails, nothing moved and the next pass tries again.
                 if (f.renameTo(target)) {
-                    File(dir, "$base.json").takeIf { it.exists() }?.renameTo(File(dir, "$fresh.json"))
+                    for (ext in COMPANIONS) {
+                        File(dir, base + ext).takeIf { it.exists() }?.renameTo(File(dir, fresh + ext))
+                    }
                 }
             }
-            for (side in dir.listFiles { x -> x.name.endsWith(".json") }.orEmpty()) {
+            for (side in dir.listFiles { x -> COMPANIONS.any { x.name.endsWith(it) } }.orEmpty()) {
                 val fresh = migratedBase(side.nameWithoutExtension) ?: continue
-                if (File(dir, "$fresh.json").exists()) continue
+                val target = File(dir, fresh + "." + side.extension)
+                if (target.exists()) continue
                 if (File(dir, "$fresh.aac").exists() || File(dir, "$fresh.synced.aac").exists()) {
-                    side.renameTo(File(dir, "$fresh.json"))
+                    side.renameTo(target)
                 }
             }
         }
@@ -320,16 +442,21 @@ object SegmentSync {
     fun status(context: Context, nowMs: Long = System.currentTimeMillis()): Status {
         val dir = LocalRecorder.dir(context)
         val files = dir.listFiles { f -> f.name.endsWith(".aac") }.orEmpty()
-        val waitingFiles = files.filter { !isSynced(it) && !LocalRecorder.isOpen(baseOf(it)) }
+        val route = router(context, dir, bind = false)
+        val (waitingFiles, unroutable) = files
+            .filter { !isSynced(it) && !LocalRecorder.isOpen(baseOf(it)) }
+            .partition { route(it) != null }
         val state = prefsState(context)
         return Status(
+            unroutable = unroutable.size,
+            oldestUnroutableMs = unroutable.maxOfOrNull { nowMs - it.lastModified() } ?: 0,
             waiting = waitingFiles.size,
             oldestWaitingMs = waitingFiles.maxOfOrNull { nowMs - it.lastModified() } ?: 0,
             synced = files.count { isSynced(it) },
             rejected = waitingFiles.count { state.getLong("rejected:" + it.name) > 0 },
             expiredUnsynced = state.getLong("expired_unsynced").toInt(),
             lastSuccessUtcMs = state.getLong("last_success"),
-            hasEndpoint = endpoint(context) != null,
+            hasEndpoint = hasEndpoint(context),
         )
     }
 

@@ -39,39 +39,8 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         } else {
             warnIfStuck(applicationContext)
         }
+        // (StuckCheckWorker raises the same alert when no network lets this job run at all.)
         if (done) Result.success() else Result.retry()
-    }
-
-    /** A recording that has not reached the edge for a day gets a loud alert, not just a status line. */
-    private fun warnIfStuck(context: Context) {
-        val s = SegmentSync.status(context)
-        if (s.waiting == 0 || s.oldestWaitingMs < STUCK_MS) return
-        val nm = context.getSystemService(NotificationManager::class.java) ?: return
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && nm.getNotificationChannel(CHANNEL) == null) {
-            nm.createNotificationChannel(
-                NotificationChannel(CHANNEL, "Recording sync problems", NotificationManager.IMPORTANCE_HIGH),
-            )
-        }
-        val open = PendingIntent.getActivity(
-            context, 19, Intent(context, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        val text = "${s.waiting} recording file(s) have not reached Genesis for over a day. " +
-            "They are safe on this phone. " +
-            if (s.hasEndpoint) "Check Tailscale, and set battery use to Unrestricted."
-            else "No secure (wss://) bridge address is saved: open the app and start a capture with one."
-        nm.notify(
-            NOTIF_ID,
-            NotificationCompat.Builder(context, CHANNEL)
-                .setSmallIcon(R.drawable.ic_mic)
-                .setContentTitle("Meeting recordings not synced")
-                .setContentText(text)
-                .setStyle(NotificationCompat.BigTextStyle().bigText(text))
-                .setContentIntent(open)
-                .setOnlyAlertOnce(true)
-                .setAutoCancel(true)
-                .build(),
-        )
     }
 
     companion object {
@@ -80,8 +49,37 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         private const val CHANNEL = "recording_sync"
         private const val NOTIF_ID = 7
         private const val PERIODIC = "segment-sync-hourly"
+        private const val STUCK_CHECK = "segment-sync-stuck-check"
 
         private val online = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
+
+        /** A recording that has not reached the edge for a day gets a loud alert, not just a status line. */
+        fun warnIfStuck(context: Context) {
+            val s = SegmentSync.status(context)
+            val text = stuckText(s) ?: return
+            val nm = context.getSystemService(NotificationManager::class.java) ?: return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && nm.getNotificationChannel(CHANNEL) == null) {
+                nm.createNotificationChannel(
+                    NotificationChannel(CHANNEL, "Recording sync problems", NotificationManager.IMPORTANCE_HIGH),
+                )
+            }
+            val open = PendingIntent.getActivity(
+                context, 19, Intent(context, MainActivity::class.java),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            nm.notify(
+                NOTIF_ID,
+                NotificationCompat.Builder(context, CHANNEL)
+                    .setSmallIcon(R.drawable.ic_mic)
+                    .setContentTitle("Meeting recordings not synced")
+                    .setContentText(text)
+                    .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                    .setContentIntent(open)
+                    .setOnlyAlertOnce(true)
+                    .setAutoCancel(true)
+                    .build(),
+            )
+        }
 
         /**
          * A sync pass now (a file closed, capture stopped, app opened). REPLACE restarts a job that is
@@ -104,11 +102,57 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
             }
         }
 
-        /** The hourly catch-up that survives restarts and reboots. Idempotent. */
+        /**
+         * The hourly catch-up that survives restarts and reboots, plus the stuck-recording check.
+         * The check has no network constraint: a phone offline for days is exactly when the alert
+         * matters, and the upload jobs never run then. Idempotent.
+         */
         fun schedule(context: Context) {
+            val wm = WorkManager.getInstance(context)
             val req = PeriodicWorkRequestBuilder<SyncWorker>(1, TimeUnit.HOURS).setConstraints(online).build()
-            WorkManager.getInstance(context)
-                .enqueueUniquePeriodicWork(PERIODIC, ExistingPeriodicWorkPolicy.KEEP, req)
+            wm.enqueueUniquePeriodicWork(PERIODIC, ExistingPeriodicWorkPolicy.KEEP, req)
+            val check = PeriodicWorkRequestBuilder<StuckCheckWorker>(STUCK_CHECK_HOURS, TimeUnit.HOURS).build()
+            wm.enqueueUniquePeriodicWork(STUCK_CHECK, ExistingPeriodicWorkPolicy.KEEP, check)
         }
+
+        /** Every 3 h, so a day-old recording is reported within about 27 h of capture. */
+        private const val STUCK_CHECK_HOURS = 3L
+
+        /** Clears the alert once nothing has been waiting for a day. */
+        fun clearIfNotStuck(context: Context) {
+            if (stuckText(SegmentSync.status(context)) == null) {
+                context.getSystemService(NotificationManager::class.java)?.cancel(NOTIF_ID)
+            }
+        }
+
+        /**
+         * The alert text, or null when nothing is stuck: a recording waiting over a day, or one with
+         * no secure destination (it will never sync) for over a day.
+         */
+        fun stuckText(s: SegmentSync.Status): String? {
+            val parts = mutableListOf<String>()
+            if (s.waiting > 0 && s.oldestWaitingMs >= STUCK_MS) {
+                parts += "${s.waiting} recording file(s) have not reached Genesis for over a day. " +
+                    "They are safe on this phone. Check Tailscale, and set battery use to Unrestricted."
+            }
+            if (s.unroutable > 0 && s.oldestUnroutableMs >= STUCK_MS) {
+                parts += "${s.unroutable} recording file(s) have no secure (wss://) destination and will " +
+                    "not sync. They stay on this phone for 90 days."
+            }
+            return parts.takeIf { it.isNotEmpty() }?.joinToString(" ")
+        }
+    }
+}
+
+/** Posts the stuck-recording alert on its own schedule, with no connectivity requirement. */
+class StuckCheckWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
+    override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+        try {
+            SyncWorker.warnIfStuck(applicationContext)
+            SyncWorker.clearIfNotStuck(applicationContext)
+        } catch (_: Exception) {
+            // A failed check retries at its next period; it never touches recordings.
+        }
+        Result.success()
     }
 }

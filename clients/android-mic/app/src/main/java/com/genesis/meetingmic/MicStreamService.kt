@@ -242,8 +242,9 @@ class MicStreamService : LifecycleService() {
         mic.start(SystemClock.elapsedRealtime())
         micGreenSinceMs = -1L
         // The local copy starts with capture and is independent of the connection.
-        localRecorder.start(runId, localMonitor.start(SystemClock.elapsedRealtime()), UUID.randomUUID().toString())
-        SegmentSync.saveEndpoint(this, base, token)
+        // The endpoint is registered before the first segment opens: each segment records it.
+        val dest = SegmentSync.registerEndpoint(this, base, token)
+        localRecorder.start(runId, localMonitor.start(SystemClock.elapsedRealtime()), UUID.randomUUID().toString(), dest)
         SyncWorker.schedule(this)
         ensureVpn()
         honestyActive = true

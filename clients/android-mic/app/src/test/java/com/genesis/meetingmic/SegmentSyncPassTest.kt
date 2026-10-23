@@ -53,7 +53,10 @@ class SegmentSyncPassTest {
         """{"status":"stored","sha256":"${SegmentSync.sha256(bytes)}","bytes":${bytes.size},"created":true}""",
     )
 
-    private fun pass(low: Boolean = false) = SegmentSync.runPass(dir, ep, state, low, http) { now }
+    /** Every file routes to the fake edge unless a test gives it its own route. */
+    private var route: (File) -> String? = { ep }
+
+    private fun pass(low: Boolean = false) = SegmentSync.runPass(dir, route, state, low, http) { now }
 
     @Test
     fun provenReceiptMarksTheFileSynced() {
@@ -158,5 +161,152 @@ class SegmentSyncPassTest {
         segment(a, byteArrayOf(1), ageMs = 1_000)
         assertFalse(pass())
         assertEquals(0, server.requestCount)
+    }
+
+    // ── each recording goes only to the bridge it was captured for ─────────
+
+    private fun destOf(f: File) = SegmentSync.destinationOf(dir, f, legacyDefault = null)
+
+    @Test
+    fun eachRecordingIsSentOnlyToItsOwnDestination() {
+        val one = byteArrayOf(1)
+        val two = byteArrayOf(2, 2)
+        segment(a, one)
+        segment(b, two)
+        File(dir, "$a.dest").writeText("first")
+        File(dir, "$b.dest").writeText("second")
+        val eps = mapOf("first" to server.url("/meeting/old").toString().trimEnd('/'), "second" to ep)
+        route = { f -> destOf(f)?.let { eps[it] } }
+        server.enqueue(stored(one))
+        server.enqueue(stored(two))
+        assertTrue(pass())
+        val paths = listOf(server.takeRequest().path!!, server.takeRequest().path!!)
+        assertTrue(paths.any { it.startsWith("/meeting/old/upload") && it.contains("name=$a") })
+        assertTrue(paths.any { it.startsWith("/meeting/tok/upload") && it.contains("name=$b") })
+    }
+
+    @Test
+    fun aRecordingWithNoSecureDestinationIsNeverSent() {
+        segment(a, byteArrayOf(1))
+        File(dir, "$a.dest").writeText(SegmentSync.DEST_NONE)
+        route = { f -> destOf(f)?.let { ep } }
+        assertTrue(pass())  // nothing a retry could change, so the job is not kept retrying
+        assertEquals(0, server.requestCount)
+        assertTrue(File(dir, "$a.aac").exists())
+    }
+
+    @Test
+    fun anUnreachableOldBridgeDoesNotHoldBackTheCurrentOne() {
+        val dead = MockWebServer().apply { start() }
+        val deadEp = dead.url("/meeting/old").toString().trimEnd('/')
+        dead.shutdown()
+        val two = byteArrayOf(2, 2)
+        segment(a, byteArrayOf(1))
+        segment(b, two)
+        route = { f -> if (f.name.startsWith(a)) deadEp else ep }
+        server.enqueue(stored(two))
+        assertFalse(pass())  // a is still waiting
+        assertTrue(File(dir, "$a.aac").exists())
+        assertTrue(File(dir, "$b.synced.aac").exists())
+    }
+
+    @Test
+    fun theStillHeldCheckAsksTheRecordingsOwnBridge() {
+        segment(a, byteArrayOf(5), synced = true, ageMs = SegmentSync.GRACE_MS + 1)
+        File(dir, "$a.dest").writeText("first")
+        route = { f -> destOf(f)?.let { server.url("/meeting/old").toString().trimEnd('/') } }
+        server.enqueue(MockResponse().setBody("""{"have":true}"""))
+        assertTrue(pass())
+        assertTrue(server.takeRequest().path!!.startsWith("/meeting/old/have"))
+        assertFalse(File(dir, "$a.synced.aac").exists())
+        assertFalse(File(dir, "$a.dest").exists())  // companions go with the audio
+        assertFalse(File(dir, "$a.json").exists())
+    }
+
+    @Test
+    fun anOlderRecordingIsBoundOnceAndNeverRedirected() {
+        val f = segment(a, byteArrayOf(1))
+        assertEquals("first", SegmentSync.destinationOf(dir, f, legacyDefault = "first"))
+        // The default changes later (a new bridge): the recording keeps its first destination.
+        assertEquals("first", SegmentSync.destinationOf(dir, f, legacyDefault = "second"))
+        assertEquals("first", File(dir, "$a.dest").readText())
+        // With no default yet, an unbound recording simply waits (and stays unbound).
+        val g = segment(b, byteArrayOf(2))
+        assertEquals(null, SegmentSync.destinationOf(dir, g, legacyDefault = null))
+        assertFalse(File(dir, "$b.dest").exists())
+    }
+
+    @Test
+    fun anEndpointIdNeverContainsTheToken() {
+        val id = SegmentSync.endpointId("wss://bridge.example.com/meeting/", "s3cretT0ken")
+        assertEquals(16, id.length)
+        assertFalse(id.contains("s3cret"))
+        assertEquals(id, SegmentSync.endpointId(" wss://bridge.example.com/meeting/ ", "s3cretT0ken "))
+    }
+
+    // ── review round: legacy adoption, cutoff, liveness, alert ──────────────
+
+    @Test
+    fun theOldBuildsEndpointBecomesTheBacklogsDefaultAheadOfANewBridge() {
+        val p = MemPrefs()
+        p.m["ws_base"] = "wss://old.example.com/meeting/"
+        p.m["token"] = "oldtok"
+        val newId = SegmentSync.registerEndpoint(p, "wss://new.example.com/meeting/", "newtok")
+        val oldId = SegmentSync.endpointId("wss://old.example.com/meeting/", "oldtok")
+        assertEquals(oldId, p.getString("default", null))  // where the backlog was really going
+        assertEquals("https://old.example.com/meeting/oldtok", p.getString("ep:$oldId", null))
+        assertEquals("https://new.example.com/meeting/newtok", p.getString("ep:$newId", null))
+        assertFalse(p.contains("ws_base") || p.contains("token"))  // no stray token left behind
+        SegmentSync.registerEndpoint(p, "wss://third.example.com/meeting/", "t3")
+        assertEquals(oldId, p.getString("default", null))  // set once, never moved
+    }
+
+    @Test
+    fun aNewRecordingThatLostItsDestinationIsNotGivenTheDefault() {
+        val f = segment(a, byteArrayOf(1))
+        File(dir, "$a.json").writeText("""{"v":1,"utc_start_ms":$now}""")
+        assertEquals(null, SegmentSync.destinationOf(dir, f, "first", legacyCutoffMs = now - 1))
+        assertFalse(File(dir, "$a.dest").exists())
+        val old = segment(b, byteArrayOf(2))
+        File(dir, "$b.json").writeText("""{"v":1,"utc_start_ms":${now - 86_400_000}}""")
+        assertEquals("first", SegmentSync.destinationOf(dir, old, "first", legacyCutoffMs = now - 1))
+    }
+
+    @Test
+    fun aStatusReadBindsNothing() {
+        val f = segment(a, byteArrayOf(1))
+        assertEquals("first", SegmentSync.destinationOf(dir, f, "first", bind = false))
+        assertFalse(File(dir, "$a.dest").exists())
+    }
+
+    @Test
+    fun aSyncedFileWithNoDestinationDoesNotKeepTheJobRetrying() {
+        segment(a, byteArrayOf(5), synced = true, ageMs = SegmentSync.GRACE_MS + 1)
+        route = { null }
+        assertTrue(pass())
+        assertTrue(File(dir, "$a.synced.aac").exists())  // kept, under the 90-day rule
+        assertEquals(0, server.requestCount)
+    }
+
+    @Test
+    fun recordingsThatCanNeverSyncRaiseTheAlertAfterADay() {
+        val day = 24L * 60 * 60 * 1000
+        val quiet = SegmentSync.Status(0, 0, 0, 0, 0, 0, unroutable = 2, oldestUnroutableMs = day - 1)
+        assertEquals(null, SyncWorker.stuckText(quiet))
+        val stuck = quiet.copy(oldestUnroutableMs = day)
+        assertTrue(SyncWorker.stuckText(stuck)!!.contains("no secure (wss://) destination"))
+        val waiting = SegmentSync.Status(3, day, 0, 0, 0, 0)
+        assertTrue(SyncWorker.stuckText(waiting)!!.contains("not reached Genesis"))
+    }
+
+    @Test
+    fun anInterruptedMigrationReunitesTheDestinationToo() {
+        val old = "seg_20261021T182322_r1_s0"
+        val fresh = SegmentSync.migratedBase(old)!!
+        File(dir, "$fresh.aac").writeBytes(byteArrayOf(1))
+        File(dir, "$old.dest").writeText("first")
+        SegmentSync.migrateLegacyNames(dir)
+        assertEquals("first", File(dir, "$fresh.dest").readText())
+        assertFalse(File(dir, "$old.dest").exists())
     }
 }

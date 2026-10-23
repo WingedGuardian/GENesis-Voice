@@ -115,8 +115,8 @@ class MainActivity : AppCompatActivity() {
         // Retention runs on every app open as well as at each capture start, so old recordings are
         // removed even between meetings.
         refreshStorageSummary(purgeFirst = true)
-        // An install upgraded with a backlog has never saved a sync endpoint: use the last capture's
-        // settings, else the configured ones.
+        // An install upgraded with a backlog has never registered a sync endpoint: register the last
+        // capture's settings, else the configured ones. It becomes the destination of the backlog.
         if (!SegmentSync.hasEndpoint(applicationContext)) {
             val p = getSharedPreferences(MicStreamService.PREFS, MODE_PRIVATE)
             val candidates = listOf(
@@ -124,7 +124,7 @@ class MainActivity : AppCompatActivity() {
                 b.wsUrl.text.toString() to b.token.text.toString(),
             )
             candidates.firstOrNull { (url, token) -> SegmentSync.httpBase(url, token) != null }
-                ?.let { (url, token) -> SegmentSync.saveEndpoint(applicationContext, url, token) }
+                ?.let { (url, token) -> SegmentSync.registerEndpoint(applicationContext, url, token) }
         }
         SyncWorker.schedule(applicationContext)
         SyncWorker.kick(applicationContext)
@@ -230,8 +230,10 @@ class MainActivity : AppCompatActivity() {
         if (s.synced > 0) parts += "${s.synced} confirmed on Genesis (phone copy kept 7 days, then re-checked)"
         if (s.rejected > 0) parts += "⚠ ${s.rejected} refused by Genesis, kept on phone"
         if (s.expiredUnsynced > 0) parts += "⚠ ${s.expiredUnsynced} expired before syncing"
-        if (s.waiting > 0 && !s.hasEndpoint) parts += "⚠ No secure (wss://) bridge address saved: files wait on this phone"
-        if (s.waiting > 0 && hours >= 24 && s.hasEndpoint) parts += "⚠ Check Tailscale, and set battery to Unrestricted"
+        if (s.unroutable > 0) {
+            parts += "⚠ ${s.unroutable} file(s) have no secure (wss://) destination: kept on this phone, not synced"
+        }
+        if (s.waiting > 0 && hours >= 24) parts += "⚠ Check Tailscale, and set battery to Unrestricted"
         return parts.joinToString("\n")
     }
 
