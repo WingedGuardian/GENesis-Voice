@@ -110,9 +110,13 @@ object SegmentSync {
         for (ext in COMPANIONS) File(dir, base + ext).delete()
     }
 
-    /** Stable id of an endpoint: never the token itself, so `X.dest` files hold no secret. */
-    fun endpointId(wsBase: String, token: String): String =
-        sha256("${wsBase.trim()}\n${token.trim()}".toByteArray()).take(16)
+    /**
+     * Stable id of a bridge: its address only. A new token for the same address is the same server,
+     * so recordings waiting for it follow the new token ([registerEndpoint] overwrites it); a
+     * different address is a different id and never receives them. Holds no secret.
+     */
+    fun endpointId(wsBase: String): String =
+        sha256(wsBase.trim().trimEnd('/').toByteArray()).take(16)
 
     /**
      * The destination id recorded for [file]. A recording with none takes [legacyDefault] only if it
@@ -182,7 +186,7 @@ object SegmentSync {
     fun registerEndpoint(p: android.content.SharedPreferences, wsBase: String, token: String): String {
         adoptLegacyEndpoint(p)
         val ep = httpBase(wsBase, token) ?: return DEST_NONE
-        val id = endpointId(wsBase, token)
+        val id = endpointId(wsBase)
         val edit = p.edit().putString("ep:$id", ep)
         if (p.getString(DEFAULT_KEY, null) == null) {
             edit.putString(DEFAULT_KEY, id).putLong(CUTOFF_KEY, System.currentTimeMillis())
@@ -204,7 +208,7 @@ object SegmentSync {
         val edit = p.edit().remove("ws_base").remove("token")
         val ep = httpBase(base, token)
         if (ep != null && p.getString(DEFAULT_KEY, null) == null) {
-            val id = endpointId(base, token)
+            val id = endpointId(base)
             edit.putString("ep:$id", ep).putString(DEFAULT_KEY, id).putLong(CUTOFF_KEY, System.currentTimeMillis())
         }
         edit.commit()

@@ -237,11 +237,11 @@ class SegmentSyncPassTest {
     }
 
     @Test
-    fun anEndpointIdNeverContainsTheToken() {
-        val id = SegmentSync.endpointId("wss://bridge.example.com/meeting/", "s3cretT0ken")
+    fun anEndpointIdIsTheBridgeAddressOnly() {
+        val id = SegmentSync.endpointId("wss://bridge.example.com/meeting/")
         assertEquals(16, id.length)
-        assertFalse(id.contains("s3cret"))
-        assertEquals(id, SegmentSync.endpointId(" wss://bridge.example.com/meeting/ ", "s3cretT0ken "))
+        assertEquals(id, SegmentSync.endpointId(" wss://bridge.example.com/meeting "))
+        assertFalse(id == SegmentSync.endpointId("wss://other.example.com/meeting/"))
     }
 
     // ── review round: legacy adoption, cutoff, liveness, alert ──────────────
@@ -252,7 +252,7 @@ class SegmentSyncPassTest {
         p.m["ws_base"] = "wss://old.example.com/meeting/"
         p.m["token"] = "oldtok"
         val newId = SegmentSync.registerEndpoint(p, "wss://new.example.com/meeting/", "newtok")
-        val oldId = SegmentSync.endpointId("wss://old.example.com/meeting/", "oldtok")
+        val oldId = SegmentSync.endpointId("wss://old.example.com/meeting/")
         assertEquals(oldId, p.getString("default", null))  // where the backlog was really going
         assertEquals("https://old.example.com/meeting/oldtok", p.getString("ep:$oldId", null))
         assertEquals("https://new.example.com/meeting/newtok", p.getString("ep:$newId", null))
@@ -308,5 +308,17 @@ class SegmentSyncPassTest {
         SegmentSync.migrateLegacyNames(dir)
         assertEquals("first", File(dir, "$fresh.dest").readText())
         assertFalse(File(dir, "$old.dest").exists())
+    }
+
+    @Test
+    fun aNewTokenForTheSameBridgeCarriesTheWaitingRecordingsOver() {
+        val p = MemPrefs()
+        val url = "wss://bridge.example.com/meeting/"
+        val before = SegmentSync.registerEndpoint(p, url, "oldtok")
+        val after = SegmentSync.registerEndpoint(p, url, "newtok")
+        assertEquals(before, after)  // recordings bound to it keep the same destination ...
+        assertEquals("https://bridge.example.com/meeting/newtok", p.getString("ep:$after", null))  // ... with the new token
+        val other = SegmentSync.registerEndpoint(p, "wss://other.example.com/meeting/", "newtok")
+        assertFalse(other == after)  // a different address never receives them
     }
 }
