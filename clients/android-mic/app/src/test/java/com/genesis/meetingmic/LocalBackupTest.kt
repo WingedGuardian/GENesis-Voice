@@ -47,7 +47,7 @@ class LocalBackupTest {
         assertEquals(listOf(0), Adts.frameOffsets(data))
     }
 
-    // ── retention (owner rule: 90 days; 45 when storage is low; never newer than 45) ──
+    // ── retention (owner rule: keep 90 days; under pressure only copies the edge holds go early) ──
     private val day = RetentionPolicy.DAY_MS
     private val now = 1_000L * day
     private val segs = listOf(
@@ -55,28 +55,125 @@ class LocalBackupTest {
         RetentionPolicy.Segment("d60", now - 60 * day),
         RetentionPolicy.Segment("d44", now - 44 * day),
         RetentionPolicy.Segment("today", now - 1000),
+        RetentionPolicy.Segment("held30", now - 30 * day, synced = true),
+        RetentionPolicy.Segment("held5", now - 5 * day, synced = true),
+        RetentionPolicy.Segment("rechecked20", now - 20 * day, synced = true, checked = true),
     )
 
-    @Test
-    fun normallyOnlyOlderThan90DaysGo() {
-        assertEquals(listOf("d100"), RetentionPolicy.toDelete(segs, now, lowStorage = false).map { it.id })
+    /** Runs the sweep with room appearing after [roomAfter] removals; returns what it removed. */
+    private fun sweep(roomAfter: Int): List<String> {
+        val gone = mutableListOf<String>()
+        RetentionPolicy.sweep(segs, now, hasRoom = { gone.size >= roomAfter }) { gone += it.id }
+        return gone
     }
 
     @Test
-    fun lowStorageAlsoRemovesOlderThan45Days() {
-        assertEquals(listOf("d100", "d60"), RetentionPolicy.toDelete(segs, now, lowStorage = true).map { it.id })
+    fun withRoomOnlyOlderThan90DaysGoEvenIfTheEdgeHoldsACopy() {
+        assertEquals(listOf("d100"), sweep(roomAfter = 0))
     }
 
     @Test
-    fun nothingNewerThan45DaysIsEverDeleted() {
-        val kept = RetentionPolicy.toDelete(segs, now, lowStorage = true).map { it.id }
-        assertTrue("d44" !in kept && "today" !in kept)
+    fun underPressureReconfirmedCopiesGoFirstThenOtherHeldCopies() {
+        assertEquals(
+            listOf("rechecked20", "held30", "held5"),
+            RetentionPolicy.underPressure(segs, now).map { it.id },
+        )
+    }
+
+    @Test
+    fun underPressureTheSweepStopsOnceThereIsRoom() {
+        assertEquals(listOf("d100", "rechecked20"), sweep(roomAfter = 2))
+    }
+
+    @Test
+    fun theOnlyCopyIsNeverDeletedEarlyHoweverFullThePhoneIs() {
+        val gone = sweep(roomAfter = Int.MAX_VALUE)
+        assertEquals(listOf("d100", "rechecked20", "held30", "held5"), gone)
+        assertTrue("d60" !in gone && "d44" !in gone && "today" !in gone)
     }
 
     @Test
     fun exactly90DaysIsKept() {
-        val edge = listOf(RetentionPolicy.Segment("edge", now - 90 * day))
-        assertTrue(RetentionPolicy.toDelete(edge, now, lowStorage = false).isEmpty())
+        val edge = listOf(RetentionPolicy.Segment("edge", now - 90 * day, synced = true))
+        assertTrue(RetentionPolicy.expired(edge, now).isEmpty())
+    }
+
+    // ── purge on a real folder ──
+    private fun recording(dir: java.io.File, base: String, ageDays: Long, synced: Boolean): java.io.File {
+        val start = System.currentTimeMillis() - ageDays * day
+        java.io.File(dir, "$base.json").writeText("""{"v":1,"utc_start_ms":$start}""")
+        java.io.File(dir, "$base.dest").writeText("first")
+        return java.io.File(dir, base + if (synced) ".synced.aac" else ".aac").apply { writeBytes(byteArrayOf(1)) }
+    }
+
+    @Test
+    fun underPressurePurgeRemovesHeldCopiesWithTheirCompanionsAndKeepsTheOnlyCopy() {
+        val dir = java.nio.file.Files.createTempDirectory("purge").toFile()
+        try {
+            recording(dir, "seg_held", ageDays = 3, synced = true)
+            java.io.File(dir, "seg_held.checked").writeText("")
+            recording(dir, "seg_only", ageDays = 80, synced = false)
+            val r = LocalRecorder.purgeDir(dir, System.currentTimeMillis()) { false }
+            assertEquals(1, r.removed)
+            assertEquals(0, r.expiredUnsynced)
+            assertEquals(listOf("seg_only.aac", "seg_only.dest", "seg_only.json"), dir.list()!!.sorted())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun aHeldCopyTheEdgeDisownsMidPurgeIsNotDeleted() {
+        val dir = java.nio.file.Files.createTempDirectory("purge").toFile()
+        try {
+            val held = recording(dir, "seg_a", ageDays = 3, synced = true)
+            // The sync pass re-queues it between purge's listing and its delete.
+            val r = LocalRecorder.purgeDir(dir, System.currentTimeMillis()) {
+                held.renameTo(java.io.File(dir, "seg_a.aac"))
+                false
+            }
+            assertEquals(0, r.removed)
+            assertTrue(java.io.File(dir, "seg_a.aac").exists())
+            assertTrue(java.io.File(dir, "seg_a.json").exists())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun purgeLeavesARecordingAloneWhileItsEdgeCopyIsBeingRechecked() {
+        val dir = java.nio.file.Files.createTempDirectory("purge").toFile()
+        try {
+            recording(dir, "seg_v", ageDays = 3, synced = true)
+            SegmentSync.verifying.add("seg_v")
+            val r = LocalRecorder.purgeDir(dir, System.currentTimeMillis()) { false }
+            assertEquals(0, r.removed)
+            assertTrue(java.io.File(dir, "seg_v.synced.aac").exists())
+        } finally {
+            SegmentSync.verifying.remove("seg_v")
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun anExpiredUnsyncedRecordingIsCountedAsLost() {
+        val dir = java.nio.file.Files.createTempDirectory("purge").toFile()
+        try {
+            recording(dir, "seg_old", ageDays = 91, synced = false)
+            val r = LocalRecorder.purgeDir(dir, System.currentTimeMillis()) { true }
+            assertEquals(1, r.removed)
+            assertEquals(1, r.expiredUnsynced)
+            assertTrue(dir.list()!!.isEmpty())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun aHeldCopyPast90DaysExpiresAndIsNotAlsoAPressureCandidate() {
+        val old = listOf(RetentionPolicy.Segment("old", now - 91 * day, synced = true))
+        assertEquals(listOf("old"), RetentionPolicy.expired(old, now).map { it.id })
+        assertTrue(RetentionPolicy.underPressure(old, now).isEmpty())
     }
 
     // ── local-backup signal (fail-closed) ──────────────────────────────────

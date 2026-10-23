@@ -49,13 +49,12 @@ class SegmentSyncTest {
         }
     }
 
-    // ── deletion only after the grace period (sooner only when storage is low) ──
+    // ── the edge is asked again a week after confirmation ──
     @Test
-    fun deletionWaitsForTheGracePeriod() {
+    fun theRecheckWaitsAWeek() {
         val now = 100L * 24 * 60 * 60 * 1000
-        assertFalse(SegmentSync.deleteDue(now - SegmentSync.GRACE_MS + 1, now, lowStorage = false))
-        assertTrue(SegmentSync.deleteDue(now - SegmentSync.GRACE_MS, now, lowStorage = false))
-        assertTrue(SegmentSync.deleteDue(now - 1000, now, lowStorage = true))
+        assertFalse(SegmentSync.recheckDue(now - SegmentSync.RECHECK_MS + 1, now))
+        assertTrue(SegmentSync.recheckDue(now - SegmentSync.RECHECK_MS, now))
     }
 
     @Test

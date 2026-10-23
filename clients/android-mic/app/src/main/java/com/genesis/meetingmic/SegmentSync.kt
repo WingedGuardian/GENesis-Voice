@@ -16,7 +16,8 @@ import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
 /**
- * Mirrors every closed local recording to the edge, and deletes the phone copy only on proof.
+ * Mirrors every closed local recording to the edge. It never deletes a recording: the phone keeps
+ * every copy for 90 days, and only [LocalRecorder.purge] removes them (see [RetentionPolicy]).
  *
  * The recordings folder IS the queue: `X.aac` is waiting, `X.synced.aac` is held by the edge. No
  * other state can drift from the files. One pass ([runPass]):
@@ -24,11 +25,11 @@ import kotlin.concurrent.withLock
  * 1. Upload each waiting, closed file. The edge answers `stored` only after writing the bytes,
  *    re-reading them from disk and re-hashing them; the file becomes `X.synced.aac` only when that
  *    hash AND length equal the phone's own. Anything else leaves it waiting.
- * 2. For a synced file past the grace period (or sooner when storage is low), ask the edge again
- *    whether it still holds those exact bytes. Only a yes deletes the phone copy; a no puts the file
- *    back in the queue; no answer leaves it alone.
+ * 2. A week after confirmation, ask the edge once more whether it still holds those exact bytes. A
+ *    yes leaves an `X.checked` mark and the phone copy stays; a no puts the file back in the queue;
+ *    no answer means asking again on a later pass.
  *
- * The owner's rule: when there is any doubt, keep the file (the 90-day retention still applies).
+ * The owner's rule: when there is any doubt, keep the file.
  *
  * Each recording goes to the bridge it was captured for, never to whatever is configured later: the
  * capture run registers its endpoint and every segment gets a `X.dest` file naming it (see
@@ -37,7 +38,7 @@ import kotlin.concurrent.withLock
  * endpoint saved first after the upgrade.
  */
 object SegmentSync {
-    const val GRACE_MS = 7L * 24 * 60 * 60 * 1000
+    const val RECHECK_MS = 7L * 24 * 60 * 60 * 1000
     private const val SETTLE_MS = 10_000L          // never touch a file modified this recently
     private const val REJECT_RETRY_MS = 24L * 60 * 60 * 1000
     private const val FILE_RETRY_MS = 10L * 60 * 1000  // a file the edge could not take right now
@@ -52,6 +53,12 @@ object SegmentSync {
 
     /** Guards every rename/delete in the recordings folder (sync and retention). */
     val folderLock = ReentrantLock()
+
+    /**
+     * Recordings whose edge copy is being re-checked right now. Retention never deletes one: if the
+     * edge answers "no", the phone copy is the only one left.
+     */
+    val verifying: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
     /** One pass at a time in this process, whichever job or kick started it. */
     private val passLock = ReentrantLock()
@@ -95,16 +102,18 @@ object SegmentSync {
         else -> Outcome.REJECTED
     }
 
-    fun deleteDue(syncedAtMs: Long, nowMs: Long, lowStorage: Boolean): Boolean =
-        lowStorage || nowMs - syncedAtMs >= GRACE_MS
+    fun recheckDue(syncedAtMs: Long, nowMs: Long): Boolean = nowMs - syncedAtMs >= RECHECK_MS
 
     /** `seg_x.synced.aac` and `seg_x.aac` share the base `seg_x` (and its sidecar `seg_x.json`). */
     fun baseOf(file: File): String = file.name.removeSuffix(".aac").removeSuffix(".synced")
 
     fun isSynced(file: File): Boolean = file.name.endsWith(".synced.aac")
 
-    /** The small files that belong to a recording and go wherever it goes. */
-    private val COMPANIONS = listOf(".json", ".dest")
+    /**
+     * The small files that belong to a recording and go wherever it goes: its sidecar, its
+     * destination, and the mark that the edge re-confirmed it a week after the upload.
+     */
+    val COMPANIONS = listOf(".json", ".dest", ".checked")
 
     /** Deletes a recording's companions; call only once its audio is gone. */
     fun deleteCompanions(dir: File, base: String) {
@@ -168,6 +177,9 @@ object SegmentSync {
             .connectTimeout(15, TimeUnit.SECONDS)
             .writeTimeout(60, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
+            // Bounds a whole call, so an edge that trickles bytes can never hold a re-check claim (or
+            // a pass) open indefinitely; generous enough for a segment upload on a slow link.
+            .callTimeout(10, TimeUnit.MINUTES)
             // A redirect could point the recording at a plain http address: never follow one.
             .followRedirects(false)
             .followSslRedirects(false)
@@ -266,8 +278,7 @@ object SegmentSync {
     /** One sync pass for the app. Returns true only when nothing closed is left unsynced. */
     fun runOnce(context: Context): Boolean {
         val dir = LocalRecorder.dir(context)
-        val low = LocalRecorder.allocatableBytes(context, dir) < LocalRecorder.LOW_STORAGE_BYTES
-        return runPass(dir, router(context, dir), prefsState(context), low, defaultHttp, System::currentTimeMillis)
+        return runPass(dir, router(context, dir), prefsState(context), defaultHttp, System::currentTimeMillis)
     }
 
     // ── the pass (Context-free, tested against a fake edge) ─────────────────
@@ -275,7 +286,6 @@ object SegmentSync {
         dir: File,
         route: (File) -> String?,
         state: State,
-        lowStorage: Boolean,
         http: OkHttpClient,
         now: () -> Long,
     ): Boolean = passLock.withLock {
@@ -315,29 +325,42 @@ object SegmentSync {
             }
         } while (uploadedAny)
 
-        // Synced files past their grace period: re-verify, then delete or re-queue.
+        // Synced files a week past confirmation: re-verify once; a no re-queues. Nothing is deleted.
         var allDone = true
         for (f in dir.listFiles { x -> isSynced(x) }.orEmpty()) {
-            if (!deleteDue(f.lastModified(), now(), lowStorage)) continue
+            val mark = File(dir, baseOf(f) + ".checked")
+            if (mark.exists()) continue
+            if (!recheckDue(f.lastModified(), now())) continue
             // Asked only of the edge it was sent to: another edge's "yes" proves nothing.
             val ep = route(f)
-            // No destination: nothing a retry can do, so it alone does not keep the job retrying;
-            // the copy stays under the 90-day rule. An edge that did not answer is worth a retry.
+            // No destination: nothing a retry can do, so it alone does not keep the job retrying.
+            // An edge that did not answer is worth a retry.
             if (ep == null) continue
             if (ep in unreachable) {
                 allDone = false
                 continue
             }
-            when (stillHeld(http, ep, f)) {
-                true -> folderLock.withLock {
-                    if (f.exists() && f.delete()) deleteCompanions(dir, baseOf(f))
+            // Claimed under the lock: a purge either removed the file first (it is skipped here) or sees
+            // the claim and leaves the file alone until the answer has been acted on.
+            val base = baseOf(f)
+            val claimed = folderLock.withLock { f.exists() && verifying.add(base) }
+            if (!claimed) continue
+            try {
+                when (stillHeld(http, ep, f)) {
+                    true -> folderLock.withLock {
+                        // Only beside audio that is still there, so no mark outlives its recording. A mark
+                        // that cannot be written just means asking again on a later pass.
+                        if (f.exists()) try { mark.createNewFile() } catch (e: IOException) {}
+                    }
+                    false -> folderLock.withLock {
+                        // The edge no longer holds these bytes: back into the queue.
+                        if (f.exists()) f.renameTo(File(dir, baseOf(f) + ".aac"))
+                        allDone = false
+                    }
+                    null -> allDone = false
                 }
-                false -> folderLock.withLock {
-                    // The edge no longer holds these bytes: back into the queue.
-                    if (f.exists()) f.renameTo(File(dir, baseOf(f) + ".aac"))
-                    allDone = false
-                }
-                null -> allDone = false
+            } finally {
+                verifying.remove(base)
             }
         }
         // Not done while ANY closed file is unsynced, including one too fresh to touch this pass (the
@@ -437,7 +460,7 @@ object SegmentSync {
         return folderLock.withLock {
             val synced = File(dir, "$base.synced.aac")
             if (f.exists() && f.length() == data.size.toLong() && f.renameTo(synced)) {
-                synced.setLastModified(nowMs)  // the grace period counts from confirmation
+                synced.setLastModified(nowMs)  // the week before the re-check counts from confirmation
                 Outcome.CONFIRMED
             } else {
                 Outcome.RETRY_FILE

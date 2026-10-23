@@ -41,8 +41,8 @@ android {
         // recordings live; on older releases an app with storage permission could.
         minSdk = 30
         targetSdk = 34
-        versionCode = 6
-        versionName = "0.6.0"
+        versionCode = 7
+        versionName = "0.6.1"
 
         // Surfaced to Kotlin as BuildConfig.MEETING_WS_URL / MEETING_TOKEN.
         buildConfigField("String", "MEETING_WS_URL", "\"$meetingWsUrl\"")

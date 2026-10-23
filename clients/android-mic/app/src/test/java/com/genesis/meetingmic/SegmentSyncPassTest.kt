@@ -13,7 +13,7 @@ import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.TimeUnit
 
-/** The sync pass against a fake edge: deletion only ever follows proof. */
+/** The sync pass against a fake edge: it marks, re-queues and keeps, but never deletes a recording. */
 class SegmentSyncPassTest {
     private lateinit var server: MockWebServer
     private lateinit var dir: File
@@ -56,7 +56,7 @@ class SegmentSyncPassTest {
     /** Every file routes to the fake edge unless a test gives it its own route. */
     private var route: (File) -> String? = { ep }
 
-    private fun pass(low: Boolean = false) = SegmentSync.runPass(dir, route, state, low, http) { now }
+    private fun pass() = SegmentSync.runPass(dir, route, state, http) { now }
 
     @Test
     fun provenReceiptMarksTheFileSynced() {
@@ -111,18 +111,21 @@ class SegmentSyncPassTest {
     }
 
     @Test
-    fun pastGraceAndStillHeldDeletesThePhoneCopy() {
-        segment(a, byteArrayOf(5), synced = true, ageMs = SegmentSync.GRACE_MS + 1)
+    fun aWeekOnAndStillHeldKeepsThePhoneCopyAndAsksOnlyOnce() {
+        segment(a, byteArrayOf(5), synced = true, ageMs = SegmentSync.RECHECK_MS + 1)
         server.enqueue(MockResponse().setBody("""{"have":true}"""))
         assertTrue(pass())
-        assertFalse(File(dir, "$a.synced.aac").exists())
-        assertFalse(File(dir, "$a.json").exists())
+        assertTrue(File(dir, "$a.synced.aac").exists())  // kept for the full 90 days
+        assertTrue(File(dir, "$a.json").exists())
+        assertTrue(File(dir, "$a.checked").exists())
         assertTrue(server.takeRequest().path!!.startsWith("/meeting/tok/have"))
+        assertTrue(pass())
+        assertEquals(1, server.requestCount)  // the mark means it is not asked again
     }
 
     @Test
-    fun pastGraceButNoLongerHeldGoesBackToTheQueue() {
-        segment(a, byteArrayOf(5), synced = true, ageMs = SegmentSync.GRACE_MS + 1)
+    fun aWeekOnButNoLongerHeldGoesBackToTheQueue() {
+        segment(a, byteArrayOf(5), synced = true, ageMs = SegmentSync.RECHECK_MS + 1)
         server.enqueue(MockResponse().setBody("""{"have":false}"""))
         assertFalse(pass())
         assertTrue(File(dir, "$a.aac").exists())
@@ -130,30 +133,23 @@ class SegmentSyncPassTest {
     }
 
     @Test
-    fun anUnclearAnswerKeepsTheSyncedFile() {
-        segment(a, byteArrayOf(5), synced = true, ageMs = SegmentSync.GRACE_MS + 1)
+    fun anUnclearAnswerKeepsTheSyncedFileAndAsksAgain() {
+        segment(a, byteArrayOf(5), synced = true, ageMs = SegmentSync.RECHECK_MS + 1)
         server.enqueue(MockResponse().setResponseCode(500))
         assertFalse(pass())
         assertTrue(File(dir, "$a.synced.aac").exists())
         server.enqueue(MockResponse().setBody("""{"something":"else"}"""))
         assertFalse(pass())
         assertTrue(File(dir, "$a.synced.aac").exists())
+        assertFalse(File(dir, "$a.checked").exists())
     }
 
     @Test
-    fun withinGraceNothingIsAskedOrDeleted() {
+    fun withinAWeekNothingIsAsked() {
         segment(a, byteArrayOf(5), synced = true, ageMs = 60_000)
         assertTrue(pass())
         assertTrue(File(dir, "$a.synced.aac").exists())
         assertEquals(0, server.requestCount)
-    }
-
-    @Test
-    fun lowStorageVerifiesAndFreesEarly() {
-        segment(a, byteArrayOf(5), synced = true, ageMs = 60_000)
-        server.enqueue(MockResponse().setBody("""{"have":true}"""))
-        assertTrue(pass(low = true))
-        assertFalse(File(dir, "$a.synced.aac").exists())
     }
 
     @Test
@@ -212,15 +208,14 @@ class SegmentSyncPassTest {
 
     @Test
     fun theStillHeldCheckAsksTheRecordingsOwnBridge() {
-        segment(a, byteArrayOf(5), synced = true, ageMs = SegmentSync.GRACE_MS + 1)
+        segment(a, byteArrayOf(5), synced = true, ageMs = SegmentSync.RECHECK_MS + 1)
         File(dir, "$a.dest").writeText("first")
         route = { f -> destOf(f)?.let { server.url("/meeting/old").toString().trimEnd('/') } }
         server.enqueue(MockResponse().setBody("""{"have":true}"""))
         assertTrue(pass())
         assertTrue(server.takeRequest().path!!.startsWith("/meeting/old/have"))
-        assertFalse(File(dir, "$a.synced.aac").exists())
-        assertFalse(File(dir, "$a.dest").exists())  // companions go with the audio
-        assertFalse(File(dir, "$a.json").exists())
+        assertTrue(File(dir, "$a.synced.aac").exists())
+        assertTrue(File(dir, "$a.dest").exists())
     }
 
     @Test
@@ -281,7 +276,7 @@ class SegmentSyncPassTest {
 
     @Test
     fun aSyncedFileWithNoDestinationDoesNotKeepTheJobRetrying() {
-        segment(a, byteArrayOf(5), synced = true, ageMs = SegmentSync.GRACE_MS + 1)
+        segment(a, byteArrayOf(5), synced = true, ageMs = SegmentSync.RECHECK_MS + 1)
         route = { null }
         assertTrue(pass())
         assertTrue(File(dir, "$a.synced.aac").exists())  // kept, under the 90-day rule
@@ -305,9 +300,22 @@ class SegmentSyncPassTest {
         val fresh = SegmentSync.migratedBase(old)!!
         File(dir, "$fresh.aac").writeBytes(byteArrayOf(1))
         File(dir, "$old.dest").writeText("first")
+        File(dir, "$old.checked").writeText("")
         SegmentSync.migrateLegacyNames(dir)
         assertEquals("first", File(dir, "$fresh.dest").readText())
         assertFalse(File(dir, "$old.dest").exists())
+        assertTrue(File(dir, "$fresh.checked").exists())
+        assertFalse(File(dir, "$old.checked").exists())
+    }
+
+    @Test
+    fun deletingARecordingTakesItsCheckedMarkToo() {
+        segment(a, byteArrayOf(5), synced = true)
+        File(dir, "$a.checked").writeText("")
+        File(dir, "$a.synced.aac").delete()
+        SegmentSync.deleteCompanions(dir, a)
+        assertFalse(File(dir, "$a.checked").exists())
+        assertFalse(File(dir, "$a.json").exists())
     }
 
     @Test
@@ -368,5 +376,21 @@ class SegmentSyncPassTest {
         assertTrue(pass())
         assertTrue(File(dir, "$a.synced.aac").exists())
         assertFalse(server.takeRequest().path!!.contains("meta="))
+    }
+
+    @Test
+    fun aRecordingIsClaimedAgainstPurgeWhileTheEdgeIsAsked() {
+        segment(a, byteArrayOf(5), synced = true, ageMs = SegmentSync.RECHECK_MS + 1)
+        var claimedDuringAsk = false
+        server.dispatcher = object : okhttp3.mockwebserver.Dispatcher() {
+            override fun dispatch(request: okhttp3.mockwebserver.RecordedRequest): MockResponse {
+                claimedDuringAsk = a in SegmentSync.verifying
+                return MockResponse().setBody("""{"have":false}""")
+            }
+        }
+        assertFalse(pass())
+        assertTrue(claimedDuringAsk)
+        assertFalse(a in SegmentSync.verifying)  // released once the answer is acted on
+        assertTrue(File(dir, "$a.aac").exists())  // the "no" re-queued it
     }
 }

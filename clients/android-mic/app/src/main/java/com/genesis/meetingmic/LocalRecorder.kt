@@ -50,7 +50,8 @@ class LocalRecorder(
         // it resumes only above RESUME_BYTES, so it does not flap at the edge.
         const val FLOOR_BYTES = 300L * 1024 * 1024
         const val RESUME_BYTES = 400L * 1024 * 1024
-        // Below this, retention may also remove recordings older than 45 days.
+        // Below this, retention frees room early by removing copies the edge holds, only until there
+        // is room again. Unsynced recordings are never removed early.
         const val LOW_STORAGE_BYTES = 1024L * 1024 * 1024
         private const val STORAGE_CHECK_MS = 30_000L
         private const val SYNC_MS = 5_000L
@@ -96,31 +97,46 @@ class LocalRecorder(
          */
         fun purge(context: Context, nowUtcMs: Long = System.currentTimeMillis()): Int {
             val d = dir(context)
+            val r = purgeDir(d, nowUtcMs) { allocatableBytes(context, d) >= LOW_STORAGE_BYTES }
+            // Never silent: a recording that expired before reaching the edge is reported.
+            SegmentSync.noteExpiredUnsynced(context, r.expiredUnsynced)
+            return r.removed
+        }
+
+        class Purged(val removed: Int, val expiredUnsynced: Int)
+
+        /** [purge] on a folder, with [hasRoom] answering whether storage is fine (Context-free, tested). */
+        fun purgeDir(d: File, nowUtcMs: Long, hasRoom: () -> Boolean): Purged {
             // Finish any interrupted rename first, so its sidecar is not swept as an orphan below.
             SegmentSync.migrateLegacyNames(d)
-            val low = allocatableBytes(context, d) < LOW_STORAGE_BYTES
             val files = d.listFiles { f -> f.name.endsWith(".aac") }.orEmpty()
                 .filter { SegmentSync.baseOf(it) !in openBases }
                 .associateBy { it.name }
             val segments = files.values
-                .map { RetentionPolicy.Segment(it.name, segmentStartMs(it)) }
+                .map {
+                    val checked = File(d, SegmentSync.baseOf(it) + ".checked").exists()
+                    RetentionPolicy.Segment(it.name, segmentStartMs(it), SegmentSync.isSynced(it), checked)
+                }
                 .filter { it.startUtcMs <= nowUtcMs + RetentionPolicy.DAY_MS }
-            val doomed = RetentionPolicy.toDelete(segments, nowUtcMs, low)
             var expiredUnsynced = 0
             var removed = 0
             SegmentSync.folderLock.lock()
             try {
-                for (s in doomed) {
+                RetentionPolicy.sweep(segments, nowUtcMs, hasRoom) { s ->
                     val f = files.getValue(s.id)
-                    if (!f.exists()) continue  // renamed by sync since the listing; judged next time
+                    // Renamed by sync since the listing (or already gone): judged next time. This is what
+                    // keeps a copy the edge disowned (renamed back to X.aac) from going as a held one.
+                    if (!f.exists()) return@sweep
+                    // Its edge copy is being re-checked: a "no" would make this the only copy.
+                    if (SegmentSync.baseOf(f) in SegmentSync.verifying) return@sweep
                     // The sidecar goes only once the audio is really gone: a recording that survives a
                     // failed delete keeps its timing.
-                    if (!f.delete() && f.exists()) continue
+                    if (!f.delete() && f.exists()) return@sweep
                     if (!SegmentSync.isSynced(f)) expiredUnsynced += 1
                     SegmentSync.deleteCompanions(d, SegmentSync.baseOf(f))
                     removed += 1
                 }
-                d.listFiles { f -> f.name.endsWith(".json") || f.name.endsWith(".dest") }.orEmpty()
+                d.listFiles { f -> SegmentSync.COMPANIONS.any { f.name.endsWith(it) } }.orEmpty()
                     .filter { it.nameWithoutExtension !in openBases }
                     .filter {
                         !File(d, it.nameWithoutExtension + ".aac").exists() &&
@@ -131,9 +147,7 @@ class LocalRecorder(
             } finally {
                 SegmentSync.folderLock.unlock()
             }
-            // Never silent: a recording that expired before reaching the edge is reported.
-            SegmentSync.noteExpiredUnsynced(context, expiredUnsynced)
-            return removed
+            return Purged(removed, expiredUnsynced)
         }
 
         /** One line describing what is stored on this phone, read straight from the folder. */
@@ -145,7 +159,7 @@ class LocalRecorder(
             val newest = files.maxByOrNull { segmentStartMs(it) }
             val frames = newest?.let { Adts.frameOffsets(it.readBytes()).size } ?: 0
             val secs = frames.toLong() * Adts.SAMPLES_PER_FRAME / SAMPLE_RATE
-            return "On this phone: %d recording files, %.1f MB, oldest %d days (kept 90). Newest: %d:%02d of valid audio."
+            return "On this phone: %d recording files, %.1f MB, oldest %d days (kept up to 90). Newest: %d:%02d of valid audio."
                 .format(files.size, mb, oldestDays, secs / 60, secs % 60)
         }
 
@@ -574,7 +588,7 @@ class LocalRecorder(
             val d = dir(context)
             var free = allocatableBytes(context, d)
             if (free < FLOOR_BYTES) {
-                // Free what the retention rule allows (45-day floor under pressure), then re-measure.
+                // Free what the retention rule allows under pressure, then re-measure.
                 try { purge(context) } catch (_: Exception) {}
                 free = allocatableBytes(context, d)
             }
