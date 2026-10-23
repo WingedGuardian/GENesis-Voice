@@ -77,6 +77,8 @@ class ActiveSession:
         # frozen partial over post-speech noise must not read as a live meeting.
         self._last_partial_text = ""
         self._finalized = False
+        # Set when the cloud reports an error: the session may still exist but is not transcribing.
+        self._cloud_error = False
         # Set once audio streaming begins (end of start()) — the session's t=0, against which a
         # user marker's elapsed time is measured so its [ts] aligns with the Speechmatics ones.
         self._t0: float | None = None
@@ -101,6 +103,22 @@ class ActiveSession:
     def turns(self) -> int:
         return len(self._acc.committed)
 
+    @property
+    def cloud_connected(self) -> bool:
+        """True while a live cloud session exists (False before start, after finalize, or when the
+        session could not open, e.g. a missing key). Read by the meeting bridge's asr_status."""
+        return self._client is not None and not self._finalized and not self._cloud_error
+
+    def _on_error(self, msg) -> None:
+        self._cloud_error = True
+        logger.error("Speechmatics ERROR: %s", str(msg)[:200])
+
+    def advance_clock(self, seconds: float) -> None:
+        """Account for audio sent in a burst at session start (a pre-roll): the cloud's timeline
+        already includes it, so marker timestamps (measured from _t0) must too."""
+        if self._t0 is not None and seconds > 0:
+            self._t0 -= seconds
+
     async def start(self) -> None:
         try:
             key = open(self._cfg.active_sm_key_path).read().strip()
@@ -119,7 +137,7 @@ class ActiveSession:
         client = AsyncClient(api_key=key)
         client.on(ServerMessageType.ADD_TRANSCRIPT, self._on_final)
         client.on(ServerMessageType.ADD_PARTIAL_TRANSCRIPT, self._on_partial)
-        client.on(ServerMessageType.ERROR, lambda m: logger.error("Speechmatics ERROR: %s", str(m)[:200]))
+        client.on(ServerMessageType.ERROR, self._on_error)
         client.on(ServerMessageType.WARNING, lambda m: logger.warning("Speechmatics WARNING: %s", str(m)[:200]))
         self._flush()  # header now, so the file exists for tailing immediately
         audio_format = AudioFormat(encoding=AudioEncoding.PCM_S16LE, sample_rate=16000, chunk_size=4096)

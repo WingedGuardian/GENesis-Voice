@@ -8,7 +8,8 @@ connection drives a VAD-gated session lifecycle (dependency-injected — default
 connection can span several sessions — one transcript per meeting. ``MEETING_VAD_THRESHOLD=0``
 (default) disables gating → a single session spans the whole connection (the legacy behavior).
 
-Runs behind the Tailscale Funnel (the one authenticated public door); binds loopback by default.
+Binds loopback by default, behind a local reverse proxy (typically tailnet-only `tailscale serve`,
+or Tailscale Funnel where a deployment chooses a public door).
 No ``genesis.*`` imports. The cloud SDK is imported lazily by the default factory, so the server
 imports (and unit-tests) without speechmatics-rt installed.
 """
@@ -16,6 +17,7 @@ imports (and unit-tests) without speechmatics-rt installed.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import hmac
 import json
@@ -25,11 +27,15 @@ import signal
 import time
 from pathlib import Path
 
+import aiohttp
+import aiohttp.http_exceptions
 from aiohttp import WSMsgType, web
 
 from .config import MeetingConfig, load_config
 from .session import default_session_factory
-from .vad import GateStats, SessionGate, peak_amplitude
+from . import upload_store
+from .asr_status import asr_state
+from .vad import GateStats, PreRoll, SessionGate, peak_amplitude
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +44,30 @@ _TOKEN_PLACEHOLDER = "__MEETING_TOKEN__"  # replaced per-request with the valida
 # Speechmatics operating points the client may pick per session via ?model=. Anything else
 # (absent, typo, hostile) falls back to the configured default — the model is never trusted raw.
 _ALLOWED_MODELS = ("standard", "enhanced")
+# Optional client-negotiated extensions, offered in a hello reply only when the client asks.
+SUPPORTED_CAPABILITIES = ("audio_ack_v1", "asr_status_v1")
+# A transcript this small with zero turns is the bare header; anything larger is never removed.
+EMPTY_TRANSCRIPT_MAX_BYTES = 512
+# Phone uploads: at most this many at once, and a body that stops arriving for this long is dropped.
+UPLOAD_CONCURRENCY = 4
+UPLOAD_READ_TIMEOUT_S = 30.0
+# With the VAD gate off, a frame at least this loud counts as "speech flowing" for stall reporting.
+LEGACY_SPEECH_PEAK = 1000
+
+
+async def _finish_in_thread(fn, *args, **kwargs):
+    """Run blocking disk work in a thread and wait for it to finish even if this request is
+    cancelled: the per-name lock must not be released while a store is still proving (or rolling
+    back) its file, or a /have or a retry could see that unproven file."""
+    fut = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        try:
+            await fut
+        except Exception:
+            pass
+        raise
 
 
 def tracked_task(coro, *, name: str) -> asyncio.Task:
@@ -55,6 +85,16 @@ def tracked_task(coro, *, name: str) -> asyncio.Task:
     return t
 
 
+async def _never_cache_receipts(request: web.Request, response: web.StreamResponse) -> None:
+    """Every answer from the upload and possession-check routes is uncacheable, whatever the path.
+
+    These answers decide whether the phone deletes audio, so no cache on the way may ever answer one
+    in the edge's place. Set here, once, so no response path can forget it.
+    """
+    if request.path.endswith(("/upload", "/have")):
+        response.headers["Cache-Control"] = "no-store"
+
+
 class MeetingServer:
     def __init__(self, cfg: MeetingConfig, *, session_factory=default_session_factory):
         self._cfg = cfg
@@ -66,6 +106,11 @@ class MeetingServer:
         self._frames = 0  # frames forwarded to a cloud session
         self._frames_gated = 0  # frames dropped as silence / not billed (incl. noise while dormant)
         self._sessions_idle_closed = 0  # sessions finalized on transcript-idle (post-meeting noise tail)
+        self._empty_removed = 0  # header-only transcripts removed after a session heard nothing
+        self._uploads_stored = 0  # phone segments newly stored (identical re-uploads not counted)
+        self._uploads_rejected = 0
+        self._upload_locks: dict[str, list] = {}  # name -> [lock, holders + waiters]
+        self._upload_slots = asyncio.Semaphore(UPLOAD_CONCURRENCY)
         self._bytes = 0
         self._last_frame_ts: float | None = None
         self._capture_html: str | None = None
@@ -73,10 +118,13 @@ class MeetingServer:
     # ── app wiring ─────────────────────────────────────────────────────────
     def build_app(self) -> web.Application:
         app = web.Application()
+        app.on_response_prepare.append(_never_cache_receipts)
         app.add_routes(
             [
                 web.get("/capture/{token}", self._handle_capture),
                 web.get("/meeting/{token}", self._handle_ws),
+                web.post("/meeting/{token}/upload", self._handle_upload),
+                web.get("/meeting/{token}/have", self._handle_have),
                 web.get("/health", self._handle_health),
                 web.get("/health/{token}", self._handle_health_full),
             ]
@@ -143,8 +191,15 @@ class MeetingServer:
         # continuously; a future client-side VAD (which would go silent on the wire) would instead
         # need a timer to close an idle session.
         gate = SessionGate(
-            threshold=cfg.vad_threshold, hangover_s=cfg.vad_hangover_s, silence_close_s=cfg.silence_close_s
+            threshold=cfg.vad_threshold,
+            hangover_s=cfg.vad_hangover_s,
+            silence_close_s=cfg.silence_close_s,
+            open_speech_s=cfg.vad_open_speech_s,
+            open_window_s=cfg.vad_open_window_s,
         )
+        # Audio the gate held back while deciding whether speech is real; flushed into the session
+        # it opens so the first words are not lost to the opening hysteresis.
+        preroll = PreRoll(cfg.vad_open_window_s if gate.enabled and cfg.vad_open_speech_s > 0 else 0.0)
         stats = GateStats(self._cfg.vad_log_interval_s)
         session = None
         opened = 0  # cloud sessions opened on THIS connection (for the close log)
@@ -163,6 +218,11 @@ class MeetingServer:
         ack_enabled = False
         received_bytes = 0
         last_ack_ts = 0.0
+        asr_enabled = False
+        last_status_ts = 0.0
+        session_opened_ts = 0.0
+        last_speech_sent_ts = 0.0
+        end_reason = "stream ended"
         self._active += 1
         logger.info(
             "meeting connection opening: %s model=%s vad_threshold=%d (active=%d)",
@@ -184,7 +244,8 @@ class MeetingServer:
                         await ws.send_json({"type": "audio_ack", "bytes": received_bytes})
                         last_ack_ts = now
                     peak = peak_amplitude(msg.data)
-                    forward, close = gate.observe(peak, now)
+                    frame_s = len(msg.data) / (2 * 16000)
+                    forward, close = gate.observe(peak, now, frame_s)
                     # Track strict above-threshold loudness (independent of the gate's hangover) so a
                     # dormant connection can measure a genuinely quiet room and re-arm.
                     if gate.enabled and peak >= cfg.vad_threshold:
@@ -194,6 +255,7 @@ class MeetingServer:
                     # while continuing room noise does not.
                     if dormant and gate.enabled and now - last_loud_ts >= cfg.silence_close_s:
                         dormant = False
+                        gate.reset()  # noise heard while dormant must not count as a speech run
                         logger.info("meeting re-armed after %.0fs silence: %s", now - last_loud_ts, source)
                     # Transcript-idle close: stop billing when the ASR stops producing SPEECH EVIDENCE
                     # even though the room hasn't gone quiet (the energy gate can't tell noise from
@@ -212,10 +274,7 @@ class MeetingServer:
                         if (
                             act is not None or turns is not None
                         ) and now - last_evidence_ts >= cfg.transcript_idle_close_s:
-                            try:
-                                await session.finalize()
-                            except Exception:
-                                logger.warning("meeting session idle-finalize failed for %s", source, exc_info=True)
+                            await self._finalize(session, source, "idle-finalize")
                             session = None
                             gate.reset()
                             dormant = True
@@ -234,20 +293,28 @@ class MeetingServer:
                             opened += 1
                             last_turns = getattr(session, "turns", 0) or 0
                             last_evidence_ts = now
+                            session_opened_ts = now
+                            await self._send_preroll(session, preroll, also_s=frame_s)
                         await session.send_audio(msg.data)
+                        # With the gate off every frame is forwarded, so use a fixed loudness as "speech
+                        # is flowing" for stall detection only.
+                        if peak >= (cfg.vad_threshold if gate.enabled else LEGACY_SPEECH_PEAK):
+                            last_speech_sent_ts = now
                         self._frames += 1
                         self._bytes += len(msg.data)
                         self._last_frame_ts = time.time()
                     else:
                         self._frames_gated += 1
+                        if session is None and not dormant:
+                            # Noise heard while dormant is not a lead-in to anything: never hold it.
+                            preroll.push(msg.data, frame_s)
+                            if close:
+                                gate.reset()
                         if close and session is not None:
-                            # Mirror the teardown finalize's containment: a pluggable backend whose
-                            # finalize() can raise must not kill the connection (and session=None
-                            # below prevents a double-finalize in the finally block).
-                            try:
-                                await session.finalize()
-                            except Exception:
-                                logger.warning("meeting session silence-finalize failed for %s", source, exc_info=True)
+                            # Containment lives in _finalize: a pluggable backend whose finalize()
+                            # can raise must not kill the connection (and session=None below
+                            # prevents a double-finalize in the finally block).
+                            await self._finalize(session, source, "silence-finalize")
                             session = None
                             gate.reset()
                             logger.info("meeting cloud session CLOSE (silence): %s", source)
@@ -263,10 +330,27 @@ class MeetingServer:
                             summary.max_peak,
                             summary.avg_peak,
                         )
+                    # Status after the frame was acted on, so the first speech frame reports the session
+                    # it just opened rather than the idle state before it.
+                    if asr_enabled and (last_status_ts == 0.0 or now - last_status_ts >= 2.0):
+                        state = asr_state(
+                            session=session,
+                            session_opened_ts=session_opened_ts,
+                            dormant=dormant,
+                            last_loud_ts=last_loud_ts,
+                            last_speech_sent_ts=last_speech_sent_ts,
+                            now=now,
+                            stall_s=cfg.asr_stall_s,
+                        )
+                        await ws.send_json({"type": "asr_status", "state": state})
+                        last_status_ts = now
                 elif msg.type == WSMsgType.TEXT:
-                    if self._requests_audio_ack(msg.data):
-                        ack_enabled = True
-                        await ws.send_json({"type": "hello", "capabilities": ["audio_ack_v1"]})
+                    caps = self._hello_capabilities(msg.data)
+                    if caps is not None:
+                        # A later hello can add capabilities but never silently drop one already granted.
+                        ack_enabled = ack_enabled or "audio_ack_v1" in caps
+                        asr_enabled = asr_enabled or "asr_status_v1" in caps
+                        await ws.send_json({"type": "hello", "capabilities": caps})
                         continue
                     # A marker is an explicit "pay attention here" — never drop it into a silence
                     # gap, and it ends dormancy (an explicit "a new meeting starts here").
@@ -277,19 +361,31 @@ class MeetingServer:
                             opened += 1
                             last_turns = getattr(session, "turns", 0) or 0
                             last_evidence_ts = time.monotonic()
+                            session_opened_ts = last_evidence_ts
+                            await self._send_preroll(session, preroll)
+                            gate.mark_speech(last_evidence_ts)
                         session.add_marker()
                 elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
                     break
-        except Exception:
+        except Exception as exc:
+            end_reason = f"handler error: {type(exc).__name__}"
             logger.warning("meeting ws handler error for %s", source, exc_info=True)
         finally:
             if session is not None:
-                try:
-                    await session.finalize()
-                except Exception:
-                    logger.warning("meeting session finalize failed for %s", source, exc_info=True)
+                await self._finalize(session, source, "finalize")
             self._active -= 1
-            logger.info("meeting connection closed: %s (meetings=%d, active=%d)", source, opened, self._active)
+            # Why the connection ended. aiohttp's message loop ends quietly on a client close, so
+            # the code and any transport error (e.g. a missed heartbeat) are read off the socket.
+            # Mid-meeting splits are otherwise undiagnosable.
+            if end_reason == "stream ended":
+                end_reason = self._end_reason(ws)
+            logger.info(
+                "meeting connection closed: %s (meetings=%d, active=%d, reason=%s)",
+                source,
+                opened,
+                self._active,
+                end_reason,
+            )
             if not ws.closed:
                 await ws.close()
         return ws
@@ -317,24 +413,193 @@ class MeetingServer:
             return False
 
     @staticmethod
-    def _requests_audio_ack(raw: str) -> bool:
-        """Whether a client hello opts into the receipt-ack extension."""
+    def _hello_capabilities(raw: str) -> list[str] | None:
+        """For a client hello, the supported subset of the capabilities it asked for; else None.
+
+        The reply lists only what was requested, so an older client that asks for audio_ack_v1
+        alone gets exactly the reply it always got.
+        """
         try:
             payload = json.loads(raw)
-            capabilities = payload.get("capabilities", [])
-            return (
-                payload.get("type") == "hello"
-                and isinstance(capabilities, list)
-                and "audio_ack_v1" in capabilities
-            )
         except (ValueError, TypeError):
-            return False
+            return None
+        if not isinstance(payload, dict) or payload.get("type") != "hello":
+            return None
+        requested = payload.get("capabilities", [])
+        if not isinstance(requested, list):
+            return None
+        return [c for c in SUPPORTED_CAPABILITIES if c in requested]
+
+    async def _send_preroll(self, session, preroll, also_s: float = 0.0) -> None:
+        """Flush held-back audio into a just-opened session: counted as forwarded (it was counted as
+        gated when it arrived), and the session clock advanced so later markers line up with the
+        cloud's timestamps, which include this audio. ``also_s`` is audio sent in the same burst right
+        after (the frame that triggered the open)."""
+        held = preroll.drain()
+        for frame in held:
+            await session.send_audio(frame)
+            self._frames += 1
+            self._frames_gated -= 1
+            self._bytes += len(frame)
+        advance = getattr(session, "advance_clock", None)
+        seconds = sum(len(f) for f in held) / (2 * 16000) + also_s
+        if seconds > 0 and callable(advance):
+            advance(seconds)
+
+    @staticmethod
+    def _end_reason(ws: web.WebSocketResponse) -> str:
+        exc = ws.exception()
+        if exc is not None:
+            return f"transport error: {type(exc).__name__}"
+        code = ws.close_code
+        if code is None:
+            return "stream ended without a close frame"
+        if code == 1000:
+            return "client closed normally (code 1000)"
+        return f"closed (code {code})"
+
+    async def _finalize(self, session, source: str, what: str) -> None:
+        """Finalize a session with containment, then drop its transcript if it heard nothing.
+
+        A session that committed no turns (markers and system notes count as turns) and never saw
+        ASR activity leaves a header-only file that only clutters the transcript folder. The size
+        cap is a second guard so a file with real content is never removed. Contract for pluggable
+        session factories: ``session.path`` must be a file the session itself created.
+        """
+        try:
+            await session.finalize()
+        except Exception:
+            logger.warning("meeting session %s failed for %s", what, source, exc_info=True)
+            return
+        if getattr(session, "turns", None) != 0 or getattr(session, "last_activity", 0.0) is not None:
+            return
+        path = getattr(session, "path", None)
+        try:
+            if path and os.path.isfile(path) and os.path.getsize(path) <= EMPTY_TRANSCRIPT_MAX_BYTES:
+                os.remove(path)
+                self._empty_removed += 1
+                logger.info("meeting removed empty transcript (no speech recognized): %s", path)
+        except OSError:
+            logger.warning("meeting empty-transcript cleanup failed for %s", path, exc_info=True)
+
+    # ── phone segment uploads ──────────────────────────────────────────────
+
+    def _upload_rejected(self, status: int, reason: str, name: str = "") -> web.Response:
+        self._uploads_rejected += 1
+        logger.warning("meeting upload rejected (%d): %s %s", status, reason, name)
+        return web.json_response({"status": "rejected", "reason": reason}, status=status)
+
+    async def _handle_upload(self, request: web.Request) -> web.Response:
+        """Store one phone segment; answer ``stored`` only once it is durably on disk and re-read.
+
+        Query: ``name`` (validated segment name), ``sha256`` (hex), ``bytes`` (length), optional
+        ``meta`` (the segment's sidecar JSON, <= 4 KB). Body: the raw ADTS bytes. The phone deletes
+        its copy only when the returned sha256 and length equal its own, so nothing here answers
+        ``stored`` on anything less than a re-read from disk. 4xx = this upload can never succeed
+        as sent; 5xx = try again later.
+        """
+        if not self._authenticate(request.match_info.get("token", "")):
+            return web.Response(status=403, text="forbidden")
+        q = request.query
+        name, sha = q.get("name", ""), q.get("sha256", "").lower()
+        try:
+            size = int(q.get("bytes", ""))
+        except ValueError:
+            return self._upload_rejected(400, "bad length")
+        if not upload_store.valid_name(name) or not upload_store.valid_sha(sha):
+            return self._upload_rejected(400, "bad name or sha256")
+        if size <= 0 or size > self._cfg.upload_max_bytes:
+            return self._upload_rejected(413, "length out of range", name)
+        sidecar = None
+        meta = q.get("meta")
+        if meta:
+            try:
+                sidecar = json.loads(meta) if len(meta) <= 4096 else None
+                # Bound what lands on disk too: escapes can expand once parsed.
+                if isinstance(sidecar, dict) and len(json.dumps(sidecar)) > 8192:
+                    sidecar = None
+            except (ValueError, RecursionError):
+                sidecar = None
+            if not isinstance(sidecar, dict):
+                return self._upload_rejected(400, "bad sidecar", name)
+        root = self._cfg.upload_root
+        async with self._upload_slots:
+            # Body into memory (capped) with a per-read timeout, OUTSIDE any lock: a stalled client
+            # can never hold up a retry of the same file, and no disk I/O runs on the event loop.
+            body = bytearray()
+            try:
+                while True:
+                    chunk = await asyncio.wait_for(request.content.readany(), UPLOAD_READ_TIMEOUT_S)
+                    if not chunk:
+                        break
+                    body += chunk
+                    if len(body) > self._cfg.upload_max_bytes:
+                        return self._upload_rejected(413, "upload too large", name)
+            except (TimeoutError, asyncio.TimeoutError):
+                # A stalled mobile link says nothing about the bytes either: retryable (5xx).
+                return self._upload_rejected(503, "upload stalled", name)
+            except (ConnectionError, aiohttp.ClientPayloadError, aiohttp.http_exceptions.HttpProcessingError):
+                # Says nothing about the bytes: a retry can succeed, so this is retryable (5xx).
+                return self._upload_rejected(503, "upload interrupted", name)
+            try:
+                async with self._name_lock(name):
+                    # The floor guards new writes only: a retry of bytes already held needs no space
+                    # and must still get its receipt.
+                    if await asyncio.to_thread(
+                        upload_store.free_bytes, root
+                    ) < self._cfg.upload_min_free_bytes and not await asyncio.to_thread(
+                        upload_store.verify, root, name, sha
+                    ):
+                        return self._upload_rejected(507, "edge storage below its free-space floor", name)
+                    stored = await _finish_in_thread(
+                        upload_store.store, root, name, bytes(body), sha256=sha, size=size, sidecar=sidecar
+                    )
+            except upload_store.UploadError as exc:
+                return self._upload_rejected(exc.status, str(exc), name)
+        if stored.created:
+            self._uploads_stored += 1
+        logger.info(
+            "meeting upload stored: %s (%d bytes, %s)", name, stored.size, "new" if stored.created else "already held"
+        )
+        return web.json_response(
+            {"status": "stored", "sha256": stored.sha256, "bytes": stored.size, "created": stored.created}
+        )
+
+    async def _handle_have(self, request: web.Request) -> web.Response:
+        """Does the edge still hold these exact bytes? Re-hashed from disk on every call."""
+        if not self._authenticate(request.match_info.get("token", "")):
+            return web.Response(status=403, text="forbidden")
+        name, sha = request.query.get("name", ""), request.query.get("sha256", "").lower()
+        if not upload_store.valid_name(name) or not upload_store.valid_sha(sha):
+            return web.json_response({"have": False, "reason": "bad name or sha256"}, status=400)
+        # Same per-name lock as uploads: never answer while a store of this name is still proving
+        # (or rolling back) its file.
+        async with self._upload_slots, self._name_lock(name):
+            have = await _finish_in_thread(upload_store.verify, self._cfg.upload_root, name, sha)
+        return web.json_response({"have": have})
+
+    @contextlib.asynccontextmanager
+    async def _name_lock(self, name: str):
+        """One store or verify per segment name at a time. The lock is dropped from the table only
+        when nobody holds it AND nobody is waiting for it, so a waiter can never be bypassed by a
+        newcomer that would otherwise create a second lock for the same name."""
+        entry = self._upload_locks.get(name)
+        if entry is None:
+            entry = self._upload_locks[name] = [asyncio.Lock(), 0]
+        entry[1] += 1
+        try:
+            async with entry[0]:
+                yield
+        finally:
+            entry[1] -= 1
+            if entry[1] == 0 and self._upload_locks.get(name) is entry:
+                del self._upload_locks[name]
 
     # ── health ───────────────────────────────────────────────────────────────
     async def _handle_health(self, _request: web.Request) -> web.Response:
         # Unauthenticated liveness ONLY — deliberately minimal (no session counts, activity
-        # timestamps, or pid) because this route is reachable through the public Funnel. Full
-        # operational metrics require the token: GET /health/<token>.
+        # timestamps, or pid) because this route may be reachable through a public door (Funnel)
+        # on some deployments. Full operational metrics require the token: GET /health/<token>.
         return web.json_response({"alive": True, "ts": time.time()})
 
     async def _handle_health_full(self, request: web.Request) -> web.Response:
@@ -350,6 +615,9 @@ class MeetingServer:
             "active_sessions": self._active,
             "sessions_total": self._sessions_total,
             "sessions_idle_closed": self._sessions_idle_closed,
+            "empty_transcripts_removed": self._empty_removed,
+            "uploads_stored": self._uploads_stored,
+            "uploads_rejected": self._uploads_rejected,
             "frames": self._frames,
             "frames_gated": self._frames_gated,
             "bytes": self._bytes,
@@ -373,7 +641,10 @@ class MeetingServer:
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     async def serve(self) -> None:
-        os.makedirs(self._cfg.output_dir, exist_ok=True)
+        upload_store.makedirs_durable(self._cfg.output_dir)
+        swept = upload_store.sweep_temps(self._cfg.upload_root)
+        if swept:
+            logger.info("removed %d unfinished upload temp file(s) from a previous run", swept)
         # access_log=None: the secret token rides the URL PATH (a browser can't send auth headers),
         # so aiohttp's default access log would write the token to disk on every request.
         runner = web.AppRunner(self.build_app(), access_log=None)
