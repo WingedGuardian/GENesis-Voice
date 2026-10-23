@@ -107,3 +107,65 @@ def test_gatestats_resets_between_windows():
     out = s.observe(50, forwarded=False, now=20.0)  # new window's summary (only this frame)
     assert out is not None
     assert out.forwarded == 0 and out.gated == 1 and out.max_peak == 50
+
+
+# ── opening hysteresis ──────────────────────────────────────────────────────
+def _gate(**kw):
+    base = dict(threshold=500, hangover_s=0.4, silence_close_s=45, open_speech_s=0.3, open_window_s=1.5)
+    base.update(kw)
+    return SessionGate(**base)
+
+
+def test_hysteresis_needs_sustained_speech_to_open():
+    g = _gate()
+    assert g.observe(800, 0.0, 0.1) == (False, False)
+    assert g.observe(800, 0.1, 0.1) == (False, False)
+    assert g.observe(800, 0.2, 0.1) == (True, False)  # 0.3 s of speech inside the window
+    assert g.observe(800, 0.3, 0.1) == (True, False)  # run in progress: forwarded at once
+
+
+def test_hysteresis_spikes_spread_beyond_the_window_never_open():
+    g = _gate()
+    for t in (0.0, 2.0, 4.0, 6.0):  # isolated clicks, 2 s apart
+        assert g.observe(900, t, 0.1) == (False, False)
+        assert g.observe(100, t + 0.1, 0.1) == (False, False)
+
+
+def test_hysteresis_rearms_after_reset():
+    g = _gate()
+    for i in range(3):
+        g.observe(800, i * 0.1, 0.1)
+    g.reset()
+    assert g.observe(800, 10.0, 0.1) == (False, False)
+
+
+def test_hysteresis_off_opens_on_first_loud_frame():
+    assert _gate(open_speech_s=0.0).observe(800, 0.0, 0.1) == (True, False)
+
+
+def test_hysteresis_ignored_when_gate_disabled():
+    assert _gate(threshold=0).observe(0, 0.0, 0.1) == (True, False)
+
+
+def test_preroll_keeps_only_the_most_recent_window():
+    from meeting_bridge.vad import PreRoll
+
+    p = PreRoll(0.3)
+    for i in range(5):
+        p.push(bytes([i]), 0.1)
+    assert p.drain() == [bytes([2]), bytes([3]), bytes([4])]
+    assert p.drain() == []
+
+
+def test_preroll_disabled_holds_nothing():
+    from meeting_bridge.vad import PreRoll
+
+    p = PreRoll(0.0)
+    p.push(b"x", 0.1)
+    assert p.drain() == []
+
+
+def test_mark_speech_skips_hysteresis_for_the_current_run():
+    g = _gate()
+    g.mark_speech(0.0)
+    assert g.observe(800, 0.1, 0.1) == (True, False)
