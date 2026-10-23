@@ -180,13 +180,19 @@ object SegmentSync {
      * that have none; it never changes after that, so a later address change cannot capture them.
      */
     fun registerEndpoint(context: Context, wsBase: String, token: String): String =
-        registerEndpoint(context.getSharedPreferences(CREDS, Context.MODE_PRIVATE), wsBase, token)
+        registerEndpoint(context.getSharedPreferences(CREDS, Context.MODE_PRIVATE), wsBase, token, prefsState(context))
 
     /** [registerEndpoint] against the credentials store itself (tests pass an in-memory one). */
-    fun registerEndpoint(p: android.content.SharedPreferences, wsBase: String, token: String): String {
+    fun registerEndpoint(
+        p: android.content.SharedPreferences,
+        wsBase: String,
+        token: String,
+        state: State? = null,
+    ): String {
         adoptLegacyEndpoint(p)
         val ep = httpBase(wsBase, token) ?: return DEST_NONE
         val id = endpointId(wsBase)
+        val previous = p.getString("ep:$id", null)
         val edit = p.edit().putString("ep:$id", ep)
         if (p.getString(DEFAULT_KEY, null) == null) {
             edit.putString(DEFAULT_KEY, id).putLong(CUTOFF_KEY, System.currentTimeMillis())
@@ -194,6 +200,11 @@ object SegmentSync {
         // Durable before any recording names it. Callers run on the main thread (onResume and
         // startCapture), which is also what makes the check-then-set of the default race-free.
         edit.commit()
+        // A new credential for a known bridge: files refused under the old one are tried again on the
+        // next pass, instead of waiting out their day-long refusal delay.
+        if (state != null && previous != null && previous != ep) {
+            for (k in state.keys()) if (k.startsWith("rejected:")) state.remove(k)
+        }
         return id
     }
 

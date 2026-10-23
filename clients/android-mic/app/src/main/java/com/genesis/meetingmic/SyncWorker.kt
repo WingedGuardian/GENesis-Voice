@@ -34,11 +34,9 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         } catch (e: Exception) {
             false
         }
-        if (done) {
-            applicationContext.getSystemService(NotificationManager::class.java)?.cancel(NOTIF_ID)
-        } else {
-            warnIfStuck(applicationContext)
-        }
+        // Raises or clears the alert by what is stuck, not by whether this pass finished: a pass can be
+        // done while a recording with no secure destination still needs the alert.
+        try { warnIfStuck(applicationContext) } catch (_: Exception) {}
         // (StuckCheckWorker raises the same alert when no network lets this job run at all.)
         if (done) Result.success() else Result.retry()
     }
@@ -53,11 +51,17 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
 
         private val online = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
 
-        /** A recording that has not reached the edge for a day gets a loud alert, not just a status line. */
+        /**
+         * A recording that has not reached the edge for a day gets a loud alert, not just a status line.
+         * Once nothing is stuck, an alert still showing is cleared.
+         */
         fun warnIfStuck(context: Context) {
-            val s = SegmentSync.status(context)
-            val text = stuckText(s) ?: return
             val nm = context.getSystemService(NotificationManager::class.java) ?: return
+            val text = stuckText(SegmentSync.status(context))
+            if (text == null) {
+                nm.cancel(NOTIF_ID)
+                return
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && nm.getNotificationChannel(CHANNEL) == null) {
                 nm.createNotificationChannel(
                     NotificationChannel(CHANNEL, "Recording sync problems", NotificationManager.IMPORTANCE_HIGH),
@@ -118,13 +122,6 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
         /** Every 3 h, so a day-old recording is reported within about 27 h of capture. */
         private const val STUCK_CHECK_HOURS = 3L
 
-        /** Clears the alert once nothing has been waiting for a day. */
-        fun clearIfNotStuck(context: Context) {
-            if (stuckText(SegmentSync.status(context)) == null) {
-                context.getSystemService(NotificationManager::class.java)?.cancel(NOTIF_ID)
-            }
-        }
-
         /**
          * The alert text, or null when nothing is stuck: a recording waiting over a day, or one with
          * no secure destination (it will never sync) for over a day.
@@ -149,7 +146,6 @@ class StuckCheckWorker(context: Context, params: WorkerParameters) : CoroutineWo
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         try {
             SyncWorker.warnIfStuck(applicationContext)
-            SyncWorker.clearIfNotStuck(applicationContext)
         } catch (_: Exception) {
             // A failed check retries at its next period; it never touches recordings.
         }

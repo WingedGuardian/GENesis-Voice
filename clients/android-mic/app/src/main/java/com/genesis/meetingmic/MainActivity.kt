@@ -218,25 +218,6 @@ class MainActivity : AppCompatActivity() {
 
     private var lastPhase: MicStreamService.Companion.Phase? = null
 
-    private fun syncLine(s: SegmentSync.Status): String {
-        val hours = s.oldestWaitingMs / 3_600_000
-        val parts = mutableListOf(
-            when {
-                s.waiting == 0 && s.synced == 0 -> "Synced to Genesis: nothing waiting"
-                s.waiting == 0 -> "Synced to Genesis: all recordings ✓"
-                else -> "Waiting to sync to Genesis: ${s.waiting} file(s), oldest ${hours}h"
-            },
-        )
-        if (s.synced > 0) parts += "${s.synced} confirmed on Genesis (phone copy kept 7 days, then re-checked)"
-        if (s.rejected > 0) parts += "⚠ ${s.rejected} refused by Genesis, kept on phone"
-        if (s.expiredUnsynced > 0) parts += "⚠ ${s.expiredUnsynced} expired before syncing"
-        if (s.unroutable > 0) {
-            parts += "⚠ ${s.unroutable} file(s) have no secure (wss://) destination: kept on this phone, not synced"
-        }
-        if (s.waiting > 0 && hours >= 24) parts += "⚠ Check Tailscale, and set battery to Unrestricted"
-        return parts.joinToString("\n")
-    }
-
     private fun refreshStorageSummary(purgeFirst: Boolean) {
         val app = applicationContext
         Thread({
@@ -328,4 +309,26 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
         }
     }
+}
+
+/** The sync status lines under the storage summary (pure, so the headline rule is tested). */
+internal fun syncLine(s: SegmentSync.Status): String {
+    val hours = s.oldestWaitingMs / 3_600_000
+    val parts = mutableListOf(
+        when {
+            s.waiting > 0 -> "Waiting to sync to Genesis: ${s.waiting} file(s), oldest ${hours}h"
+            // Never a success headline while some recordings can never sync (the warning below says why).
+            s.unroutable > 0 -> "⚠ Not every recording can sync to Genesis"
+            s.synced == 0 -> "Synced to Genesis: nothing waiting"
+            else -> "Synced to Genesis: all recordings ✓"
+        },
+    )
+    if (s.synced > 0) parts += "${s.synced} confirmed on Genesis (phone copy kept 7 days, then re-checked)"
+    if (s.rejected > 0) parts += "⚠ ${s.rejected} refused by Genesis, kept on phone"
+    if (s.expiredUnsynced > 0) parts += "⚠ ${s.expiredUnsynced} expired before syncing"
+    if (s.unroutable > 0) {
+        parts += "⚠ ${s.unroutable} file(s) have no secure (wss://) destination: kept on this phone, not synced"
+    }
+    if (s.waiting > 0 && hours >= 24) parts += "⚠ Check Tailscale, and set battery to Unrestricted"
+    return parts.joinToString("\n")
 }

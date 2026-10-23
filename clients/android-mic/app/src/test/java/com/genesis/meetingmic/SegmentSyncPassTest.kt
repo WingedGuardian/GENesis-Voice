@@ -321,4 +321,26 @@ class SegmentSyncPassTest {
         val other = SegmentSync.registerEndpoint(p, "wss://other.example.com/meeting/", "newtok")
         assertFalse(other == after)  // a different address never receives them
     }
+
+    @Test
+    fun aNewTokenLiftsTheRefusalDelaySoRefusedFilesRetryAtOnce() {
+        val p = MemPrefs()
+        val url = "wss://bridge.example.com/meeting/"
+        SegmentSync.registerEndpoint(p, url, "oldtok", state)
+        state.putLong("rejected:$a.aac", now)
+        state.putLong("retry:$b.aac", now)
+        SegmentSync.registerEndpoint(p, url, "oldtok", state)  // same credential: delay kept
+        assertTrue(state.getLong("rejected:$a.aac") > 0)
+        SegmentSync.registerEndpoint(p, url, "newtok", state)
+        assertEquals(0L, state.getLong("rejected:$a.aac"))
+        assertTrue(state.getLong("retry:$b.aac") > 0)  // a transient retry is not a refusal
+    }
+
+    @Test
+    fun theHeadlineIsNeverASuccessWhileSomeRecordingsCannotSync() {
+        val onlyUnroutable = SegmentSync.Status(0, 0, 3, 0, 0, 0, unroutable = 1, oldestUnroutableMs = 1)
+        val head = syncLine(onlyUnroutable).lineSequence().first()
+        assertFalse(head.contains("✓") || head.contains("nothing waiting"))
+        assertEquals("Synced to Genesis: all recordings ✓", syncLine(onlyUnroutable.copy(unroutable = 0)).lineSequence().first())
+    }
 }
