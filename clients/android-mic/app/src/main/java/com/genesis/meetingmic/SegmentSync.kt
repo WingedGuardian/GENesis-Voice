@@ -42,6 +42,7 @@ object SegmentSync {
     private const val SETTLE_MS = 10_000L          // never touch a file modified this recently
     private const val REJECT_RETRY_MS = 24L * 60 * 60 * 1000
     private const val FILE_RETRY_MS = 10L * 60 * 1000  // a file the edge could not take right now
+    private const val SIDECAR_WAIT_MS = 24L * 60 * 60 * 1000  // then upload without unreadable metadata
     const val CREDS = "sync_creds"
     /** A recording with no encrypted destination (captured over `ws://`): it never leaves the phone. */
     const val DEST_NONE = "none"
@@ -409,10 +410,18 @@ object SegmentSync {
     }
 
     private fun upload(http: OkHttpClient, ep: String, dir: File, f: File, nowMs: Long): Outcome {
+        val base = baseOf(f)
+        // An unreadable sidecar holds back only this file, never the queue behind it. For a day it is
+        // retried, since the edge cannot recover the timing later; after that the audio goes without
+        // it, because losing the timing is better than the phone holding the only copy.
+        val side = try {
+            File(dir, "$base.json").takeIf { it.exists() }?.readText()
+        } catch (e: IOException) {
+            if (nowMs - f.lastModified() < SIDECAR_WAIT_MS) return Outcome.RETRY_FILE
+            null
+        }
         val data = try { f.readBytes() } catch (e: IOException) { return Outcome.RETRY_FILE }
         val sha = sha256(data)
-        val base = baseOf(f)
-        val side = File(dir, "$base.json").takeIf { it.exists() }?.readText()
         val url = "$ep/upload".toHttpUrlOrNull()?.newBuilder()
             ?.addQueryParameter("name", base)
             ?.addQueryParameter("sha256", sha)
