@@ -43,6 +43,7 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import org.json.JSONObject
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -150,7 +151,7 @@ class MicStreamService : LifecycleService() {
     private var micAlertShown = false
     private var micGreenSinceMs = -1L
     private val localMonitor = LocalBackupMonitor()
-    private val localRecorder by lazy { LocalRecorder(this, localMonitor) }
+    private val localRecorder by lazy { LocalRecorder(this, localMonitor) { SyncWorker.kick(this) } }
     private var localReading = LocalReading(MicSignal.GREY, "off")
     private var deliveryNotifText = "Starting…"
     private var lastNotifText = ""
@@ -241,7 +242,10 @@ class MicStreamService : LifecycleService() {
         mic.start(SystemClock.elapsedRealtime())
         micGreenSinceMs = -1L
         // The local copy starts with capture and is independent of the connection.
-        localRecorder.start(runId, localMonitor.start(SystemClock.elapsedRealtime()))
+        // The endpoint is registered before the first segment opens: each segment records it.
+        val dest = SegmentSync.registerEndpoint(this, base, token)
+        localRecorder.start(runId, localMonitor.start(SystemClock.elapsedRealtime()), UUID.randomUUID().toString(), dest)
+        SyncWorker.schedule(this)
         ensureVpn()
         honestyActive = true
         mainHandler.removeCallbacks(tick)

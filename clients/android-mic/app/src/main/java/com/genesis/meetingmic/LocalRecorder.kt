@@ -35,7 +35,11 @@ import java.util.concurrent.TimeUnit
  * the queue had to drop are carried IN ORDER as a count on the next frame, and the writer encodes that
  * much silence in their place, so sample positions track real capture time without fragmenting files.
  */
-class LocalRecorder(private val context: Context, private val monitor: LocalBackupMonitor) {
+class LocalRecorder(
+    private val context: Context,
+    private val monitor: LocalBackupMonitor,
+    private val onSegmentClosed: () -> Unit = {},
+) {
 
     companion object {
         private const val TAG = "LocalRecorder"
@@ -63,6 +67,9 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
         /** Segments a writer currently has open; retention never touches them. */
         private val openBases: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap())
 
+        /** True while a writer still has the segment with this base name open. */
+        fun isOpen(base: String): Boolean = base in openBases
+
         /**
          * The most recently started writer in this process, whichever service instance started it: a
          * Stop ends the service, so the next Start has a new recorder but must still wait for the old
@@ -89,27 +96,43 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
          */
         fun purge(context: Context, nowUtcMs: Long = System.currentTimeMillis()): Int {
             val d = dir(context)
+            // Finish any interrupted rename first, so its sidecar is not swept as an orphan below.
+            SegmentSync.migrateLegacyNames(d)
             val low = allocatableBytes(context, d) < LOW_STORAGE_BYTES
-            val segments = d.listFiles { f -> f.name.endsWith(".aac") }.orEmpty()
-                .filter { it.nameWithoutExtension !in openBases }
-                .map { RetentionPolicy.Segment(it.nameWithoutExtension, segmentStartMs(it)) }
+            val files = d.listFiles { f -> f.name.endsWith(".aac") }.orEmpty()
+                .filter { SegmentSync.baseOf(it) !in openBases }
+                .associateBy { it.name }
+            val segments = files.values
+                .map { RetentionPolicy.Segment(it.name, segmentStartMs(it)) }
                 .filter { it.startUtcMs <= nowUtcMs + RetentionPolicy.DAY_MS }
             val doomed = RetentionPolicy.toDelete(segments, nowUtcMs, low)
+            var expiredUnsynced = 0
             var removed = 0
-            for (s in doomed) {
-                // The sidecar goes only once the audio is really gone: a recording that survives a
-                // failed delete keeps its timing.
-                val aac = File(d, "${s.id}.aac")
-                if (aac.delete() || !aac.exists()) {
-                    File(d, "${s.id}.json").delete()
+            SegmentSync.folderLock.lock()
+            try {
+                for (s in doomed) {
+                    val f = files.getValue(s.id)
+                    if (!f.exists()) continue  // renamed by sync since the listing; judged next time
+                    // The sidecar goes only once the audio is really gone: a recording that survives a
+                    // failed delete keeps its timing.
+                    if (!f.delete() && f.exists()) continue
+                    if (!SegmentSync.isSynced(f)) expiredUnsynced += 1
+                    SegmentSync.deleteCompanions(d, SegmentSync.baseOf(f))
                     removed += 1
                 }
+                d.listFiles { f -> f.name.endsWith(".json") || f.name.endsWith(".dest") }.orEmpty()
+                    .filter { it.nameWithoutExtension !in openBases }
+                    .filter {
+                        !File(d, it.nameWithoutExtension + ".aac").exists() &&
+                            !File(d, it.nameWithoutExtension + ".synced.aac").exists()
+                    }
+                    .filter { nowUtcMs - it.lastModified() > 60 * 60 * 1000L }
+                    .forEach { it.delete() }
+            } finally {
+                SegmentSync.folderLock.unlock()
             }
-            d.listFiles { f -> f.name.endsWith(".json") }.orEmpty()
-                .filter { it.nameWithoutExtension !in openBases }
-                .filter { !File(d, it.nameWithoutExtension + ".aac").exists() }
-                .filter { nowUtcMs - it.lastModified() > 60 * 60 * 1000L }
-                .forEach { it.delete() }
+            // Never silent: a recording that expired before reaching the edge is reported.
+            SegmentSync.noteExpiredUnsynced(context, expiredUnsynced)
             return removed
         }
 
@@ -127,7 +150,7 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
         }
 
         private fun segmentStartMs(aac: File): Long {
-            val side = File(aac.parentFile, aac.nameWithoutExtension + ".json")
+            val side = File(aac.parentFile, SegmentSync.baseOf(aac) + ".json")
             return try {
                 JSONObject(side.readText()).getLong("utc_start_ms")
             } catch (e: Exception) {
@@ -146,9 +169,9 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
      * new one opens no encoder until the old one has released its own (some phones have only one).
      */
     @Synchronized
-    fun start(runId: Long, generation: Long) {
+    fun start(runId: Long, generation: Long, runUuid: String, dest: String) {
         writer?.finish()
-        val w = Writer(runId, generation)
+        val w = Writer(runId, generation, runUuid, dest)
         w.previous = lastWriter.getAndSet(w)
         writer = w
         w.start()
@@ -181,8 +204,16 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
      * One capture run's writer. Every monitor call carries [generation], so a writer still draining
      * after the next run started can never change the new run's status.
      */
-    private inner class Writer(val runId: Long, private val generation: Long) :
-        Thread("local-recorder-$runId") {
+    private inner class Writer(
+        val runId: Long,
+        private val generation: Long,
+        // Globally unique per capture run: segment names must never repeat across app restarts
+        // (the numeric runId restarts at 1 with the process), because the edge stores by name.
+        private val runUuid: String,
+        // Where this run's recordings sync to (an endpoint id, or SegmentSync.DEST_NONE), fixed at
+        // capture so a later change of bridge or token cannot redirect them.
+        private val dest: String,
+    ) : Thread("local-recorder-$runId") {
         /** The writer started before this one, possibly by another service instance; joined before any encoder opens. */
         @Volatile var previous: Thread? = null
         private val queue = ArrayBlockingQueue<Frame>(QUEUE_FRAMES)
@@ -351,20 +382,15 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
             val utc = capturedUtcMs  // when this audio was captured, not when it was encoded
             val stamp = SimpleDateFormat("yyyyMMdd'T'HHmmss", Locale.US)
                 .apply { timeZone = TimeZone.getTimeZone("UTC") }.format(Date(utc))
-            var base = "seg_${stamp}_r${runId}_s$runSamples"
-            // Run ids restart with each service instance: never open over an existing recording.
-            var n = 1
-            while (File(d, "$base.aac").exists() || File(d, "$base.json").exists()) {
-                base = "seg_${stamp}_r${runId}_s${runSamples}_$n"
-                n += 1
-            }
+            val base = "seg_${stamp}_${runUuid}_s$runSamples"
             openBases.add(base)
             currentBase = base
+            SegmentSync.writeDest(File(d, "$base.dest"), dest)
             FileOutputStream(File(d, "$base.json")).use { side ->
                 side.write(
                     JSONObject()
                         .put("v", 1)
-                        .put("run_id", runId)
+                        .put("run_uuid", runUuid)
                         .put("utc_start_ms", utc)
                         .put("elapsed_start_ms", SystemClock.elapsedRealtime())
                         .put("start_sample", runSamples)
@@ -509,9 +535,15 @@ class LocalRecorder(private val context: Context, private val monitor: LocalBack
                 aac.length() == 0L -> {
                     // A segment that never received a frame is noise in the folder; drop it with its sidecar.
                     aac.delete()
-                    File(d, "$base.json").delete()
+                    SegmentSync.deleteCompanions(d, base)
                 }
-                else -> verify(aac)
+                else -> {
+                    verify(aac)
+                    openBases.remove(base)
+                    // A closed file is ready to mirror to the edge. Scheduling that must never be
+                    // mistaken for an encoder failure: the recording itself is already safe.
+                    try { onSegmentClosed() } catch (e: Exception) { Log.w(TAG, "sync kick failed", e) }
+                }
             }
             openBases.remove(base)
             return result

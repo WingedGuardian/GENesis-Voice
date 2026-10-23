@@ -60,6 +60,8 @@ class MainActivity : AppCompatActivity() {
         b.token.setText(BuildConfig.MEETING_TOKEN)
         b.versionLabel.text =
             "v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) · built ${BuildConfig.BUILD_TIME}"
+        // A sync pass that finishes while this screen is open updates the sync line at once.
+        SyncWorker.observe(applicationContext, this) { refreshStorageSummary(purgeFirst = false) }
 
         // Restore the last model choice (default = Enhanced/on); persist on toggle.
         val prefs = getSharedPreferences("ui", MODE_PRIVATE)
@@ -113,6 +115,19 @@ class MainActivity : AppCompatActivity() {
         // Retention runs on every app open as well as at each capture start, so old recordings are
         // removed even between meetings.
         refreshStorageSummary(purgeFirst = true)
+        // An install upgraded with a backlog has never registered a sync endpoint: register the last
+        // capture's settings, else the configured ones. It becomes the destination of the backlog.
+        if (!SegmentSync.hasEndpoint(applicationContext)) {
+            val p = getSharedPreferences(MicStreamService.PREFS, MODE_PRIVATE)
+            val candidates = listOf(
+                p.getString(MicStreamService.KEY_URL, "").orEmpty() to p.getString(MicStreamService.KEY_TOKEN, "").orEmpty(),
+                b.wsUrl.text.toString() to b.token.text.toString(),
+            )
+            candidates.firstOrNull { (url, token) -> SegmentSync.httpBase(url, token) != null }
+                ?.let { (url, token) -> SegmentSync.registerEndpoint(applicationContext, url, token) }
+        }
+        SyncWorker.schedule(applicationContext)
+        SyncWorker.kick(applicationContext)
         // Every failure alert is a notification: warn if they are off in any way (the runtime
         // permission, the app-level switch, or the failure channel muted).
         val nm = getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
@@ -207,7 +222,11 @@ class MainActivity : AppCompatActivity() {
         val app = applicationContext
         Thread({
             if (purgeFirst) try { LocalRecorder.purge(app) } catch (_: Exception) {}
-            val text = try { LocalRecorder.summary(app) } catch (e: Exception) { "On this phone: could not read recordings" }
+            val text = try {
+                LocalRecorder.summary(app) + "\n" + syncLine(SegmentSync.status(app))
+            } catch (e: Exception) {
+                "On this phone: could not read recordings"
+            }
             runOnUiThread { b.storageSummary.text = text }
         }, "storage-summary").start()
     }
@@ -290,4 +309,26 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
         }
     }
+}
+
+/** The sync status lines under the storage summary (pure, so the headline rule is tested). */
+internal fun syncLine(s: SegmentSync.Status): String {
+    val hours = s.oldestWaitingMs / 3_600_000
+    val parts = mutableListOf(
+        when {
+            s.waiting > 0 -> "Waiting to sync to Genesis: ${s.waiting} file(s), oldest ${hours}h"
+            // Never a success headline while some recordings can never sync (the warning below says why).
+            s.unroutable > 0 -> "⚠ Not every recording can sync to Genesis"
+            s.synced == 0 -> "Synced to Genesis: nothing waiting"
+            else -> "Synced to Genesis: all recordings ✓"
+        },
+    )
+    if (s.synced > 0) parts += "${s.synced} confirmed on Genesis (phone copy kept 7 days, then re-checked)"
+    if (s.rejected > 0) parts += "⚠ ${s.rejected} refused by Genesis, kept on phone"
+    if (s.expiredUnsynced > 0) parts += "⚠ ${s.expiredUnsynced} expired before syncing"
+    if (s.unroutable > 0) {
+        parts += "⚠ ${s.unroutable} file(s) have no secure (wss://) destination: kept on this phone, not synced"
+    }
+    if (s.waiting > 0 && hours >= 24) parts += "⚠ Check Tailscale, and set battery to Unrestricted"
+    return parts.joinToString("\n")
 }
