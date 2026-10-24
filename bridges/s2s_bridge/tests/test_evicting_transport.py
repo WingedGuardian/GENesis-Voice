@@ -17,6 +17,7 @@ import socket
 import time
 
 import websockets
+import pytest
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
@@ -164,3 +165,94 @@ def test_the_evicted_handlers_teardown_cannot_clear_the_new_client():
     assert second == "OPEN"
     assert in_ws is not None
     assert out_ws is in_ws, "the old teardown cleared the reconnected device's output socket"
+
+
+async def _replacement_preserves_session(half_open):
+    port = _free_port()
+    handler = WebSocketHandler(host="127.0.0.1", port=port)
+    transport = handler.create_transport()
+    ready, connected, disconnected = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    calls = []
+
+    @transport.event_handler("on_websocket_ready")
+    async def on_ready(_transport):
+        ready.set()
+
+    async def on_connect(client_id):
+        calls.append(("connect", client_id))
+        connected.set()
+
+    async def on_disconnect(client_id):
+        calls.append(("disconnect", client_id))
+        disconnected.set()
+
+    handler.setup_event_handlers(transport, on_connect, on_disconnect)
+    task = PipelineTask(
+        Pipeline([transport.input(), transport.output()]),
+        idle_timeout_secs=None, cancel_on_idle_timeout=False,
+    )
+    run = asyncio.create_task(PipelineRunner(handle_sigint=False).run(task))
+    first = second = None
+    try:
+        await asyncio.wait_for(ready.wait(), 5)
+        if half_open:
+            first = await asyncio.get_running_loop().run_in_executor(None, _raw_half_open, port)
+        else:
+            first = await websockets.connect(f"ws://127.0.0.1:{port}/")
+        await asyncio.wait_for(connected.wait(), 5)
+        old = transport.input()._websocket
+        second = await websockets.connect(f"ws://127.0.0.1:{port}/")
+        async with asyncio.timeout(5):
+            while (
+                transport.input()._websocket in (None, old)
+                or transport.output()._websocket is not transport.input()._websocket
+            ):
+                await asyncio.sleep(0.01)
+        assert second.state.name == "OPEN"
+        assert calls == [("connect", "server")], "replacement reset the logical session"
+        await second.close()
+        await asyncio.wait_for(disconnected.wait(), 5)
+        assert calls == [("connect", "server"), ("disconnect", "server")]
+    finally:
+        if second is not None:
+            await second.close()
+        if first is not None:
+            if half_open:
+                first.close()
+            else:
+                await first.close()
+        await task.cancel()
+        await asyncio.wait_for(run, 5)
+
+
+@pytest.mark.parametrize("half_open", [False, True])
+def test_replacement_keeps_session_until_the_last_socket_disconnects(half_open):
+    asyncio.run(_replacement_preserves_session(half_open))
+
+
+def test_a_late_old_notification_still_restores_the_new_sockets_output():
+    async def check():
+        handler = WebSocketHandler()
+        transport = handler.create_transport()
+        old, current = object(), object()
+        transport.input()._websocket = current
+        handler._active_websocket = current
+        output = transport.output()
+        assert output._websocket is None  # an old teardown cleared it
+        calls = []
+
+        async def connected(client_id):
+            calls.append("connected")
+
+        async def disconnected(client_id):
+            calls.append("disconnected")
+
+        handler.setup_event_handlers(transport, connected, disconnected)
+        await transport._emit_client_disconnected(old)
+        async with asyncio.timeout(1):
+            while output._websocket is not current:
+                await asyncio.sleep(0)
+        assert output._websocket is current
+        assert calls == []  # the existing stale-socket guard owns this case
+
+    asyncio.run(check())
