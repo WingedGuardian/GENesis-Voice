@@ -83,6 +83,16 @@ class EvictingWebsocketServerTransport(WebsocketServerTransport):
     ``disconnect_tool`` keep passing.
     """
 
+    async def _emit_client_disconnected(self, websocket):
+        """Eviction closes a socket, not the logical conversation it replaces."""
+        # The input clears its old socket before eviction and waits for its
+        # teardown. Suppress only that gap, so the next connect can take the
+        # replacement path. Once a new socket is installed, keep notifying:
+        # the bridge's stale-socket guard can restore its output if needed.
+        if self.input()._websocket is None:
+            return
+        await super()._emit_client_disconnected(websocket)
+
     def input(self) -> EvictingWebsocketServerInputTransport:
         if not self._input:
             self._input = EvictingWebsocketServerInputTransport(
