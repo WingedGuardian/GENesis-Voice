@@ -52,8 +52,8 @@ async def _transcript_reaches_guard(monkeypatch, with_context):
     app.websocket_handler = handler
     service = _Service()
     monkeypatch.setattr("app.websocket_handler.PipelineRunner", lambda: PipelineRunner(handle_sigint=False))
-    _pipeline, _runner, task = handler.build_pipeline(transport, service, "test")
-    run = handler._pipeline_task
+    _pipeline, runner, task = handler.build_pipeline(transport, service, "test")
+    run = asyncio.create_task(runner.run(task))
     if with_context:
         aggregator = sessions.context_aggregators["test"].user()
         original = aggregator._handle_transcription
