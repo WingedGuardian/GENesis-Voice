@@ -1,5 +1,4 @@
 """WebSocket handler for managing WebSocket connections and pipelines."""
-import asyncio
 import functools
 import logging
 import uuid
@@ -328,23 +327,11 @@ class WebSocketHandler:
         runner = PipelineRunner()
         task = PipelineTask(pipeline, idle_timeout_secs=None, cancel_on_idle_timeout=False)
 
-        # Start pipeline in background with exception tracking
-        pipeline_task = asyncio.create_task(runner.run(task))
-        pipeline_task.add_done_callback(self._on_pipeline_done)
-        self._pipeline_task = pipeline_task
-        logger.info("✅ Pipeline started for WebSocket connection")
+        # Application.run owns startup, exception reporting and cleanup. Building
+        # must not schedule a second invocation of this same runner/task pair.
         logger.info("✅ Pipeline initialized successfully")
 
         return pipeline, runner, task
-
-    @staticmethod
-    def _on_pipeline_done(task: asyncio.Task) -> None:
-        """Log exceptions from background pipeline tasks."""
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            logger.error("Pipeline task failed: %s", exc, exc_info=exc)
 
     def extract_client_id(self, websocket) -> str:
         """
