@@ -33,6 +33,25 @@ jobs:
           pip install aiohttp==3.14.5 pytest==9.0.2 pytest-asyncio==1.3.0
           PYTHONPATH=. python -m pytest -q meeting_bridge/tests
 
+  s2s:
+    name: Speech-to-speech bridge tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bridges/s2s_bridge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install locked bridge dependencies
+        run: |
+          pip install poetry==2.2.1 pytest==9.0.2 pytest-asyncio==1.3.0 pytest-timeout==2.4.0
+          poetry config virtualenvs.create false
+          poetry install --no-root --only main --no-interaction
+      - name: Run bridge regressions
+        run: python -m pytest -q tests -p timeout -o timeout=60
+
   shell:
     name: Shell scripts
     runs-on: ubuntu-latest
