@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in Linux Codex -> SSH -> native Windows audio helper. No resident service."""
+"""Opt-in native Windows audio relay, with optional managed build updates."""
 import argparse
 import asyncio
 import base64
@@ -58,7 +58,7 @@ def atomic_write(path, data, mode=0o600):
             os.unlink(temporary)
 
 
-def package_at(directory=None):
+def package_at(directory=None, *, probe=False):
     if directory:
         candidates = [Path(directory).expanduser().resolve()]
     else:
@@ -72,7 +72,7 @@ def package_at(directory=None):
         raise ValueError('Cannot uniquely discover the physical Codex package; pass --package')
     root = matches[0]
     manifest = json.loads((root / VOICE / 'manifest.json').read_text())
-    if manifest['schemaVersion'] != 1 or manifest['appVersion'] not in SUPPORTED:
+    if manifest['schemaVersion'] != 1 or (not probe and manifest['appVersion'] not in SUPPORTED):
         raise ValueError('Untested Codex helper protocol/version; supported: ' + ', '.join(sorted(SUPPORTED)))
     if not re.fullmatch(r'[a-f0-9]{40}', manifest['buildCommit']):
         raise ValueError('Invalid Codex build commit')
@@ -106,16 +106,24 @@ def remote_command(asset):
             f"'Genesis','CodexVoice','{asset}','host.cjs'))\"")
 
 
-def setup_windows(ssh, windows_package):
+def setup_windows(ssh, windows_package, *, provision=None):
     source = Path(__file__).with_name('host.cjs').read_bytes()
-    options = base64.b64encode(json.dumps({'package': windows_package}).encode()).decode()
+    options = base64.b64encode(json.dumps({'package': windows_package, **(provision or {})}).encode()).decode()
     script = Path(__file__).with_name('setup.ps1').read_text()
     script = script.replace('__OPTIONS__', options).replace('__SOURCE__', base64.b64encode(source).decode())
     loader = '& ([ScriptBlock]::Create([Console]::In.ReadToEnd()))'
     encoded = base64.b64encode(loader.encode('utf-16-le')).decode()
     result = subprocess.run(ssh + ['powershell.exe -NoProfile -NonInteractive -EncodedCommand ' + encoded],
-                            input=script.encode('utf-8'), capture_output=True, timeout=45, env=helper_environment())
+                            input=script.encode('utf-8'), capture_output=True,
+                            timeout=7200 if provision else 45, env=helper_environment())
     if result.returncode:
+        if provision:
+            try:
+                failure = json.loads(result.stdout.decode('utf-8-sig'))
+            except (ValueError, UnicodeDecodeError):
+                failure = {}
+            if result.returncode == 255 or not isinstance(failure, dict) or failure.get('held') is not True:
+                raise OSError('Windows provisioning unavailable; retrying the matching build')
         raise ValueError('Windows setup failed in Codex helper environment (SSH_AUTH_SOCK is not inherited; '
                          'use a file identity or explicit SSH IdentityAgent): ' + result.stderr.decode(errors='replace'))
     return json.loads(result.stdout.decode('utf-8-sig'))
@@ -135,7 +143,8 @@ def load_state(state):
 
 def install(args):
     state = args.state_dir.expanduser().resolve()
-    root, manifest = package_at(args.package)
+    managed = getattr(args, 'managed', False)
+    root, manifest = package_at(args.package, probe=managed)
     helper = root / VOICE / 'bin/codex-voice-host'
     if helper.resolve() != helper:
         raise ValueError('The packaged helper must be a physical file')
@@ -154,7 +163,8 @@ def install(args):
         if digest(current) != expected and not ours:
             raise ValueError('Helper has a foreign modification or another state directory owns it')
         ssh = ssh_args(args.host, args.identity)
-        remote = setup_windows(ssh, args.windows_package)
+        remote = (setup_windows(ssh, args.windows_package, provision=args.provision) if managed
+                  else setup_windows(ssh, args.windows_package))
         if (remote['buildCommit'], remote['appVersion']) != (manifest['buildCommit'], manifest['appVersion']):
             raise ValueError('Linux and Windows Codex builds differ; update both before installing')
         command = remote_command(remote['asset'])
@@ -166,10 +176,12 @@ def install(args):
             raise ValueError('Original helper backup is missing; refusing to adopt the relay as backup')
         else:
             atomic_write(backup, current, stat.S_IMODE(helper.stat().st_mode))
-        script = launcher(state)
-        config = {'application': 'genesis-codex-voice', 'package': str(root), 'ssh': ssh,
+        script = launcher(getattr(args, 'runtime_state', state))
+        config = {'application': 'genesis-codex-voice', 'package': str(getattr(args, 'runtime_package', root)), 'ssh': ssh,
                   'command': command, 'buildCommit': manifest['buildCommit'], 'originalHash': expected,
                   'originalMode': stat.S_IMODE(backup.stat().st_mode), 'launcher': script.decode()}
+        if managed:
+            config['managedBuild'] = manifest['buildCommit']
         atomic_write(state / 'config.json', json.dumps(config).encode())
         atomic_write(state / 'bridge.py', Path(__file__).read_bytes())
         atomic_write(helper, script, config['originalMode'])
@@ -199,7 +211,7 @@ def uninstall(state):
 
 def run(state):
     config = load_state(state)
-    _, manifest = package_at(config['package'])
+    _, manifest = package_at(config['package'], probe=config.get('managedBuild') == config['buildCommit'])
     if manifest['buildCommit'] != config['buildCommit']:
         raise ValueError('Codex changed builds; reinstall the bridge after updating both hosts')
     os.execv(config['ssh'][0], config['ssh'] + [config['command']])
@@ -286,6 +298,11 @@ async def doctor(args):
     process = await asyncio.create_subprocess_exec(str(helper), stdin=asyncio.subprocess.PIPE,
                                                  stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                                                  env=helper_environment())
+    await inspect_process(process, config, args)
+
+
+async def inspect_process(process, config, args):
+    """Shared native protocol qualification; device opening remains opt-in."""
     try:
         for message, expected, deadline in [({'type': 'hello', 'protocol': 1, 'buildCommit': config['buildCommit']}, 'ready', 5),
                                             ({'type': 'initializeRuntime'}, 'runtimeReady', 30)]:
@@ -305,16 +322,25 @@ async def doctor(args):
         await asyncio.wait_for(process.wait(), 5)
         if process.returncode:
             raise ValueError('Helper exited unsuccessfully')
+    except EOFError:
+        # EOF can precede delivery of SSH's process-exit notification. Let that
+        # finish before cleanup so the updater can distinguish transport exit
+        # 255 from a native/protocol failure. Reuse the normal close deadline.
+        try:
+            await asyncio.wait_for(process.wait(), 5)
+        except asyncio.TimeoutError:
+            pass
+        raise
     finally:
         if process.returncode is None:
             process.kill()
             await process.wait()
 
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest='action', required=True)
-    for name in ('install', 'run', 'uninstall', 'doctor'):
+    for name in ('install', 'run', 'uninstall', 'doctor', 'manage', 'launch', 'sync', 'status', 'unmanage'):
         command = actions.add_parser(name)
         command.add_argument('--state-dir', type=Path, default=DEFAULT_STATE)
         if name == 'install':
@@ -326,9 +352,28 @@ def main():
             command.add_argument('--audio', action='store_true', help='Negotiate live WebRTC and open devices muted')
             codex_home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
             command.add_argument('--socket', type=Path, default=codex_home / 'app-server-control/app-server-control.sock')
-    args = parser.parse_args()
+        if name in ('manage', 'launch'):
+            command.add_argument('--codex', required=True, help='Real npm Codex entry point, not the voice launcher')
+        if name == 'manage':
+            command.add_argument('--host', required=True)
+            command.add_argument('--identity')
+            command.add_argument('--launcher', type=Path, required=True)
+            command.add_argument('--replace-launcher-sha256', help='Explicit ownership check when replacing an existing launcher')
+        if name == 'launch':
+            command.add_argument('arguments', nargs=argparse.REMAINDER)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
     try:
-        if args.action == 'install':
+        if args.action in ('manage', 'launch', 'sync', 'status', 'unmanage'):
+            if __package__:
+                from . import managed
+            else:
+                import managed
+            return getattr(managed, args.action)(args)
+        elif args.action == 'install':
             install(args)
         elif args.action == 'uninstall':
             uninstall(args.state_dir.expanduser().resolve())

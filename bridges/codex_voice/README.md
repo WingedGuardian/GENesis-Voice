@@ -3,8 +3,9 @@
 Keep running Codex in your usual Linux SSH terminal. F8 opens the native Windows
 microphone and speakers on your PC. A short-lived SSH process connects Codex's
 helper control pipe to the matching Windows helper; audio uses the helper's
-native WebRTC connection. No audio recording, listener, service, scheduled task,
-or Genesis session registration is added.
+native WebRTC connection. Manual installation adds no audio recording, listener,
+service, scheduled task, or Genesis session registration. The optional managed
+mode below adds a background build updater; audio still runs only on demand.
 
 This is an opt-in adapter for **Codex 0.163.0's private helper protocol**. Both
 hosts must have the same build commit. Other releases are refused until tested.
@@ -68,7 +69,58 @@ follows `CODEX_HOME` (or `~/.codex` when unset/empty). `--socket` can select
 another local app-server Unix socket. A final spoken F8 test verifies perception
 and playback. Enumeration alone is deliberately not called an audio success.
 
-## Updates and uninstall
+## Automatic updates with immediate text startup
+
+Managed mode is opt-in. It keeps the globally installed Codex package untouched
+and prepares a private copy of that exact release, paired with an immutable
+Windows helper build. It extends the same relay and native protocol checks;
+it does not install a separate audio engine or change your Codex configuration.
+Windows needs Node, npm, and the existing key-based SSH connection.
+
+```sh
+python3 bridges/codex_voice/bridge.py manage \
+  --host windows-audio --codex /path/to/npm/codex/bin/codex.js \
+  --launcher "$HOME/.local/bin/codex"
+python3 bridges/codex_voice/bridge.py status
+```
+
+Select the real npm entry point for `--codex`, not the generated launcher. If
+that launcher already exists, installation refuses unless
+`--replace-launcher-sha256` supplies its exact SHA-256; the original contents
+and mode are retained for rollback. An existing manual installation needs a
+different `--state-dir` or must be uninstalled first. Use the chosen state
+directory on each management command; the generated launcher remembers it.
+
+After an upgrade, `codex` opens immediately for text while a systemd user
+oneshot prepares matching builds. Transient network or sleeping-PC failures
+retry every five minutes; incompatible manifests, protocol failures and foreign
+changes are held for inspection without repeated downloads. `status` reports
+the current release's readiness. Relaunch after it reports ready to use voice.
+Preparation verifies voice resource hashes, build identity, native handshake,
+runtime initialization and device enumeration. It never opens the microphone
+or speakers. New helper protocols that fail those checks are not activated.
+
+The existing `doctor --audio` applies to the prepared build's `relay` state
+directory shown by `status`. Run the muted device test and a spoken F8 check
+when validating a new release: background qualification alone does not prove
+a working conversation. Previous immutable builds remain available to active
+sessions and are retained for rollback.
+
+```sh
+python3 bridges/codex_voice/bridge.py unmanage
+```
+
+This stops the updater, restores the previous launcher (or removes the generated
+one if none existed), and retains prepared builds. Modified launchers or units
+are preserved rather than overwritten. No Genesis session registration or
+lifecycle hook is introduced.
+
+Manager source files are fixed within a state directory. Repeating the same
+setup is safe; upgrading the manager code itself requires a new state directory
+and an explicit launcher replacement hash. This avoids partial source updates
+changing a running updater. Native Codex release matching remains automatic.
+
+## Manual updates and uninstall
 
 An npm update can replace the launcher. Update Codex on **both** hosts and rerun
 `install`; the installer checks version/build compatibility before patching.
