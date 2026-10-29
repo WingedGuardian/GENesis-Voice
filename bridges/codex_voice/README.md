@@ -92,7 +92,9 @@ different `--state-dir` or must be uninstalled first. Use the chosen state
 directory on each management command; the generated launcher remembers it.
 
 After an upgrade, `codex` opens immediately for text while a systemd user
-oneshot prepares matching builds. Transient network or sleeping-PC failures
+oneshot quietly prepares matching builds. A new version alone produces no
+startup warning; a recorded failure for the current build, a damaged prepared
+build, or an unavailable updater does. Transient network or sleeping-PC failures
 retry every five minutes; incompatible manifests, protocol failures and foreign
 changes are held for inspection without repeated downloads. `status` reports
 the current release's readiness. Relaunch after it reports ready to use voice.

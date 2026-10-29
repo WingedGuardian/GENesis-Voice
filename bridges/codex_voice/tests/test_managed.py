@@ -58,6 +58,33 @@ class ManagedUpdates(unittest.TestCase):
             self.managed.launch(self.args())
         self.assertEqual(execute.call_args.args[0], str(self.codex))
 
+    def test_update_preparation_is_quiet_until_a_current_build_failure(self):
+        build = self.manifest['buildCommit']
+        cases = [
+            ({}, ''),
+            ({'attemptedBuild': build, 'status': 'pending'}, ''),
+            ({'attemptedBuild': 'b' * 40, 'status': 'held', 'error': 'old failure'}, ''),
+            ({'attemptedBuild': build, 'status': 'held', 'error': 'protocol mismatch'}, 'protocol mismatch'),
+            ({'attemptedBuild': build, 'status': 'pending', 'error': 'SSH unavailable'}, 'SSH unavailable'),
+            ({'ready': build, 'status': 'ready'}, 'Prepared voice build no longer validates'),
+        ]
+        original = dict(self.config['managed'])
+        for settings, warning in cases:
+            with self.subTest(settings=settings):
+                self.config['managed'] = {**original, **settings}
+                self.save()
+                output = io.StringIO()
+                with patch.object(self.managed, 'request_sync') as queue, \
+                        patch.object(self.managed.os, 'execv') as execute, \
+                        patch('sys.stderr', output):
+                    self.managed.launch(self.args())
+                queue.assert_called_once()
+                self.assertEqual(execute.call_args.args[0], str(self.codex))
+                if warning:
+                    self.assertIn(warning, output.getvalue())
+                else:
+                    self.assertEqual(output.getvalue(), '')
+
     def test_private_entry_selected_only_when_manifest_and_launcher_verify(self):
         private = self.state / 'builds' / self.manifest['buildCommit']
         private.mkdir(parents=True)

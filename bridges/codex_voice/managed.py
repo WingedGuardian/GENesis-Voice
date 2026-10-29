@@ -121,7 +121,13 @@ def launch(args):
         if prepared:
             entry = str(prepared)
         else:
-            print('Codex voice: update pending; text is available. Relaunch after sync completes.', file=sys.stderr)
+            settings = config['managed']
+            build = manifest['buildCommit']
+            error = settings.get('error') if settings.get('attemptedBuild') == build else None
+            if settings.get('ready') == build:
+                error = 'Prepared voice build no longer validates'
+            if error:
+                print('Codex voice: ' + str(error) + '; starting normal Codex.', file=sys.stderr)
             request_sync(config)
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         print('Codex voice: ' + str(error) + '; starting normal Codex.', file=sys.stderr)
