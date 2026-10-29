@@ -254,8 +254,9 @@ def status(args):
 def manage(args):
     state = args.state_dir.expanduser().resolve()
     entry = Path(args.codex).expanduser().resolve()
+    identity = str(Path(args.identity).expanduser().resolve()) if args.identity else None
     native_package(entry)
-    bridge.ssh_args(args.host, args.identity)
+    bridge.ssh_args(args.host, identity)
     target = args.launcher.expanduser().absolute()
     if target.resolve() == entry:
         raise ValueError('Launcher must not replace the real Codex executable')
@@ -263,7 +264,7 @@ def manage(args):
     with open(state / 'sync.lock', 'a') as lock, bridge.helper_lock(state / 'config.json'):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         previous = bridge.load_state(state) if (state / 'config.json').exists() else None
-        desired = {'codex': str(entry), 'host': args.host, 'identity': args.identity, 'launcher': str(target)}
+        desired = {'codex': str(entry), 'host': args.host, 'identity': identity, 'launcher': str(target)}
         if previous and any(previous.get('managed', {}).get(k) != v for k, v in desired.items()):
             raise ValueError('State manages another installation; preserving it')
         if target.exists() or target.is_symlink():
@@ -312,10 +313,11 @@ def manage(args):
             return json.dumps(str(s)).replace('%', '%%').replace('$', '$$')
         command = ' '.join(quote(s) for s in (sys.executable, state / 'bridge.py', 'sync', '--state-dir', state))
         environment = json.dumps('PATH=' + os.environ.get('PATH', '/usr/bin:/bin')).replace('%', '%%')
+        writable_state = json.dumps(str(state)).replace('%', '%%')
         unit_text = ('[Unit]\nDescription=Codex native voice build synchronization\nStartLimitIntervalSec=0\n'
                      '[Service]\nType=oneshot\nExecStart=' + command + '\nEnvironment=' + environment
                      + '\nTimeoutStartSec=7200\nRestart=on-failure\nRestartSec=5min\n'
-                     'NoNewPrivileges=yes\nProtectSystem=strict\nReadWritePaths=%h\n')
+                     'NoNewPrivileges=yes\nProtectSystem=strict\nReadWritePaths=%h ' + writable_state + '\n')
         if unit_path.is_symlink() or (unit_path.exists() and unit_path.read_text() != unit_text):
             raise ValueError('Updater unit differs from this installation; preserving it')
         config['managed']['unitHash'] = bridge.digest(unit_text.encode())

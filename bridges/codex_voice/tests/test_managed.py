@@ -216,6 +216,7 @@ class ManagedUpdates(unittest.TestCase):
 
     def test_manage_quotes_literal_systemd_paths_and_restores_owned_launcher(self):
         self.state = Path(self.tmp.name) / 'voice-${USER}-%literal'
+        home = Path(self.tmp.name) / 'home'
         target = Path(self.tmp.name) / 'bin/codex'
         target.parent.mkdir()
         target.write_bytes(b'#!/bin/sh\nexit 7\n')
@@ -223,12 +224,14 @@ class ManagedUpdates(unittest.TestCase):
         args = argparse.Namespace(state_dir=self.state, codex=str(self.codex), host='windows-audio',
                                   identity=None, launcher=target,
                                   replace_launcher_sha256=self.managed.bridge.digest(target.read_bytes()))
-        with patch.object(self.managed.Path, 'home', return_value=Path(self.tmp.name)):
+        with patch.object(self.managed.Path, 'home', return_value=home):
             with patch.object(self.managed.subprocess, 'run', return_value=argparse.Namespace(returncode=0)):
                 self.assertEqual(self.managed.manage(args), 0)
                 config = json.loads((self.state / 'config.json').read_text())
-                unit = Path(self.tmp.name) / '.config/systemd/user' / config['managed']['unit']
+                unit = home / '.config/systemd/user' / config['managed']['unit']
                 self.assertIn('voice-$${USER}-%%literal', unit.read_text())
+                self.assertIn('ReadWritePaths=%h ' + json.dumps(str(self.state)).replace('%', '%%') + '\n',
+                              unit.read_text())
                 retained = self.state / 'builds/retained'
                 retained.mkdir(parents=True)
                 self.assertEqual(self.managed.unmanage(args), 0)
@@ -237,6 +240,34 @@ class ManagedUpdates(unittest.TestCase):
         self.assertFalse(unit.exists())
         self.assertTrue(retained.is_dir())
         self.assertFalse(json.loads((self.state / 'config.json').read_text())['managed']['enabled'])
+
+    def test_manage_identity_survives_worker_working_directory(self):
+        home = Path(self.tmp.name)
+        key = home / 'key'
+        key.write_text('fixture identity')
+        previous_cwd = Path.cwd()
+        try:
+            os.chdir(home)
+            for index, identity in enumerate(('./key', '~/key', str(key), None)):
+                with self.subTest(identity=identity):
+                    state = home / str(index)
+                    args = argparse.Namespace(state_dir=state, codex=str(self.codex), host='windows-audio',
+                                              identity=identity, launcher=home / ('codex-' + str(index)),
+                                              replace_launcher_sha256=None)
+                    with patch.dict(os.environ, {'HOME': str(home)}), \
+                            patch.object(self.managed.subprocess, 'run', return_value=argparse.Namespace(returncode=0)):
+                        self.managed.manage(args)
+                    config = self.managed.bridge.load_state(state)
+                    self.assertEqual(config['managed']['identity'], str(key) if identity else None)
+                    os.chdir(state)
+                    ssh = self.managed.bridge.ssh_args('windows-audio', config['managed']['identity'])
+                    if identity:
+                        self.assertEqual(ssh[ssh.index('-i') + 1], str(key))
+                    else:
+                        self.assertNotIn('-i', ssh)
+                    os.chdir(home)
+        finally:
+            os.chdir(previous_cwd)
 
     def test_sync_prepares_private_install_and_never_patches_global_package(self):
         before = {p.relative_to(self.codex.parents[1]): p.read_bytes()
