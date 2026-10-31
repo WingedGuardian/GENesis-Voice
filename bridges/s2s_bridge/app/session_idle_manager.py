@@ -41,6 +41,20 @@ from app.ws_control import send_disconnect_then_close
 logger = logging.getLogger(__name__)
 
 
+class UserTranscriptObserver(FrameProcessor):
+    """Observe realtime user transcripts before the user aggregator consumes them."""
+
+    def __init__(self, idle_manager: "SessionIdleManager", **kwargs):
+        super().__init__(**kwargs)
+        self._idle_manager = idle_manager
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame) and direction == FrameDirection.UPSTREAM:
+            self._idle_manager.record_user_transcript(frame.text)
+        await self.push_frame(frame, direction)
+
+
 class SessionIdleManager(FrameProcessor):
     """Track conversation activity and close the client WS on genuine idle.
 
@@ -88,9 +102,7 @@ class SessionIdleManager(FrameProcessor):
             # A completed user transcript = a real user turn. VAD alone is
             # unreliable here (the bot's own echo trips it), so the disconnect
             # guard keys off when the user last actually said something.
-            if frame.text and frame.text.strip():
-                self._last_user_transcript_t = time.monotonic()
-            self._touch()
+            self.record_user_transcript(frame.text)
         elif isinstance(frame, BotStartedSpeakingFrame):
             self._bot_speaking = True
             self._last_bot_response_t = time.monotonic()
@@ -113,6 +125,12 @@ class SessionIdleManager(FrameProcessor):
 
         self._update_pending_clock()
         await self.push_frame(frame, direction)
+
+    def record_user_transcript(self, text: str) -> None:
+        """Share completed-turn evidence with the observer on the upstream path."""
+        if text and text.strip():
+            self._last_user_transcript_t = time.monotonic()
+        self._touch()
 
     def _touch(self) -> None:
         """Record the current time as the last activity."""

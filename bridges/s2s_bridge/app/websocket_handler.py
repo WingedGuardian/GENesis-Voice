@@ -25,7 +25,7 @@ from app.audio_recording_service import AudioRecordingService
 from app.interrupt_relay import InterruptRelay
 from app.noise_gate import NoiseGate
 from app.raw_audio_serializer import RawAudioSerializer
-from app.session_idle_manager import SessionIdleManager
+from app.session_idle_manager import SessionIdleManager, UserTranscriptObserver
 from app.session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
@@ -286,15 +286,18 @@ class WebSocketHandler:
         if input_recorder:
             pipeline_components.append(input_recorder)
 
-        # Continue with rest of pipeline
+        # Realtime emits user transcripts upstream. Observe them between the
+        # service and user aggregator, which consumes rather than forwards them.
+        transcript_observer = UserTranscriptObserver(session_idle_manager)
         if context_aggregator:
             pipeline_components.extend([
                 context_aggregator.user(),
+                transcript_observer,
                 openai_service,
                 context_aggregator.assistant(),
             ])
         else:
-            pipeline_components.append(openai_service)
+            pipeline_components.extend([transcript_observer, openai_service])
 
         pipeline_components.append(output_activity_tracker)
         # Idle manager observes downstream activity (user/tool frames via the
